@@ -243,6 +243,11 @@ impl Gpu {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = backends;
         descriptor.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        // A Vulkan driver that reports conformance version 0 (a Mesa development build, Asahi's
+        // Honeykrisp before it was certified) is still the machine's GPU. Hidden, the only adapter
+        // left is llvmpipe, and every frame is rasterized on the CPU. wgpu still ranks a GPU ahead
+        // of a software adapter, so this never picks a worse one.
+        descriptor.flags.insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
         // An HWND's DXGI swapchain is opaque only; DirectComposition composites alpha on every GPU.
         descriptor.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
         // A window waits for room in its swap chain itself, in the loop rather than in
