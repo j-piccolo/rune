@@ -55,6 +55,8 @@ pub(super) struct Layers {
     spare: Vec<Target>,
     stack: Vec<usize>,
     pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    /// The isolation pipelines being made ahead of the first layer ([`warm_layers`]).
+    warming: Warming,
     pub additive: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     pub blur: Option<layer_blur::Pipeline>,
     viewport: (u32, u32),
@@ -144,6 +146,7 @@ impl Default for Layers {
             spare: Vec::new(),
             stack: Vec::new(),
             pipelines: Vec::new(),
+            warming: Warming::Unasked,
             additive: None,
             blur: None,
             viewport: (0, 0),
@@ -625,11 +628,11 @@ impl Renderer {
     /// without the ones the device refused or hasn't taken yet: a dissolve as source-over, a blur
     /// unblurred. Whether layers can isolate; when they can't, each group draws in its parent.
     fn check_layer_features(&mut self, device: &wgpu::Device) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.warm_isolation(device);
         // A layer a cache covers counts: the cache can still miss and draw it this frame.
         let shown = || self.layers.plan.iter().enumerate().filter(|(_, l)| l.planned != Planned::Hidden);
-        // An app that asked ([`warm_layers`]) has the isolation pipelines built by its first frame.
-        let warm = WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) && matches!(self.breakers.health(breaker::Feature::Isolation), breaker::Health::Untried);
-        let isolation = warm || shown().any(|(index, _)| self.isolates(index));
+        let isolation = shown().any(|(index, _)| self.isolates(index));
         let plus_lighter = shown().any(|(_, l)| l.blend == Blend::PlusLighter);
         let blur = shown().any(|(_, l)| l.blur > 0.0);
         if !isolation && !plus_lighter && !blur && !self.breakers.checking() { return false; }
@@ -659,6 +662,8 @@ impl Renderer {
     /// frame will draw into again.
     pub(super) fn drop_layer_pipelines(&mut self, targets: bool) {
         self.layers.pipelines.clear();
+        // Pipelines still being made ahead are the old shader's.
+        if matches!(self.layers.warming, Warming::Making(_)) { self.layers.warming = Warming::Done; }
         if targets {
             self.layers.targets.clear();
             self.layers.retained.clear();
@@ -881,11 +886,69 @@ impl Renderer {
 
 static WARM_LAYERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Has every renderer build the pipelines an isolated layer draws with (a group's opacity, a
-/// fade, a rounded clip cut by its viewport) on its first frame, not on the first frame that
-/// shows one. Building them compiles shaders, some 20 ms on a slow machine: left to the first
-/// hover or fade, that is a stall the user sees, and a window's first frame is slow already.
+/// Has every renderer make the pipelines an isolated layer draws with (a group's opacity, a
+/// fade, a rounded clip cut by its viewport) on a thread of their own, from its first frame,
+/// rather than in the first frame that shows a layer. Making them compiles shaders, some 20 ms
+/// on a slow machine: in the frame of the first hover or fade, that is a stall the user sees.
+/// A layer shown before the thread is done makes them in its frame, as it would have.
 /// Call it before the window opens.
 pub fn warm_layers() {
     WARM_LAYERS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The isolation pipelines a thread makes, with what the device said of them.
+type Warmed = std::sync::Arc<std::sync::Mutex<Option<(Vec<(wgpu::TextureFormat, &'static str, wgpu::RenderPipeline)>, bool)>>>;
+
+enum Warming {
+    Unasked,
+    Making(Warmed),
+    Done,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Renderer {
+    /// Starts the isolation pipelines on their thread, once, and takes them when they are made:
+    /// the breaker then finds them built and has only the device's answer to hear.
+    fn warm_isolation(&mut self, device: &wgpu::Device) {
+        if !matches!(self.breakers.health(breaker::Feature::Isolation), breaker::Health::Untried) {
+            // A layer got there first, and its frame made them.
+            if matches!(self.layers.warming, Warming::Making(_)) { self.layers.warming = Warming::Done; }
+            return;
+        }
+        match &self.layers.warming {
+            Warming::Done => {}
+            Warming::Unasked => {
+                if !WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) { return; }
+                let made = Warmed::default();
+                let (to, device, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
+                let thread = std::thread::Builder::new().name("rune-warm-layers".into()).spawn(move || {
+                    // What `build_feature` makes for isolation: the uber pipeline for layer
+                    // targets, and the composite for the window's format and theirs.
+                    let mut pipelines = Vec::new();
+                    let verdict = breaker::checked(&device, || {
+                        for (format, entry) in [(FORMAT, entry), (format, "vs"), (FORMAT, "vs")] {
+                            pipelines.push((format, entry, Renderer::pipeline(&device, &layout, &shader, format, entry, Blend::SourceOver)));
+                        }
+                    });
+                    let taken = matches!(verdict, breaker::Verdict::Now(None));
+                    *to.lock().unwrap_or_else(|e| e.into_inner()) = Some((pipelines, taken));
+                });
+                self.layers.warming = if thread.is_ok() { Warming::Making(made) } else { Warming::Done };
+            }
+            Warming::Making(made) => {
+                let Some((pipelines, taken)) = made.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+                self.layers.warming = Warming::Done;
+                // Refused on the thread: the first layer builds them in the breaker, which reports it.
+                if !taken { return; }
+                let mut pipelines = pipelines.into_iter();
+                if let Some((format, _, uber)) = pipelines.next() && !self.extra.iter().any(|(f, _)| *f == format) {
+                    self.extra.push((format, uber));
+                }
+                for (format, _, composite) in pipelines {
+                    if !self.layers.pipelines.iter().any(|(f, _)| *f == format) { self.layers.pipelines.push((format, composite)); }
+                }
+                self.check_features(device, |feature| feature == breaker::Feature::Isolation);
+            }
+        }
+    }
 }
