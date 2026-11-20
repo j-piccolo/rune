@@ -269,7 +269,9 @@ impl RuntimeCore {
                 || p_scale_anim
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
             let presence_anim = store.is_animating(n.id, prop::PRESENCE);
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || presence_anim || own_scale_anim;
+            // A presence that only fades or slides scales nothing: text under it draws as it
+            // rests, not from its outlines.
+            let scale_animating = store.is_animating(n.id, prop::SCALE) || (presence_anim && self.scene.presence_scales(n.id)) || own_scale_anim;
             let presence_scales = presence_anim
                 && n.transition.as_deref().is_some_and(|t| t.insertion.scale != 1.0 || t.removal.scale != 1.0);
             let own_scale_moving = presence_scales || own_scale_anim;

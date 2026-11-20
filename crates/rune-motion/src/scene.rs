@@ -474,6 +474,15 @@ impl Scene {
     pub fn presented(&self, id: NodeId) -> Option<Presented> {
         self.slot(id).and_then(|i| self.nodes[i].last)
     }
+    /// Whether the node's presence, entering or leaving, changes its scale: the looks it blends
+    /// between at presence 0 and 1 are of different scales. Never under reduced motion, where
+    /// presence only fades.
+    pub fn presence_scales(&self, id: NodeId) -> bool {
+        !self.store.reduced_motion() && self.slot(id).is_some_and(|i| {
+            let (absent, present) = self.nodes[i].presence.pair();
+            absent[1] != present[1]
+        })
+    }
     /// The rect the node comes to rest at once every track (its own and its ancestors') reaches
     /// its target, snapped like [`Presented::rect`], while that differs from where it is: the
     /// difference from [`presented`](Self::presented) is the motion still in flight. Only a
