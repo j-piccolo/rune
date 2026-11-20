@@ -439,6 +439,25 @@ impl PaintState {
         if let Some(raw) = self.keep.hit_raw.get_mut(i) { *raw = rect; }
     }
 
+    /// Node `i`'s own opacity for paint and for hits, which it multiplies what it inherits by.
+    #[inline]
+    pub(in crate::runtime) fn note_own_opacity(&mut self, i: usize, own: f32, hit_own: f32) {
+        if let Some(o) = self.keep.own_opacity.get_mut(i) { *o = [own, hit_own]; }
+    }
+
+    /// Tests: the nodes of subtrees a debug build checked against their paint as copies under
+    /// a fade, and the subtrees that painted something else (`keep_carried.rs`).
+    #[cfg(test)]
+    pub(in crate::runtime) fn fade_checks(&self) -> (usize, usize) {
+        self.keep.fade_checks
+    }
+
+    /// Tests: the nodes copied under a fade so far, copying for real (`copy_for_real`).
+    #[cfg(test)]
+    pub(in crate::runtime) fn fade_copies(&self) -> usize {
+        self.keep.fade_copies
+    }
+
     /// Tests: the nodes of moved subtrees a debug build checked against their paint, and the
     /// subtrees that painted something else (`keep_shift.rs`).
     #[cfg(test)]
