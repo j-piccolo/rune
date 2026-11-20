@@ -95,6 +95,16 @@ impl El {
         self.virtualize(estimated_row_height)
     }
 
+    /// How far past its viewport a list built by [`El::virtual_rows`] keeps rows mounted, in
+    /// viewports either side: two unless set. Every mounted row costs each frame whether it
+    /// shows or not, so a list of heavy rows on a slow machine (a page of card rails on a TV
+    /// stick) sets less, down to a fraction of a viewport. The list moves its window sooner to
+    /// match, and a scroll faster than rows mount (half a viewport a frame) shows the gap.
+    pub fn virtual_overscan(mut self, viewports: f32) -> Self {
+        self.cold_mut().virtual_overscan = Some(viewports.max(0.0));
+        self
+    }
+
     /// Tells [`El::virtual_rows`] its keys are those of the last commit that gave the same
     /// `version`, so layout skips calling `key` for every row to find out. A list of tens of
     /// thousands of rows then commits in time independent of its length. Change `version`

@@ -41,6 +41,8 @@ pub(crate) struct VirtualList {
     pub before: f32,
     pub after: f32,
     estimate: f32,
+    /// [`El::virtual_overscan`](crate::El::virtual_overscan), where the list set one.
+    pub overscan: Option<f32>,
     /// Rows are built by index (`El::virtual_rows`), so a commit costs only the rows it mounts.
     /// Such a list moves its window in small steps and spreads rows new to it over frames.
     pub indexed: bool,
@@ -210,6 +212,11 @@ const INDEXED_BUDGET: f32 = 0.5;
 const PINNED_ROWS: usize = 32;
 
 impl VirtualList {
+    /// How far ahead the list keeps rows mounted, in viewports either side.
+    fn overscan_by(&self) -> f32 {
+        self.overscan.unwrap_or(OVERSCAN)
+    }
+
     pub fn height(&self, key: &str) -> f32 {
         self.index_of(key).and_then(|i| self.measured[i]).unwrap_or(self.estimate)
     }
@@ -676,7 +683,7 @@ impl VirtualList {
                 // The viewport's own rows always mount; the overscan takes new rows up to a budget.
                 let first = sums[1..].partition_point(|&s| self.pad_top + s - self.gap <= offset).max(start);
                 let last = sums[..self.keys.len()].partition_point(|&s| self.pad_top + s < offset + self.viewport).max(first);
-                let budget = self.viewport * INDEXED_BUDGET;
+                let budget = self.viewport * INDEXED_BUDGET.min(self.overscan_by());
                 let mut spent = 0.0;
                 let mut from = first;
                 while from > start {
@@ -705,8 +712,8 @@ impl VirtualList {
         // them out (rows below a fold gliding open), within an overscan of the window.
         let (mut lo, mut hi) = (start, end);
         for i in self.drawn.iter().filter_map(|k| self.index_of(k)) {
-            if i < start && self.prefix(start) - self.prefix(i) <= self.viewport * OVERSCAN { lo = lo.min(i); }
-            if i >= end && self.row_end(i + 1) - self.row_end(end) <= self.viewport * OVERSCAN { hi = hi.max(i + 1); }
+            if i < start && self.prefix(start) - self.prefix(i) <= self.viewport * self.overscan_by() { lo = lo.min(i); }
+            if i >= end && self.row_end(i + 1) - self.row_end(end) <= self.viewport * self.overscan_by() { hi = hi.max(i + 1); }
         }
         (start, end) = (lo, hi);
         // A row still at its estimate grows or shrinks once measured; anchoring to it would move
@@ -750,8 +757,8 @@ impl VirtualList {
     /// The rows within the overscan around `offset`: rows ending at or above its top go, rows
     /// starting above its bottom stay.
     fn overscan(&self, offset: f32) -> (usize, usize) {
-        let lo = offset - self.viewport * OVERSCAN;
-        let hi = offset + self.viewport * (1.0 + OVERSCAN);
+        let lo = offset - self.viewport * self.overscan_by();
+        let hi = offset + self.viewport * (1.0 + self.overscan_by());
         let sums = self.sums();
         let start = sums[1..].partition_point(|&s| self.pad_top + s - self.gap <= lo);
         (start, sums[..self.keys.len()].partition_point(|&s| self.pad_top + s < hi))
@@ -776,7 +783,8 @@ impl VirtualList {
     pub fn needs_window(&self, offset: f32, pinned: bool) -> bool {
         if self.keys.is_empty() { return false; }
         if pinned { return self.range.end != self.keys.len(); }
-        let edge = self.viewport * if self.indexed { INDEXED_EDGE } else { 0.5 };
+        // A list with its own overscan keeps the same share of it between the viewport and the edge.
+        let edge = self.viewport * if self.indexed { INDEXED_EDGE * self.overscan_by() / OVERSCAN } else { 0.5 };
         let top = self.pad_top + self.before;
         let bottom = self.pad_top + self.row_end(self.range.end);
         (self.range.start > 0 && offset < top + edge)
@@ -1008,5 +1016,29 @@ mod tests {
         );
         assert_eq!(anchor, None);
         assert!(!v.replaced_view(), "visible rows survived even with list-level no_anchor");
+    }
+
+    /// A list that sets its own overscan mounts that many viewports either side, not two, and
+    /// moves its window on while the same share of it is still ahead of the viewport.
+    #[test]
+    fn a_list_with_its_own_overscan_mounts_that_much_either_side() {
+        let mut v = VirtualList::default();
+        v.set_estimate(20.0);
+        v.set_keys((0..100).map(|i| format!("r{i}")).collect(), 0, None);
+        v.viewport = 40.0;
+        v.indexed = true;
+        // Two viewports either side of 1000 to 1040: rows 46 to 55.
+        v.select(1000.0, false, None);
+        assert_eq!(v.range, 46..56);
+        // Half a viewport either side: rows 49 to 52.
+        v.overscan = Some(0.5);
+        v.select(1000.0, false, None);
+        assert_eq!(v.range, 49..53);
+        assert_eq!(v.unfilled(1000.0, false), 0);
+        // The window's edges are 20 from the viewport; it moves once one is within 17.5.
+        assert!(!v.needs_window(1000.0, false));
+        assert!(!v.needs_window(1002.0, false));
+        assert!(v.needs_window(1003.0, false));
+        assert!(v.needs_window(997.0, false));
     }
 }

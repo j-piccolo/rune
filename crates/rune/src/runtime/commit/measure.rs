@@ -324,6 +324,7 @@ impl Measurement<'_> {
         let list = self.committed_node(path);
         let v = self.virtuals.entry(path.to_owned()).or_default();
         let estimate = if el.style.whole_rows_column() { (estimate + 0.5).floor() } else { estimate };
+        v.overscan = el.cold.virtual_overscan;
         v.scroll_path = scroll_path.to_owned();
         // A retry keeps the viewport the last pass measured; `self.nodes` is the last commit's.
         if self.pass.trusts_estimates() { v.viewport = height; }
