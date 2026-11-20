@@ -109,94 +109,165 @@ impl RuntimeCore {
     /// Per node of the new tree `nodes`: neither it nor anything under it drew in the last
     /// build (out of sight or transparent), and none of its swept path lands in sight in this
     /// layout (in the window, inside its clips, not transparent). Empty when nothing non-skipped
-    /// qualifies.
-    pub(in crate::runtime) fn unseen_before_and_after(&self, nodes: &[Node], skip: &[memo_reuse::CleanApplySpan]) -> Vec<bool> {
-        let seen: Vec<bool> = self.drew_nothing().into_iter().map(|nothing| !nothing).collect();
+    /// qualifies. `drew_nothing` is [`Self::drew_nothing`] if the commit worked it out already,
+    /// or empty. Only the nodes apply doesn't skip (`skip`) are worked out; the rest read false.
+    pub(in crate::runtime) fn unseen_before_and_after(&self, nodes: &[Node], skip: &[memo_reuse::CleanApplySpan], drew_nothing: &[bool]) -> Vec<bool> {
+        let worked;
+        let drew_nothing = if drew_nothing.is_empty() { worked = self.drew_nothing(); worked.as_slice() } else { drew_nothing };
         // New nodes may mount out of sight however much drew.
         let mounts = nodes.len() > self.tree.nodes.len();
-        if seen.is_empty() || (!mounts && seen.iter().all(|&s| s)) {
+        if drew_nothing.is_empty() || (!mounts && drew_nothing.iter().all(|&nothing| !nothing)) {
             return Vec::new();
         }
-        let any_active_unseen = self.tree.nodes.iter().zip(&seen).any(|(old, &s)| {
-            !s && self.tree.node_index.get(&old.id).is_some_and(|&ni| !memo_reuse::is_in_clean_spans(skip, ni))
+        let any_active_unseen = self.tree.nodes.iter().zip(drew_nothing).any(|(old, &nothing)| {
+            nothing && self.tree.node_index.get(&old.id).is_some_and(|&ni| !memo_reuse::is_in_clean_spans(skip, ni))
         });
         if !any_active_unseen && !mounts { return Vec::new(); }
-        // Each new node's place in the last build, found walking both trees in step.
-        let mut last = paint_tracks::Finder::default();
-        let olds: Vec<Option<usize>> = nodes.iter().map(|n| last.find(&self.tree.nodes, n.id)).collect();
+        let unseen = self.unseen_outside(nodes, skip, drew_nothing).unwrap_or_else(|| self.unseen_outside(nodes, &[], drew_nothing).unwrap_or_default());
+        // Debug builds work out every node too, and hold the nodes apply reads to it.
+        if cfg!(debug_assertions) && !skip.is_empty() && let Some(all) = self.unseen_outside(nodes, &[], drew_nothing) {
+            let differ = (0..nodes.len()).find(|&i| !memo_reuse::is_in_clean_spans(skip, i) && unseen[i] != all[i]);
+            debug_assert!(differ.is_none(), "unseen outside the skipped spans differs from unseen worked out whole at {:?}", differ.map(|i| &nodes[i].path));
+        }
+        unseen
+    }
+
+    /// [`Self::unseen_before_and_after`] for the nodes outside the spans apply skips, and the
+    /// ancestors they need from inside one: a span may hold a list's node alone, or run it
+    /// together with rows that stayed, while a row that mounted under it is outside. What a
+    /// span holds can only show a node above it, though: None when a node apply reads shows
+    /// nothing itself but holds a skipped node.
+    fn unseen_outside(&self, nodes: &[Node], skip: &[memo_reuse::CleanApplySpan], drew_nothing: &[bool]) -> Option<Vec<bool>> {
+        let len = nodes.len();
         let window = [0.0, 0.0, self.viewport.0, self.viewport.1];
         // Per node: the swept clip and scroll-offset range its children are under, in points.
-        let mut inner = vec![(window, [0.0f32; 2], [0.0f32; 2]); nodes.len()];
-        let mut after = vec![false; nodes.len()];
+        let mut inner = vec![(window, [0.0f32; 2], [0.0f32; 2]); len];
+        let mut after = vec![false; len];
         // Per node: the opacity it rests at, its ancestors' included. A live opacity or a loop
         // may show it whatever it rests at.
-        let mut alpha = vec![1.0f32; nodes.len()];
-        for (i, n) in nodes.iter().enumerate() {
-            // A hover group's hidden actions (`El::group_opacity`) rest at their rest level.
-            let own = if n.looping.is_some() || n.live.iter().any(|b| b.property == crate::live::Property::Opacity) { 1.0 } else { n.vis.opacity * n.vis.group_opacity.map_or(1.0, |g| g[0].max(0.0)) };
-            alpha[i] = own * n.parent.filter(|&p| p < i).map_or(1.0, |p| alpha[p]);
-            let (clip, shift_min, shift_max) = match n.parent {
-                Some(p) if n.above.is_none() && p < i => inner[p],
-                Some(_) if n.above.is_none() => { after[i] = true; (window, [0.0; 2], [0.0; 2]) }
-                _ => (window, [0.0; 2], [0.0; 2]),
-            };
-            // A stuck element draws where it's held, not where scrolling puts it: its shift last
-            // frame brings it, and everything it holds, back into its viewport (a header's
-            // ticking number mounts in sight there).
-            let (shift_min, shift_max) = match olds[i].filter(|_| self.tree.has_sticky).and_then(|o| self.scroll.stuck.get(o).filter(|s| **s != 0.0).map(|&s| (o, s))) {
-                Some((o, s)) => {
-                    let axis = usize::from(!matches!(self.sticky_of(o), Some((crate::el::StickyEdge::Left, ..))));
-                    let (mut lo, mut hi) = (shift_min, shift_max);
-                    lo[axis] -= s;
-                    hi[axis] -= s;
-                    (lo, hi)
-                }
-                None => (shift_min, shift_max),
-            };
-            let t = n.target;
-            let r = [t[0] - shift_max[0], t[1] - shift_max[1], t[2] - shift_min[0], t[3] - shift_min[1]];
-            let drew = olds[i].filter(|&o| { let t = self.tree.nodes[o].target; t[2] > t[0] || t[3] > t[1] });
-            let swept = match drew.map(|o| self.drawn_edges(o)) {
-                Some(b) => [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])],
-                None => r,
-            };
-            // Under a clip with no area nothing draws, shadows included.
-            // Room for its shadows, blur and a focus ring, which draw past its rect.
-            let margin = n.vis.shadows.iter().filter(|s| !s.inset).map(|s| s.x.abs() + s.y.abs() + s.spread.max(0.0) + s.blur * 1.5).fold(0.0, f32::max) + n.vis.blur * 3.0
-                + if n.focus.enabled { 4.0 } else { 0.0 };
-            // A rect that only touches the clip's edge draws nothing inside it.
-            after[i] |= alpha[i] >= 1.0 / 512.0 && clip[2] > clip[0] && clip[3] > clip[1]
-                && swept[2] > clip[0] - margin && swept[0] < clip[2] + margin
-                && swept[3] > clip[1] - margin && swept[1] < clip[3] + margin;
-            let clip = if n.vis.clip.is_some() || n.scroll.is_some() {
-                intersect(clip, swept)
-            } else { clip };
-            let (shift_min, shift_max) = match (self.scroll.scrolls.get(&n.id), n.scroll) {
-                (Some(st), Some(sp)) => {
-                    let children = || (i + 1..nodes.len()).take_while(|&j| nodes[j].parent >= Some(i)).filter(|&j| nodes[j].parent == Some(i));
-                    let max_x = match (n.scroll_axes.x(), st.x.flow) {
-                        (false, _) => 0.0,
-                        (true, Flow::Ltr) => children().fold(0.0_f32, |m, c| m.max(nodes[c].target[2] - n.target[2])),
-                        (true, Flow::Rtl) => children().fold(0.0_f32, |m, c| m.max(n.target[0] - nodes[c].target[0])),
-                    };
-                    let max_y = if n.scroll_axes.y() { children().fold(0.0_f32, |m, c| m.max(nodes[c].target[3] - n.target[3])) } else { 0.0 };
-                    let ox0 = st.x.shift() as f32;
-                    let ox1 = match st.x.flow { Flow::Ltr => ox0.clamp(0.0, max_x), Flow::Rtl => ox0.clamp(-max_x, 0.0) };
-                    let oy0 = st.offset as f32 + st.slack.height();
-                    let oy1 = if st.pinned() && sp.stick_bottom { max_y + st.slack.height() } else { oy0.clamp(0.0, max_y + st.slack.height()) };
-                    (
-                        [shift_min[0] + ox0.min(ox1), shift_min[1] + oy0.min(oy1)],
-                        [shift_max[0] + ox0.max(ox1), shift_max[1] + oy0.max(oy1)],
-                    )
-                }
-                _ => (shift_min, shift_max),
-            };
-            inner[i] = (clip, shift_min, shift_max);
+        let mut alpha = vec![1.0f32; len];
+        let mut olds: Vec<Option<usize>> = vec![None; len];
+        let mut done = vec![false; len];
+        let mut skipped = vec![false; len];
+        for s in skip { skipped[s.new_start..s.new_start + s.len].fill(true); }
+        // A skipped node's place in the last build: its span holds the same nodes in order.
+        let old_in_span = |k: usize| { let s = &skip[skip.partition_point(|s| s.new_start <= k) - 1]; s.old_start + (k - s.new_start) };
+        // Each other new node's place in the last build, found walking both trees in step.
+        let mut last = paint_tracks::Finder::default();
+        let mut chain = Vec::new();
+        let (mut i, mut cursor) = (0usize, 0usize);
+        while i < len {
+            while cursor < skip.len() && skip[cursor].new_start + skip[cursor].len <= i { cursor += 1; }
+            if let Some(span) = skip.get(cursor).filter(|s| s.new_start == i) {
+                last.advance(span.old_start + span.len);
+                i += span.len;
+                continue;
+            }
+            olds[i] = last.find(&self.tree.nodes, nodes[i].id);
+            // Its ancestors not worked out yet are skipped ones: top down, before it.
+            chain.clear();
+            let mut p = nodes[i].parent;
+            while let Some(j) = p.filter(|&j| j < i && !done[j]) {
+                chain.push(j);
+                p = nodes[j].parent;
+            }
+            for &j in chain.iter().rev() {
+                olds[j] = Some(old_in_span(j));
+                self.unseen_node(nodes, j, olds[j], window, &mut alpha, &mut after, &mut inner);
+                done[j] = true;
+            }
+            self.unseen_node(nodes, i, olds[i], window, &mut alpha, &mut after, &mut inner);
+            done[i] = true;
+            i += 1;
         }
         mark_ancestors(nodes, &mut after);
+        if !skip.is_empty() {
+            // Every ancestor of a skipped node, found from each span's nodes whose parent lies
+            // before the span.
+            let mut holds = vec![false; len];
+            for s in skip {
+                for k in s.new_start..s.new_start + s.len {
+                    let mut p = nodes[k].parent.filter(|&p| p < s.new_start);
+                    while let Some(j) = p {
+                        if holds[j] { break; }
+                        holds[j] = true;
+                        p = nodes[j].parent;
+                    }
+                }
+            }
+            if (0..len).any(|j| holds[j] && !skipped[j] && !after[j]) { return None; }
+        }
         // A node new out of sight (a ticking digit in a row scrolled out of view, a row mounting
         // past its list's viewport) enters where nothing shows, so it lands at once too.
-        (0..nodes.len()).map(|i| !after[i] && olds[i].is_none_or(|o| !seen[o])).collect()
+        Some((0..len).map(|i| !skipped[i] && !after[i] && olds[i].is_none_or(|o| drew_nothing[o])).collect())
+    }
+
+    /// Node `i`'s part of [`Self::unseen_outside`], its parent's worked out already: the opacity
+    /// it rests at, whether its swept path lands in sight, and the clip and scroll-offset range
+    /// its children are under. `old` is its place in the last build.
+    #[allow(clippy::too_many_arguments)]
+    fn unseen_node(&self, nodes: &[Node], i: usize, old: Option<usize>, window: [f32; 4], alpha: &mut [f32], after: &mut [bool], inner: &mut [([f32; 4], [f32; 2], [f32; 2])]) {
+        let n = &nodes[i];
+        // A hover group's hidden actions (`El::group_opacity`) rest at their rest level.
+        let own = if n.looping.is_some() || n.live.iter().any(|b| b.property == crate::live::Property::Opacity) { 1.0 } else { n.vis.opacity * n.vis.group_opacity.map_or(1.0, |g| g[0].max(0.0)) };
+        alpha[i] = own * n.parent.filter(|&p| p < i).map_or(1.0, |p| alpha[p]);
+        let (clip, shift_min, shift_max) = match n.parent {
+            Some(p) if n.above.is_none() && p < i => inner[p],
+            Some(_) if n.above.is_none() => { after[i] = true; (window, [0.0; 2], [0.0; 2]) }
+            _ => (window, [0.0; 2], [0.0; 2]),
+        };
+        // A stuck element draws where it's held, not where scrolling puts it: its shift last
+        // frame brings it, and everything it holds, back into its viewport (a header's
+        // ticking number mounts in sight there).
+        let (shift_min, shift_max) = match old.filter(|_| self.tree.has_sticky).and_then(|o| self.scroll.stuck.get(o).filter(|s| **s != 0.0).map(|&s| (o, s))) {
+            Some((o, s)) => {
+                let axis = usize::from(!matches!(self.sticky_of(o), Some((crate::el::StickyEdge::Left, ..))));
+                let (mut lo, mut hi) = (shift_min, shift_max);
+                lo[axis] -= s;
+                hi[axis] -= s;
+                (lo, hi)
+            }
+            None => (shift_min, shift_max),
+        };
+        let t = n.target;
+        let r = [t[0] - shift_max[0], t[1] - shift_max[1], t[2] - shift_min[0], t[3] - shift_min[1]];
+        let drew = old.filter(|&o| { let t = self.tree.nodes[o].target; t[2] > t[0] || t[3] > t[1] });
+        let swept = match drew.map(|o| self.drawn_edges(o)) {
+            Some(b) => [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])],
+            None => r,
+        };
+        // Under a clip with no area nothing draws, shadows included.
+        // Room for its shadows, blur and a focus ring, which draw past its rect.
+        let margin = n.vis.shadows.iter().filter(|s| !s.inset).map(|s| s.x.abs() + s.y.abs() + s.spread.max(0.0) + s.blur * 1.5).fold(0.0, f32::max) + n.vis.blur * 3.0
+            + if n.focus.enabled { 4.0 } else { 0.0 };
+        // A rect that only touches the clip's edge draws nothing inside it.
+        after[i] |= alpha[i] >= 1.0 / 512.0 && clip[2] > clip[0] && clip[3] > clip[1]
+            && swept[2] > clip[0] - margin && swept[0] < clip[2] + margin
+            && swept[3] > clip[1] - margin && swept[1] < clip[3] + margin;
+        let clip = if n.vis.clip.is_some() || n.scroll.is_some() {
+            intersect(clip, swept)
+        } else { clip };
+        let (shift_min, shift_max) = match (self.scroll.scrolls.get(&n.id), n.scroll) {
+            (Some(st), Some(sp)) => {
+                let children = || (i + 1..nodes.len()).take_while(|&j| nodes[j].parent >= Some(i)).filter(|&j| nodes[j].parent == Some(i));
+                let max_x = match (n.scroll_axes.x(), st.x.flow) {
+                    (false, _) => 0.0,
+                    (true, Flow::Ltr) => children().fold(0.0_f32, |m, c| m.max(nodes[c].target[2] - n.target[2])),
+                    (true, Flow::Rtl) => children().fold(0.0_f32, |m, c| m.max(n.target[0] - nodes[c].target[0])),
+                };
+                let max_y = if n.scroll_axes.y() { children().fold(0.0_f32, |m, c| m.max(nodes[c].target[3] - n.target[3])) } else { 0.0 };
+                let ox0 = st.x.shift() as f32;
+                let ox1 = match st.x.flow { Flow::Ltr => ox0.clamp(0.0, max_x), Flow::Rtl => ox0.clamp(-max_x, 0.0) };
+                let oy0 = st.offset as f32 + st.slack.height();
+                let oy1 = if st.pinned() && sp.stick_bottom { max_y + st.slack.height() } else { oy0.clamp(0.0, max_y + st.slack.height()) };
+                (
+                    [shift_min[0] + ox0.min(ox1), shift_min[1] + oy0.min(oy1)],
+                    [shift_max[0] + ox0.max(ox1), shift_max[1] + oy0.max(oy1)],
+                )
+            }
+            _ => (shift_min, shift_max),
+        };
+        inner[i] = (clip, shift_min, shift_max);
     }
 }
 
