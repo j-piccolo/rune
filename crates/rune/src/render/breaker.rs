@@ -217,7 +217,7 @@ impl Renderer {
 
 /// Runs `build` inside error scopes for validation, out-of-memory and internal errors.
 #[cfg(not(target_arch = "wasm32"))]
-fn checked(device: &wgpu::Device, build: impl FnOnce()) -> Verdict {
+pub(super) fn checked(device: &wgpu::Device, build: impl FnOnce()) -> Verdict {
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
