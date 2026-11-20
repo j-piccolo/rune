@@ -28,15 +28,16 @@ pub(super) struct KeyIndex {
     mark_chain: Vec<(u32, u32)>,
 }
 
+/// Which nodes an index was built for: their commit, count and buffer.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct NodesId {
+pub(super) struct NodesId {
     commit: u64,
     len: usize,
     at: *const Node,
 }
 
 impl NodesId {
-    fn of(nodes: &[Node], commit: u64) -> Self {
+    pub(super) fn of(nodes: &[Node], commit: u64) -> Self {
         NodesId { commit, len: nodes.len(), at: nodes.as_ptr() }
     }
 }

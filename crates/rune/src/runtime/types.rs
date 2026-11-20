@@ -601,6 +601,8 @@ pub(crate) struct TreeState {
     pub(crate) has_playground: bool,
     pub(in crate::runtime) exit_mask: exit_mask::Mask,
     key_index: key_index::KeyIndex,
+    /// The scroll viewports and their direct children (`runtime/scroll/viewports.rs`).
+    pub(in crate::runtime) viewports: scroll_viewports::Viewports,
 }
 
 impl TreeState {
@@ -631,6 +633,7 @@ impl TreeState {
             app_root: 0,
             exit_mask: Default::default(),
             key_index: Default::default(),
+            viewports: Default::default(),
         }
     }
 
@@ -697,6 +700,7 @@ impl TreeState {
     pub(super) fn nodes_replaced(&mut self) {
         self.key_index.forget();
         self.exit_mask.forget();
+        self.viewports.forget();
     }
 
     #[inline]

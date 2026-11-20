@@ -223,11 +223,14 @@ impl RuntimeCore {
         Some(self.scroll_overflow(i) + self.stuck_lag(i, c, bottom)?)
     }
 
-    /// Scroll viewport `i`'s present direct children.
+    /// Scroll viewport `i`'s present direct children: from the viewport index when it's up to
+    /// date (`runtime/scroll/viewports.rs`), else by walking `i`'s subtree.
     pub(in crate::runtime) fn scroll_children(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
-        (i + 1..self.tree.nodes.len())
-            .take_while(move |&j| self.tree.nodes[j].parent >= Some(i))
-            .filter(move |&j| self.tree.nodes[j].parent == Some(i) && !self.is_exiting(self.tree.nodes[j].id) && self.scene.contains(self.tree.nodes[j].id))
+        let kids = self.indexed_scroll_children(i);
+        let walk = if kids.is_some() { 0..0 } else { i + 1..self.tree.nodes.len() };
+        kids.unwrap_or_default().iter().map(|&j| j as usize)
+            .chain(walk.take_while(move |&j| self.tree.nodes[j].parent >= Some(i)).filter(move |&j| self.tree.nodes[j].parent == Some(i)))
+            .filter(move |&j| !self.is_exiting(self.tree.nodes[j].id) && self.scene.contains(self.tree.nodes[j].id))
     }
 
     /// Scroll viewport `i`'s growth-stack child, or the child that supplies its content end.
