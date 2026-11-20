@@ -89,8 +89,10 @@ impl Scene {
             self.rebuild_order();
         }
         self.out.clear();
+        self.out_own.clear();
         // Written first, so this frame's own values for the same nodes win.
         self.out.append(&mut self.late);
+        self.out_own.append(&mut self.late_own);
         self.present_dirty();
         for k in 0..self.to_remove.len() {
             let i = self.to_remove[k] as usize;
@@ -114,6 +116,13 @@ impl Scene {
         &self.out
     }
 
+    /// For each of [`changed`](Self::changed), whether the node itself changed: a value of its
+    /// own was set or animated, or the scene was asked to present it. False for a node presented
+    /// only because one above it was, which reads nothing of its own that it didn't before.
+    pub fn changed_own(&self) -> &[bool] {
+        &self.out_own
+    }
+
     /// Presents what was set or animated since [`frame`](Self::frame), without stepping time,
     /// so a value worked out from something that frame moved afterwards (a scroll offset)
     /// shows in the same frame. The motion trace, already written for that frame, records them
@@ -126,6 +135,7 @@ impl Scene {
         self.present_dirty();
         if self.trace.is_some() {
             self.late.extend_from_slice(&self.out[from..]);
+            self.late_own.extend_from_slice(&self.out_own[from..]);
         }
     }
 
@@ -145,6 +155,7 @@ impl Scene {
                 let p = self.compute(i, scale, reduced, own, parent_dirty);
                 self.nodes[i].last = Some(p);
                 self.out.push(p);
+                self.out_own.push(own);
             }
         }
         for k in 0..self.order.len() {
