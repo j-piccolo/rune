@@ -8,7 +8,9 @@
 //! same shape, none of which the scene presented again for itself since (one presented only for
 //! a node above it, with what it was presented with before, is as it was), under the same
 //! inherited state, in a window whose shared paint state (scale, viewport, blending, the glyph
-//! atlas's key, focus) is the same. What paint would read elsewhere, or as time passes, keeps a
+//! atlas's key, focus) is the same. Under inherited state that differs only by a move, the copy
+//! is moved (`keep_shift.rs`); only by how far an ancestor has faded, it hands down the opacities
+//! paint would (`keep_fade`). What paint would read elsewhere, or as time passes, keeps a
 //! node from being copied (`static_ok`, `dynamic_ok`, and what the paint of it found).
 //!
 //! Debug builds paint a subtree they would copy and say on stderr where the copy would differ.
@@ -88,6 +90,13 @@ pub(in crate::runtime) struct PaintKeep {
     /// and last: a copy that moved cuts it again where the clip is now.
     pub(in crate::runtime) hit_raw: Vec<[f32; 4]>,
     prev_hit_raw: Vec<[f32; 4]>,
+    /// Each node's own opacity, for paint and for hits, as it multiplied what it inherited by:
+    /// a copy under a fade works out again what each node hands down (`keep_fade`).
+    pub(in crate::runtime) own_opacity: Vec<[f32; 2]>,
+    prev_own_opacity: Vec<[f32; 2]>,
+    /// The opacities (paint, hits) each node of a subtree hands down under the fade it is
+    /// being copied under.
+    faded: Vec<[f32; 2]>,
     /// What the scene presented for each node when it painted, and where it said the node comes
     /// to rest, this paint and last. A node presented again since only because one above it was
     /// (`carried`), with the very same values, is as it was.
@@ -130,6 +139,15 @@ pub(in crate::runtime) struct PaintKeep {
     verify_span: (usize, usize),
     /// Debug builds: the copy such a subtree would have got, moved.
     verify_moved: Vec<Option<Box<shift::Moved>>>,
+    /// Debug builds: what each node of such a subtree would hand down, copied under a fade.
+    verify_faded: Vec<Option<Box<[[f32; 2]]>>>,
+    /// Tests: the nodes of subtrees checked against their paint as copies under a fade, and how
+    /// many of those subtrees differed.
+    #[cfg(test)]
+    pub(in crate::runtime) fade_checks: (usize, usize),
+    /// Tests: the nodes copied under a fade, copying as a release build does (`real_copies`).
+    #[cfg(test)]
+    pub(in crate::runtime) fade_copies: usize,
     /// Nodes copied this paint from where they were (`RUNE_PAINT_KEEP_LOG`).
     shifted: usize,
     /// Tests: the nodes of moved subtrees checked against their paint so far, and how many of
@@ -229,6 +247,8 @@ impl RuntimeCore {
         k.pinh.resize(self.tree.nodes.len(), Inh::default());
         std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
         k.hit_raw.resize(self.tree.nodes.len(), [0.0; 4]);
+        std::mem::swap(&mut k.own_opacity, &mut k.prev_own_opacity);
+        k.own_opacity.resize(self.tree.nodes.len(), [f32::NAN; 2]);
         std::mem::swap(&mut k.shown, &mut k.prev_shown);
         k.shown.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.picture, &mut k.prev_picture);
@@ -289,6 +309,8 @@ impl RuntimeCore {
         if cfg!(debug_assertions) {
             k.verify_moved.clear();
             k.verify_moved.resize_with(n, || None);
+            k.verify_faded.clear();
+            k.verify_faded.resize_with(n, || None);
         }
         if !k.recording {
             return;
@@ -409,6 +431,7 @@ impl RuntimeCore {
         self.paint.keep.picture[i] = None;
         self.paint.keep.text_cut[i] = None;
         self.paint.keep.shown[i] = shown(&self.scene, self.tree.nodes[i].id);
+        self.paint.keep.own_opacity[i] = [f32::NAN; 2];
         self.paint.keep.recs[i] = rec;
         self.paint.keep.open.push(i);
     }
@@ -431,12 +454,14 @@ impl RuntimeCore {
         }
         // A picture is copied only while the atlas holds the pixels it drew, where it drew them.
         if r.pictures && !self.keep_pictures_hold(i, o, end - i) { return None; }
-        // Inheriting what it did, it is copied as it was; inheriting that but for a move, where
-        // it is now. What each node inherited is held for it, painted or copied, as the paint
-        // left it: one copied where a scroll took it holds what it inherited there.
+        // Inheriting what it did, it is copied as it was; inheriting that but for how far an
+        // ancestor has faded, as it was but for the opacities it hands down; but for a move,
+        // where it is now. What each node inherited is held for it, painted or copied, as the
+        // paint left it: one copied where a scroll took it holds what it inherited there.
         let same = inh_key(&self.paint.keep.prev_pinh[o]) == inh_key(pinh);
         let starts = self.keep_starts();
-        let shift = if same { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
+        let fade = !same && self.keep_fade(o, end - i, pinh);
+        let shift = if same || fade { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
         if cfg!(debug_assertions) && !real_copies(&self.paint.keep) {
             // The move was only tried: the subtree paints, and is checked against it.
             let moved = shift.map(|_| Box::new(self.keep_take_moved(i, end, starts)));
@@ -445,13 +470,69 @@ impl RuntimeCore {
             if !(a..b).contains(&i) {
                 self.paint.keep.verify[i] = o as u32;
                 self.paint.keep.verify_moved[i] = moved;
+                self.paint.keep.verify_faded[i] = fade.then(|| self.paint.keep.faded.clone().into_boxed_slice());
                 self.paint.keep.verify_span = (i, end);
                 self.paint.keep.kept += end - i;
             }
             return None;
         }
         self.keep_copy(i, o, end, glyph_count, starts, shift.is_some());
+        if fade {
+            self.keep_faded(i, end - i);
+            #[cfg(test)]
+            { self.paint.keep.fade_copies += end - i; }
+        }
         Some(end - i)
+    }
+
+    /// Whether the subtree of `len` nodes at last paint's `o` inherits under `pinh` what it did
+    /// but for how far an ancestor has faded, and would paint what it painted: inside a fading
+    /// layer a node draws at full strength, and the opacity it inherits only says whether it
+    /// draws and takes hits at all. Leaves in `faded` what each node hands down now, worked
+    /// out as paint does.
+    fn keep_fade(&mut self, o: usize, len: usize, pinh: &Inh) -> bool {
+        if fade_off() { return false; }
+        let k = &mut self.paint.keep;
+        let was = k.prev_pinh[o];
+        if was.opacity == pinh.opacity && was.hit_opacity == pinh.hit_opacity { return false; }
+        if inh_key(&Inh { opacity: pinh.opacity, hit_opacity: pinh.hit_opacity, ..was }) != inh_key(pinh) { return false; }
+        k.faded.clear();
+        for j in 0..len {
+            let (down, own) = (k.inh[o + j], k.prev_own_opacity[o + j]);
+            let (then, now) = if j == 0 { ([was.opacity, was.hit_opacity], [pinh.opacity, pinh.hit_opacity]) } else {
+                let up = k.prev[o + j].up as usize;
+                if up == 0 || up > j { return false; }
+                // It inherited what its parent handed down, untouched on the way.
+                let (given, held) = (k.prev_pinh[o + j], k.inh[o + j - up]);
+                if given.opacity != held.opacity || given.hit_opacity != held.hit_opacity { return false; }
+                ([given.opacity, given.hit_opacity], k.faded[j - up])
+            };
+            let of = |up: [f32; 2]| [(own[0] * up[0]).clamp(0.0, 1.0), (own[1] * up[1]).clamp(0.0, 1.0)];
+            let (a, b) = (of(then), of(now));
+            // What is on record is what these make of what it inherited then.
+            if down.first_fade != 1.0 || a[0].to_bits() != down.opacity.to_bits() || a[1].to_bits() != down.hit_opacity.to_bits() { return false; }
+            // It draws while its opacity is over a thousandth, and takes hits by that or, hidden,
+            // by its hit opacity: over a thousandth, or over nothing.
+            let hit = |v: [f32; 2]| if v[0] > 0.001 { v[0] } else { v[1] };
+            if (a[0] > 0.001) != (b[0] > 0.001) || (hit(a) > 0.001) != (hit(b) > 0.001) || (hit(a) > 0.0) != (hit(b) > 0.0) { return false; }
+            k.faded.push(b);
+        }
+        true
+    }
+
+    /// The subtree copied as this paint's `i..i + len` hands down what `keep_fade` worked out.
+    fn keep_faded(&mut self, i: usize, len: usize) {
+        let k = &mut self.paint.keep;
+        for j in 0..len {
+            let [opacity, hit_opacity] = k.faded[j];
+            let down = &mut self.paint.inh_scratch[i + j];
+            (down.opacity, down.hit_opacity) = (opacity, hit_opacity);
+            if j > 0 {
+                let [opacity, hit_opacity] = k.faded[j - k.recs[i + j].up as usize];
+                let up = &mut k.pinh[i + j];
+                (up.opacity, up.hit_opacity) = (opacity, hit_opacity);
+            }
+        }
     }
 
     /// Whether every picture in the subtree of `len` nodes at last paint's `o` (this paint's
@@ -498,6 +579,7 @@ impl RuntimeCore {
                 self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
                 k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
                 k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
+                k.own_opacity[i..end].copy_from_slice(&k.prev_own_opacity[o..o + len]);
                 k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
                 k.picture[i..end].copy_from_slice(&k.prev_picture[o..o + len]);
                 k.shown[i..end].copy_from_slice(&k.prev_shown[o..o + len]);
@@ -588,9 +670,12 @@ impl RuntimeCore {
                     crate::render::end_layer(&mut self.instances, &mut self.surfaces, &mut self.marks, start, surface_start);
                 }
                 // A scope folded into its one primitive took its marker out: what its subtree
-                // recorded after the marker moved down one.
+                // recorded after the marker moved down one. The primitive took the scope's
+                // opacity too, so a node inside doesn't hold what it painted, and isn't copied
+                // on its own: the scope's node, which already holds what they said, is.
                 if self.instances.len() < before {
                     for rec in &mut self.paint.keep.recs[owner + 1..] {
+                        if rec.inst[0] as usize > start { rec.keep = false; }
                         for v in rec.inst.iter_mut() {
                             if *v as usize > start { *v -= 1; }
                         }
@@ -689,11 +774,22 @@ impl RuntimeCore {
         if self.track_marks && self.marks.get(range(now.inst)) != k.marks.get(range(was.inst)) { differ.push("marks"); }
         let len = k.end[r] as usize - r;
         if self.paint.drawn[r..r + len] != k.drawn[o..o + len] || self.paint.drawn_scale[r..r + len] != k.drawn_scale[o..o + len] || self.paint.seen[r..r + len] != k.seen[o..o + len] { differ.push("drawn rects"); }
-        if (0..len).any(|d| inh_key(&self.paint.inh_scratch[r + d]) != inh_key(&k.inh[o + d])) { differ.push("inherited state"); }
+        // Under a fade, a copy hands down what it did but for the opacities worked out for it.
+        let faded = k.verify_faded[r].as_deref();
+        let held = |d: usize| match faded {
+            Some(f) => Inh { opacity: f[d][0], hit_opacity: f[d][1], ..k.inh[o + d] },
+            None => k.inh[o + d],
+        };
+        if (0..len).any(|d| inh_key(&self.paint.inh_scratch[r + d]) != inh_key(&held(d))) { differ.push("inherited state"); }
         if self.tree.has_sticky && self.scroll.sticky_frame[r..r + len] != k.sticky_frame[o..o + len] { differ.push("sticky frames"); }
         if self.hit.overlay_hits[range(now.overlay)] != k.overlay[range(was.overlay)] { differ.push("overlay hits"); }
         if now.glyphs[1] - now.glyphs[0] != was.glyphs[1] - was.glyphs[0] { differ.push("glyph count"); }
         if k.pages[range(now.pages)] != k.prev_pages[range(was.pages)] { differ.push("atlas pages"); }
+        #[cfg(test)]
+        if faded.is_some() {
+            let k = &mut self.paint.keep;
+            k.fade_checks = (k.fade_checks.0 + len, k.fade_checks.1 + !differ.is_empty() as usize);
+        }
         if !differ.is_empty() {
             #[cfg(test)]
             { self.paint.keep.carried_checks.1 += 1; }
@@ -747,6 +843,12 @@ fn own_key(rt: &RuntimeCore, i: usize) -> u64 {
     bits(&mut h, &[rt.paint.row_dy[i], rt.paint.row_h[i], rt.paint.row_mask[i]]);
     h.write_u8((rt.tree.has_dissolve && rt.paint.dissolve_scratch.get(i).copied().unwrap_or(false)) as u8);
     h.finish()
+}
+
+/// `RUNE_PAINT_FADE=0`: paint what an ancestor's fade is all that changed for, again.
+fn fade_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("RUNE_PAINT_FADE").is_some_and(|v| v == "0"))
 }
 
 /// What the scene presents for a node and the rect it says the node comes to rest at, which
