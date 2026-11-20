@@ -123,7 +123,12 @@ impl RuntimeCore {
             let (rect, crop) = crate::pixels::fit_in(n.vis.pixels_fit, n.vis.surface_place, [r[0], r[1], w, h], pixels.size(), snap_u);
             let span = [crop[2] - crop[0], crop[3] - crop[1]];
             // The mip covers the whole image's drawn size, not just its visible window.
-            let placed = self.images.place_at(pixels, [rect[2] / span[0], rect[3] / span[1]], Some(now));
+            let drawn = [rect[2] / span[0], rect[3] / span[1]];
+            let placed = self.images.place_at(pixels, drawn, Some(now));
+            // For a copy of this picture, which holds while the atlas gives the same again.
+            if let Some(picture) = self.paint.keep.picture.get_mut(i) {
+                *picture = Some(paint_keep::Picture { signature: pixels.signature(), drawn, placed: placed.map(|(image, _)| image), plays: placed.is_some_and(|(_, next)| next.is_some()) });
+            }
             // An animated image wakes the window for its next frame only while drawn in a shown
             // window: off screen it isn't painted, so it asks for nothing.
             if let Some((_, Some(at))) = placed && self.frame.live.visible() && self.time_scale > 0.0 {

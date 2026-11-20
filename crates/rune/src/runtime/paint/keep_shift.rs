@@ -15,7 +15,7 @@
 //! - a text clipped to its own box (`PaintKeep::text_cut` holds the box and its soft edge), cut
 //!   and faded again where it is now;
 //! - each node's drawn rect, and the offset, clips, hover group box and rigid translation in
-//!   what it inherits and hands down.
+//!   what it inherits and hands down; where sticky elements may stick inside it.
 //!
 //! What the copy can't know, it doesn't guess. It gives the subtree back to paint when:
 //! - anything inherited differs but the offset, the clips and what follows from them;
@@ -153,14 +153,17 @@ impl Shift {
         let kind = q.params[1];
         let glyph = kind == KIND_GLYPH;
         // Kinds whose geometry is the rect alone; an outline glyph also holds its pen.
-        if !(kind == crate::render::KIND_RECT || kind == crate::render::KIND_SHADOW || kind == crate::render::KIND_GRADIENT || kind == crate::render::KIND_RADIAL || kind == crate::render::KIND_DASHED || (glyph && q.radii[3] <= 0.0)) {
+        // A picture's image is here only where its place in the atlas held (`keep_pictures_hold`).
+        let image = kind == KIND_IMAGE;
+        if !(kind == crate::render::KIND_RECT || kind == crate::render::KIND_SHADOW || kind == crate::render::KIND_GRADIENT || kind == crate::render::KIND_RADIAL || kind == crate::render::KIND_DASHED || image || (glyph && q.radii[3] <= 0.0)) {
             return None;
         }
         // A box too thin to snap draws at its exact edges, and an icon at its exact place: both
         // moved by the offset itself. What snapped lies on whole pixels; a text's glyph sits
         // where its line's box put it.
         for axis in 0..2 {
-            let exact = if glyph { text.is_none() } else { q.rect[axis].fract() != 0.0 || q.rect[axis + 2].fract() != 0.0 };
+            // A picture fitted inside its box sits a fraction off the box's snapped edge, and moves with it.
+            let exact = if glyph { text.is_none() } else { !image && (q.rect[axis].fract() != 0.0 || q.rect[axis + 2].fract() != 0.0) };
             if exact && !self.exact[axis] { return None; }
         }
         let rect = [q.rect[0] + self.px[0], q.rect[1] + self.px[1], q.rect[2], q.rect[3]];
@@ -272,6 +275,7 @@ pub(super) struct Moved {
     drop: Vec<(NodeId, [f32; 4], usize)>,
     drawn: Vec<[f32; 4]>,
     inh: Vec<Inh>,
+    sticky: Vec<[f32; 8]>,
     /// The hit list's length where the copy began, which help and drop hits count from.
     hits_at: usize,
 }
@@ -304,6 +308,7 @@ impl RuntimeCore {
             drop: self.hit.drop_hits[to.drop..].to_vec(),
             drawn: self.paint.drawn[i..end].to_vec(),
             inh: self.paint.inh_scratch[i..end].to_vec(),
+            sticky: if self.tree.has_sticky { self.scroll.sticky_frame[i..end].to_vec() } else { Vec::new() },
             hits_at: to.hits,
         };
         self.keep_unwind(to);
@@ -316,7 +321,7 @@ impl RuntimeCore {
     /// instances, hits, drawn rects and inherited state, as `keep_copy` copies them for a
     /// subtree that stayed. The move, or None with nothing added.
     pub(super) fn keep_move(&mut self, i: usize, o: usize, len: usize, pinh: &Inh) -> Option<Shift> {
-        if self.tree.has_sticky || shift_off() { return None; }
+        if shift_off() { return None; }
         let sh = Shift::between(&self.paint.keep.prev_pinh[o], pinh, self.env.scale)?;
         let starts = self.keep_starts();
         if self.keep_move_into(i, o, len, &sh).is_none() {
@@ -337,6 +342,10 @@ impl RuntimeCore {
         let first = self.instances.len();
         // Help and drop hits count from the hit list.
         let seq = self.hit.hits.len().wrapping_sub(r.hits[0] as usize);
+        // Where sticky elements may stick: the viewport's bounds, handed down from the root's
+        // parent as it painted them now, and each node's own content box, which moved.
+        let sticky = self.tree.has_sticky.then(|| self.tree.nodes[i].parent.map(|p| self.scroll.sticky_frame[p])).flatten();
+        if self.tree.has_sticky && sticky.is_none() { return None; }
         for j in 0..len {
             let p = k.prev[o + j];
             let n = &self.tree.nodes[i + j];
@@ -354,6 +363,10 @@ impl RuntimeCore {
                 k.pinh[i + j] = up;
             }
             self.paint.drawn[i + j] = sh.drawn(k.drawn[o + j]);
+            if let Some(up) = sticky {
+                let f = k.sticky_frame[o + j];
+                self.scroll.sticky_frame[i + j] = [up[0], up[1], f[2] + sh.d[1], f[3] + sh.d[1], up[4], up[5], f[6] + sh.d[0], f[7] + sh.d[0]];
+            }
             // What is its own: up to its first child's.
             let child = if j + 1 < len && ((o + j + 1) as u32) < p.end { Some(k.prev[o + j + 1]) } else { None };
             let own = |all: [u32; 2], first: fn(&PaintRec) -> u32| all[0] as usize..child.as_ref().map_or(all[1], first) as usize;
@@ -369,6 +382,7 @@ impl RuntimeCore {
             let (was, now) = (cut(raw, from), cut(sh.raw(raw), to));
             if empty(was) != empty(now) { return None; }
             k.hit_raw[i + j] = sh.raw(raw);
+            k.picture[i + j] = k.prev_picture[o + j];
             for at in own(p.hits, |c| c.hits[0]) {
                 if k.hits[at].1 != was { return None; }
                 self.hit.hits.push((k.hits[at].0, now));
@@ -432,6 +446,7 @@ impl RuntimeCore {
             inh_key(&x) == inh_key(got)
         };
         if (0..len).any(|j| !alike(&m.inh[j], &self.paint.inh_scratch[r + j])) { differ.push("moved inherited state"); }
+        if self.tree.has_sticky && (0..len).any(|j| (0..8).any(|e| { let (g, w) = (self.scroll.sticky_frame[r + j][e], m.sticky[j][e]); g != w && !near(g, w) })) { differ.push("moved sticky frames"); }
         if self.track_marks && self.marks.get(range(now.inst)) != k.marks.get(range(was.inst)) { differ.push("marks"); }
         if now.glyphs[1] - now.glyphs[0] != was.glyphs[1] - was.glyphs[0] { differ.push("glyph count"); }
         if k.pages[range(now.pages)] != k.prev_pages[range(was.pages)] { differ.push("atlas pages"); }
