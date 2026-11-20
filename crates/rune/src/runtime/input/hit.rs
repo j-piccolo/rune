@@ -277,7 +277,7 @@ impl RuntimeCore {
     }
 
     pub(crate) fn is_exiting(&self, id: NodeId) -> bool {
-        matches!(self.scene.phase(id), Some(PresencePhase::Exiting { .. }))
+        self.scene.any_exiting() && matches!(self.scene.phase(id), Some(PresencePhase::Exiting { .. }))
     }
 
     /// The single reachable editor in a textbox. Only resolve descendants on presses;

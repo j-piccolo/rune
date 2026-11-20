@@ -267,8 +267,16 @@ struct Node {
 
 impl Node {
     /// Moves this node's presence one event on, and asks for what the scene should do about it.
-    fn phase_step(&mut self, event: PhaseEvent) -> phase::Acts {
-        phase::step(&mut self.presence, &mut self.generation, event)
+    /// `exiting` is the scene's count of nodes on their way out, kept as this one starts or stops.
+    fn phase_step(&mut self, exiting: &mut u32, event: PhaseEvent) -> phase::Acts {
+        let was = self.presence.exiting();
+        let acts = phase::step(&mut self.presence, &mut self.generation, event);
+        match (was, self.presence.exiting()) {
+            (false, true) => *exiting += 1,
+            (true, false) => *exiting -= 1,
+            _ => {}
+        }
+        acts
     }
 }
 
@@ -296,6 +304,8 @@ pub struct Scene {
     root_tail: u32,
     order: Vec<u32>,
     order_dirty: bool,
+    /// How many nodes are exiting, so a frame with none asks no node for its phase.
+    exiting: u32,
     out: Vec<Presented>,
     /// What [`Scene::present`] presented after the motion trace wrote its frame, for the next.
     late: Vec<Presented>,
@@ -328,6 +338,7 @@ impl Scene {
             root_tail: NONE,
             order: Vec::new(),
             order_dirty: false,
+            exiting: 0,
             out: Vec::new(),
             late: Vec::new(),
             exited: Carry::new(),
@@ -417,6 +428,10 @@ impl Scene {
     pub fn contains(&self, id: NodeId) -> bool {
         self.index.contains_key(&id.0)
     }
+    /// Whether any node is exiting: still drawn after the app removed it.
+    pub fn any_exiting(&self) -> bool {
+        self.exiting > 0
+    }
     pub fn phase(&self, id: NodeId) -> Option<Phase> {
         let i = self.slot(id)?;
         Some(self.nodes[i].presence.public(self.nodes[i].generation))
@@ -488,6 +503,10 @@ impl Scene {
         self.store.remove_node(id);
         self.index.remove(&id.0);
         let n = &mut self.nodes[i];
+        if n.presence.exiting() {
+            self.exiting -= 1;
+            n.presence = Presence::LANDED;
+        }
         n.alive = false;
         n.dirty = false;
         n.first_child = NONE;

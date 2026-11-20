@@ -43,7 +43,7 @@ impl RuntimeCore {
 
     /// Ends the exits that drew nothing last frame. A flight paints outside its clips, so it stays.
     pub(in crate::runtime) fn end_unseen_exits(&mut self) {
-        if !self.tree.built { return; }
+        if !self.tree.built || !self.scene.any_exiting() { return; }
         let mut hid: Option<Vec<bool>> = None;
         for i in 0..self.tree.nodes.len() {
             let id = self.tree.nodes[i].id;
