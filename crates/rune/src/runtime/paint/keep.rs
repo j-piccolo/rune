@@ -533,6 +533,13 @@ impl RuntimeCore {
                 ..p
             };
         }
+        // A copy is never closed (`keep_close`), so it hands its pictures up here. Otherwise the
+        // node above, painted around it, records none, and when that node is copied next it is
+        // copied without asking the atlas for them: their pages go untouched, the atlas reuses
+        // the space, and the copy shows whatever image lands there.
+        if r.pictures && let Some(p) = self.tree.nodes[i].parent {
+            k.recs[p].pictures = true;
+        }
         k.kept += len;
     }
 
