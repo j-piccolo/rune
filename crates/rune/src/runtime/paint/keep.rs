@@ -48,11 +48,13 @@ pub(in crate::runtime) struct PaintRec {
     /// What its own fields say (`static_ok`), kept while its epoch is.
     fits: bool,
     keep: bool,
+    /// A glyph of its own text lay outside the clip and was left out (`keep_shift.rs`).
+    cut: bool,
 }
 
 impl Default for PaintRec {
     fn default() -> Self {
-        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, inh: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false }
+        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, inh: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false }
     }
 }
 
@@ -72,6 +74,14 @@ pub(in crate::runtime) struct PaintKeep {
     drawn_scale: Vec<f32>,
     seen: Vec<bool>,
     inh: Vec<Inh>,
+    /// What each node inherited when it painted, this paint and last: a subtree that inherits
+    /// the same but for a move is copied where it is now (`keep_shift.rs`).
+    pinh: Vec<Inh>,
+    prev_pinh: Vec<Inh>,
+    /// The window in device pixels, as this paint culls against it.
+    vp: [f32; 4],
+    /// The node painting now left a glyph of its text out, for lying outside the clip.
+    pub(in crate::runtime) glyph_out: bool,
     sticky_frame: Vec<[f32; 8]>,
     pages: Vec<(u16, u32)>,
     prev_pages: Vec<(u16, u32)>,
@@ -98,6 +108,14 @@ pub(in crate::runtime) struct PaintKeep {
     /// Debug builds: the last paint's index of a subtree painted to check its copy.
     verify: Vec<u32>,
     verify_span: (usize, usize),
+    /// Debug builds: the move such a subtree's copy would be made with.
+    verify_shift: Vec<Option<shift::Shift>>,
+    /// Nodes copied this paint from where they were (`RUNE_PAINT_KEEP_LOG`).
+    shifted: usize,
+    /// Tests: the nodes of moved subtrees checked against their paint so far, and how many of
+    /// those subtrees painted something else.
+    #[cfg(test)]
+    pub(in crate::runtime) moved_checks: (usize, usize),
     /// Nodes copied this paint, and why the others weren't as they were (`RUNE_PAINT_KEEP_LOG`).
     kept: usize,
     why: [usize; 6],
@@ -183,6 +201,9 @@ impl RuntimeCore {
         std::mem::swap(&mut self.paint.inh_scratch, &mut k.inh);
         std::mem::swap(&mut self.scroll.sticky_frame, &mut k.sticky_frame);
         std::mem::swap(&mut k.recs, &mut k.prev);
+        std::mem::swap(&mut k.pinh, &mut k.prev_pinh);
+        // Not cleared: a node reads last paint's only where its record says it was written.
+        k.pinh.resize(self.tree.nodes.len(), Inh::default());
         std::mem::swap(&mut k.pages, &mut k.prev_pages);
         // The other pairs too, as the instances above: a paint that grows one buffer doesn't
         // leave the frame after it to grow the other.
@@ -198,6 +219,7 @@ impl RuntimeCore {
         k.recs.resize(self.tree.nodes.len(), PaintRec::default());
         k.open.clear();
         k.kept = 0;
+        k.shifted = 0;
     }
 
     /// Whether this paint copies what it can, from the window's shared state, and if so which
@@ -232,6 +254,11 @@ impl RuntimeCore {
         k.verify.clear();
         k.verify.resize(n, NONE);
         k.verify_span = (0, 0);
+        k.vp = vp;
+        if cfg!(debug_assertions) {
+            k.verify_shift.clear();
+            k.verify_shift.resize(n, None);
+        }
         if !k.recording {
             return;
         }
@@ -334,7 +361,9 @@ impl RuntimeCore {
             glyphs: [glyphs as u32; 2],
             fits: self.paint.keep.fits[i],
             keep: self.paint.keep.fits[i] && dynamic_ok(self, i, sel, marks),
+            cut: false,
         };
+        self.paint.keep.glyph_out = false;
         self.paint.keep.recs[i] = rec;
         self.paint.keep.open.push(i);
     }
@@ -346,6 +375,7 @@ impl RuntimeCore {
         if !self.paint.keep.recording || !self.paint.keep.recs[i].keep { return None; }
         let inh = inh_key(pinh);
         self.paint.keep.recs[i].inh = inh;
+        self.paint.keep.pinh[i] = *pinh;
         let k = &self.paint.keep;
         if !k.on || !k.clean[i] {
             return None;
@@ -353,53 +383,71 @@ impl RuntimeCore {
         let o = k.old[i] as usize;
         let r = k.prev[o];
         let end = k.end[i] as usize;
-        if !r.keep || r.inh != inh || r.end as usize - o != end - i {
+        if !r.keep || r.end as usize - o != end - i {
             return None;
         }
+        // Inheriting what it did, it is copied as it was; inheriting that but for a move, where
+        // it is now.
+        let starts = self.keep_starts();
+        let shift = if r.inh == inh { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
         if cfg!(debug_assertions) {
+            // The move was only tried: the subtree paints, and is checked against it.
+            if shift.is_some() {
+                self.keep_unwind(starts);
+                self.paint.keep.shifted -= end - i;
+            }
             // Checked as one: what it holds paints as it does, inside it.
             let (a, b) = self.paint.keep.verify_span;
             if !(a..b).contains(&i) {
                 self.paint.keep.verify[i] = o as u32;
+                self.paint.keep.verify_shift[i] = shift;
                 self.paint.keep.verify_span = (i, end);
                 self.paint.keep.kept += end - i;
             }
             return None;
         }
-        self.keep_copy(i, o, end, glyph_count);
+        self.keep_copy(i, o, end, glyph_count, starts, shift.is_some());
         Some(end - i)
     }
 
-    fn keep_copy(&mut self, i: usize, o: usize, end: usize, glyph_count: &mut usize) {
+    /// Copies the subtree at last paint's `o` as this paint's `i..end`. `moved`: `keep_move`
+    /// has added what it painted already, from `starts` on.
+    fn keep_copy(&mut self, i: usize, o: usize, end: usize, glyph_count: &mut usize, starts: shift::Starts, moved: bool) {
         let k = &mut self.paint.keep;
         k.open.pop();
         let r = k.prev[o];
         let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
-        let at = [self.instances.len(), self.hit.hits.len(), self.hit.overlay_hits.len(), k.pages.len()];
-        self.instances.extend_from_slice(&k.instances[range(r.inst)]);
-        if self.track_marks {
-            self.marks.resize(at[0], 0);
-            self.marks.extend_from_slice(&k.marks[range(r.inst)]);
+        let at = [starts.instances, starts.hits, starts.overlay, k.pages.len()];
+        let (at_wheel, at_help, at_drop) = (starts.wheel, starts.help, starts.drop);
+        let len = end - i;
+        match moved {
+            true => {}
+            false => {
+                self.instances.extend_from_slice(&k.instances[range(r.inst)]);
+                if self.track_marks {
+                    self.marks.resize(at[0], 0);
+                    self.marks.extend_from_slice(&k.marks[range(r.inst)]);
+                }
+                self.hit.hits.extend_from_slice(&k.hits[range(r.hits)]);
+                self.hit.wheel_hits.extend_from_slice(&k.wheel[range(r.wheel)]);
+                self.hit.overlay_hits.extend_from_slice(&k.overlay[range(r.overlay)]);
+                let seq = |s: usize| s + at[1] - r.hits[0] as usize;
+                self.hit.help_hits.extend(k.help[range(r.help)].iter().map(|&(id, rect, s, l)| (id, rect, seq(s), l)));
+                self.hit.drop_hits.extend(k.drop[range(r.drop)].iter().map(|&(id, rect, s)| (id, rect, seq(s))));
+                self.paint.drawn[i..end].copy_from_slice(&k.drawn[o..o + len]);
+                self.paint.drawn_scale[i..end].copy_from_slice(&k.drawn_scale[o..o + len]);
+                self.paint.seen[i..end].copy_from_slice(&k.seen[o..o + len]);
+                self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
+                k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
+            }
         }
-        self.hit.hits.extend_from_slice(&k.hits[range(r.hits)]);
-        let at_wheel = self.hit.wheel_hits.len();
-        self.hit.wheel_hits.extend_from_slice(&k.wheel[range(r.wheel)]);
-        self.hit.overlay_hits.extend_from_slice(&k.overlay[range(r.overlay)]);
-        let seq = |s: usize| s + at[1] - r.hits[0] as usize;
-        let (at_help, at_drop) = (self.hit.help_hits.len(), self.hit.drop_hits.len());
-        self.hit.help_hits.extend(k.help[range(r.help)].iter().map(|&(id, rect, s, l)| (id, rect, seq(s), l)));
-        self.hit.drop_hits.extend(k.drop[range(r.drop)].iter().map(|&(id, rect, s)| (id, rect, seq(s))));
+        let k = &mut self.paint.keep;
         let pages = range(r.pages);
         k.pages.extend_from_slice(&k.prev_pages[pages.clone()]);
         for &(page, texels) in &k.prev_pages[pages] {
             self.text.touch_quad(page, texels);
         }
         *glyph_count += (r.glyphs[1] - r.glyphs[0]) as usize;
-        let len = end - i;
-        self.paint.drawn[i..end].copy_from_slice(&k.drawn[o..o + len]);
-        self.paint.drawn_scale[i..end].copy_from_slice(&k.drawn_scale[o..o + len]);
-        self.paint.seen[i..end].copy_from_slice(&k.seen[o..o + len]);
-        self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
         if self.tree.has_sticky {
             self.scroll.sticky_frame[i..end].copy_from_slice(&k.sticky_frame[o..o + len]);
         }
@@ -445,6 +493,7 @@ impl RuntimeCore {
             }
         }
         k.recs[i].keep &= ok;
+        k.recs[i].cut = std::mem::take(&mut k.glyph_out);
     }
 
     /// Closes the records of the open subtrees node `next`'s parent isn't inside (all of them
@@ -505,6 +554,7 @@ impl RuntimeCore {
         k.moved.clear();
         if !k.recording {
             k.recs.clear();
+            k.shifted = 0;
             return;
         }
         // Subtree ends, from the tree: a record holds one past its subtree.
@@ -522,7 +572,7 @@ impl RuntimeCore {
         for r in open.drain(..) { k.recs[r].end = n as u32; }
         k.moved.clear();
         if logging() {
-            eprintln!("rune: paint keep: {} of {} nodes copied (on: {}; unfit {}, new {}, moved {}, rebuilt {}, rows {}, as they were {})", k.kept, n, k.on, k.why[0], k.why[1], k.why[2], k.why[3], k.why[4], k.why[5]);
+            eprintln!("rune: paint keep: {} of {} nodes copied, {} of them from where they were (on: {}; unfit {}, new {}, moved {}, rebuilt {}, rows {}, as they were {})", k.kept, n, k.shifted, k.on, k.why[0], k.why[1], k.why[2], k.why[3], k.why[4], k.why[5]);
             k.why = [0; 6];
         }
     }
@@ -535,6 +585,19 @@ impl RuntimeCore {
         let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
         let bytes = bytemuck::cast_slice::<Instance, u8>;
         let mut differ = Vec::new();
+        if let Some(sh) = k.verify_shift[r] {
+            self.keep_check_shifted(r, o, &sh, &mut differ);
+            #[cfg(test)]
+            {
+                let checked = self.paint.keep.end[r] as usize - r;
+                let k = &mut self.paint.keep;
+                k.moved_checks = (k.moved_checks.0 + checked, k.moved_checks.1 + !differ.is_empty() as usize);
+            }
+            if !differ.is_empty() {
+                eprintln!("rune: paint keep: {} would have copied, moved, what differs: {}", self.tree.nodes[r].path, differ.join(", "));
+            }
+            return;
+        }
         if bytes(&self.instances[range(now.inst)]) != bytes(&k.instances[range(was.inst)]) { differ.push("instances"); }
         if self.hit.hits[range(now.hits)] != k.hits[range(was.hits)] { differ.push("hits"); }
         if self.hit.wheel_hits[range(now.wheel)] != k.wheel[range(was.wheel)] { differ.push("wheel hits"); }
@@ -561,6 +624,8 @@ impl RuntimeCore {
 
 #[path = "cycle.rs"]
 pub(super) mod cycle;
+#[path = "keep_shift.rs"]
+mod shift;
 #[path = "slide.rs"]
 mod slide;
 

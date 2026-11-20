@@ -82,7 +82,9 @@ pub(crate) struct PaintState {
     pub(in crate::runtime) text_rows: HashMap<NodeId, (f32, f32)>,
     /// Each still text's quads as it drew them, by node and layout id, and the paint they were
     /// last used in (`paint_content`): a frame that draws it the same copies them.
-    pub(super) text_quads: HashMap<(NodeId, crate::text::LayoutId), (crate::el::grid::DrawnRow, u64)>,
+    /// With each: the frame it was last used in, and whether a glyph of the text lay outside
+    /// the clip and was left out of it.
+    pub(super) text_quads: HashMap<(NodeId, crate::text::LayoutId), (crate::el::grid::DrawnRow, u64, bool)>,
     /// `El::system_material` elements built this frame, in paint order.
     pub(super) materials: Vec<crate::system_material::MaterialDraw>,
     /// Per-window cap on native `El::system_material` views (default `MAX_NATIVE_MATERIALS`,
@@ -518,6 +520,13 @@ impl PaintState {
     #[inline]
     pub(crate) fn icon_aprons(&self) -> &[[u32; 3]] {
         &self.icon_aprons
+    }
+
+    /// Tests: the nodes of moved subtrees a debug build checked against their paint, and the
+    /// subtrees that painted something else (`keep_shift.rs`).
+    #[cfg(test)]
+    pub(in crate::runtime) fn moved_checks(&self) -> (usize, usize) {
+        self.keep.moved_checks
     }
 
     #[cfg(test)]
