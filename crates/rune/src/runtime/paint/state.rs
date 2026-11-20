@@ -522,6 +522,12 @@ impl PaintState {
         &self.icon_aprons
     }
 
+    /// Node `i`'s box as its hit rects are cut from it, for a copy of them that moves.
+    #[inline]
+    pub(in crate::runtime) fn note_hit_raw(&mut self, i: usize, rect: [f32; 4]) {
+        if let Some(raw) = self.keep.hit_raw.get_mut(i) { *raw = rect; }
+    }
+
     /// Tests: the nodes of moved subtrees a debug build checked against their paint, and the
     /// subtrees that painted something else (`keep_shift.rs`).
     #[cfg(test)]
