@@ -3,9 +3,10 @@
 //! Each paint records, for every node, what its subtree emitted (its instances and their marks,
 //! its hits, the atlas pages its glyphs sample, its glyph count) and what that depended on: the
 //! node's commit epoch (a node built again from its element gets a new one; a node a region kept
-//! keeps its own), the per-node rows paint reads (`row_dy`, `row_h`, `row_mask`), and the hash of
-//! the state it inherited (`Inh`). The next paint copies a subtree whose nodes are the same ones,
-//! in the same shape, none of whose scene values were presented again since, under the same
+//! keeps its own), the per-node rows paint reads (`row_dy`, `row_h`, `row_mask`), and the state
+//! it inherited (`Inh`). The next paint copies a subtree whose nodes are the same ones, in the
+//! same shape, none of which the scene presented again for itself since (one presented only for
+//! a node above it, with what it was presented with before, is as it was), under the same
 //! inherited state, in a window whose shared paint state (scale, viewport, blending, the glyph
 //! atlas's key, focus) is the same. What paint would read elsewhere, or as time passes, keeps a
 //! node from being copied (`static_ok`, `dynamic_ok`, and what the paint of it found).
@@ -33,7 +34,6 @@ pub(in crate::runtime) struct PaintRec {
     /// Its index less its parent's (0 for a root).
     up: u32,
     own: u64,
-    inh: u64,
     /// One past its subtree's last node.
     end: u32,
     inst: [u32; 2],
@@ -56,7 +56,7 @@ pub(in crate::runtime) struct PaintRec {
 
 impl Default for PaintRec {
     fn default() -> Self {
-        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, inh: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false, pictures: false }
+        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false, pictures: false }
     }
 }
 
@@ -136,6 +136,10 @@ pub(in crate::runtime) struct PaintKeep {
     /// those subtrees painted something else.
     #[cfg(test)]
     pub(in crate::runtime) moved_checks: (usize, usize),
+    /// Tests: copy as a release build does, rather than paint what would be copied and check
+    /// it, so a test can follow copies made from copies (`keep_shift.rs`).
+    #[cfg(test)]
+    pub(in crate::runtime) real_copies: bool,
     /// Tests: the nodes presented again only for one above them and found as they were, and
     /// how many subtrees, copied from where they were, painted something else.
     #[cfg(test)]
@@ -392,7 +396,6 @@ impl RuntimeCore {
             epoch: self.tree.nodes[i].epoch,
             up: self.tree.nodes[i].parent.map_or(0, |p| (i - p) as u32),
             own: own_key(self, i),
-            inh: 0,
             end: 0,
             inst: [self.instances.len() as u32; 2],
             hits: [self.hit.hits.len() as u32; 2],
@@ -420,8 +423,6 @@ impl RuntimeCore {
     pub(in crate::runtime) fn keep_or_paint(&mut self, i: usize, pinh: &Inh, glyph_count: &mut usize) -> Option<usize> {
         // Only a node that can be copied needs what it inherits.
         if !self.paint.keep.recording || !self.paint.keep.recs[i].keep { return None; }
-        let inh = inh_key(pinh);
-        self.paint.keep.recs[i].inh = inh;
         self.paint.keep.pinh[i] = *pinh;
         let k = &self.paint.keep;
         if !k.on || !k.clean[i] {
@@ -436,10 +437,12 @@ impl RuntimeCore {
         // A picture is copied only while the atlas holds the pixels it drew, where it drew them.
         if r.pictures && !self.keep_pictures_hold(i, o, end - i) { return None; }
         // Inheriting what it did, it is copied as it was; inheriting that but for a move, where
-        // it is now.
+        // it is now. What each node inherited is held for it, painted or copied, as the paint
+        // left it: one copied where a scroll took it holds what it inherited there.
+        let same = inh_key(&self.paint.keep.prev_pinh[o]) == inh_key(pinh);
         let starts = self.keep_starts();
-        let shift = if r.inh == inh { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
-        if cfg!(debug_assertions) {
+        let shift = if same { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
+        if cfg!(debug_assertions) && !real_copies(&self.paint.keep) {
             // The move was only tried: the subtree paints, and is checked against it.
             let moved = shift.map(|_| Box::new(self.keep_take_moved(i, end, starts)));
             // Checked as one: what it holds paints as it does, inside it.
@@ -732,6 +735,15 @@ fn twin<T>(now: &mut Vec<T>, was: &Vec<T>) {
     if now.capacity() < was.capacity() {
         now.reserve_exact(was.capacity() - now.len());
     }
+}
+
+/// Whether a test asked for copies as a release build makes them (`PaintKeep::real_copies`).
+#[inline]
+fn real_copies(k: &PaintKeep) -> bool {
+    #[cfg(test)]
+    { k.real_copies }
+    #[cfg(not(test))]
+    { let _ = k; false }
 }
 
 /// The per-node rows paint reads besides the node.

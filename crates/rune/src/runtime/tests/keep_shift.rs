@@ -246,3 +246,37 @@ fn rows_under_sticky_headers_paint_what_their_moved_copies_hold() {
         assert_eq!(differed, 0, "a moved copy differs from its paint at {scale}x");
     }
 }
+
+/// Whether two paints drew the same, but for a moved copy's rects and clips, which may differ
+/// from a fresh paint's in the last bit (`keep_check_moved`).
+fn same_paint(a: &[crate::render::Instance], b: &[crate::render::Instance]) -> bool {
+    let near = |x: [f32; 4], y: [f32; 4]| (0..4).all(|k| x[k] == y[k] || (x[k] - y[k]).abs() < 1e-3);
+    let rest = |q: &crate::render::Instance| crate::render::Instance { rect: [0.0; 4], clip: [0.0; 4], ..*q };
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| near(x.rect, y.rect) && near(x.clip, y.clip) && bytemuck::bytes_of(&rest(x)) == bytemuck::bytes_of(&rest(y)))
+}
+
+/// A page scrolled down, then straight back as a card in its first row takes the pointer:
+/// copied where the scroll took them, the rows are then copied again from those copies, each
+/// by what it inherited there. Copying as a release build does, the page paints what a runtime
+/// painting all of it does, frame by frame.
+#[test]
+fn a_page_scrolled_down_and_back_copies_its_rows_from_where_they_were() {
+    for scale in [1.0, 1.25, 2.0] {
+        let mut copied = Runtime::new((), page, (640.0, 400.0), Env::new(true, scale));
+        copied.paint.copy_for_real();
+        let mut painted = Runtime::new((), page, (640.0, 400.0), Env::new(true, scale));
+        let mut differed = Vec::new();
+        for f in 0..16 {
+            for rt in [&mut copied, &mut painted] {
+                match f {
+                    2 => rt.wheel_xy(320.0, 200.0, 0.0, -40.0),
+                    3 => { rt.wheel_xy(320.0, 200.0, 0.0, 40.0); rt.pointer_move(70.0, 80.0); }
+                    _ => {}
+                }
+                rt.frame(if f == 0 { 0.0 } else { 1.0 / 120.0 });
+            }
+            if !same_paint(&copied.instances, &painted.instances) { differed.push(f); }
+        }
+        assert!(differed.is_empty(), "frames painted otherwise than a full paint at {scale}x: {differed:?}");
+    }
+}
