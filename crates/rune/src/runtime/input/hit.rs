@@ -367,6 +367,8 @@ impl RuntimeCore {
         (press_k, press_anchor): (f32, [f32; 2]),
     ) {
         let s = self.env.scale;
+        // What the hit rects below are cut from, for a copy of them that moves (`keep_shift.rs`).
+        self.paint.note_hit_raw(i, rect_pt);
         let n = &self.tree.nodes[i];
         let hits_before = self.hit.hits_len();
         if (n.vis_flags.hit() || n.handlers.get().is_some_and(crate::el::Handlers::takes_hit) || n.input.is_some() || n.role == "textbox" || n.window_drag != crate::el::WindowDrag::None || n.focus.get().is_some_and(|f| f.enabled)
