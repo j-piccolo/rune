@@ -647,6 +647,8 @@ impl RuntimeCore {
                 // as `El::grid` rows do: `quads` is the entry to record them under otherwise.
                 let mut copied = false;
                 let mut quads: Option<((NodeId, crate::text::LayoutId), u64, usize, usize)> = None;
+                // A glyph outside the clip is left out: a text copied where it moved to lacks it.
+                let mut left_out = false;
                 let mut pages: Option<Vec<(u16, u32)>> = None;
                 let zoom = if let (Some(r), Some((_, at))) = (&n.run_layout, &spec.cold.advance_in)
                     && let Some(x) = r.x(*at)
@@ -670,6 +672,8 @@ impl RuntimeCore {
                     } else {
                         f32::NEG_INFINITY..f32::INFINITY
                     };
+                    // Lines outside the band are left out as glyphs outside the clip are.
+                    left_out |= band.start > 0.0 || band.end < layout.height();
                     let bytes = reveal.is_some() || !link_fx.is_empty() || has_hl_fg || selected_ink.is_some();
                     // A secret's glyphs aren't kept past the frame that draws them.
                     let secret = spec.redacted || n.input.as_ref().is_some_and(|i| i.edit.is_secure());
@@ -689,9 +693,10 @@ impl RuntimeCore {
                             (sp.start, sp.end, sp.color.map(|c| premul(c, o, srgb).map(f32::to_bits))).hash(&mut h);
                         }
                         let (id, key) = ((n.id, layout_id), h.finish());
-                        match self.paint.text_quads.get_mut(&id).filter(|(d, _)| d.key == key) {
-                            Some((d, used)) => {
+                        match self.paint.text_quads.get_mut(&id).filter(|(d, _, _)| d.key == key) {
+                            Some((d, used, out)) => {
                                 *used = self.paint.quads_frame;
+                                left_out = *out;
                                 self.instances.extend_from_slice(&d.instances);
                                 d.pages.iter().for_each(|&(page, texels)| self.text.touch_quad(page, texels));
                                 *glyph_count += d.glyphs;
@@ -733,7 +738,7 @@ impl RuntimeCore {
                     // `El::scroll_x` skips the glyphs scrolled out of sight.
                     let out = y0 > clip[3] || y1 < clip[1] || x0 > clip[2] || x1 < clip[0];
                     self.paint.keep.cycles.glyph([x0, y0, x1, y1], !out);
-                    if out { continue; }
+                    if out { left_out = true; continue; }
                     let mut f = base;
                     if q.ink > 0
                         && let Some(c) = spans.get(q.ink as usize - 1).and_then(|sp| sp.color)
@@ -780,8 +785,9 @@ impl RuntimeCore {
                 }
                 if let (Some((id, key, start, glyphs)), Some(pages)) = (quads, pages) {
                     let d = crate::el::grid::DrawnRow { key, instances: self.instances[start..].to_vec(), pages, glyphs: *glyph_count - glyphs };
-                    self.paint.text_quads.insert(id, (d, self.paint.quads_frame));
+                    self.paint.text_quads.insert(id, (d, self.paint.quads_frame, left_out));
                 }
+                self.paint.keep.glyph_out |= left_out;
             }
             if let (Some(c), Some(inp)) = (caret, &n.input) {
                 self.instances.push(rect_inst(c, premul(inp.caret, o, srgb), 0.0, clip, fade));
