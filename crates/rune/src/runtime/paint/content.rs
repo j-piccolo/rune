@@ -125,27 +125,35 @@ impl RuntimeCore {
             let snap_u = if cover.is_none() { (1.0 - (sc - 1.0).abs() * 32.0).clamp(0.0, 1.0) } else { 0.0 };
             let (rect, crop) = crate::pixels::fit_in(n.vis.pixels_fit, n.vis.surface_place, [r[0], r[1], w, h], pixels.size(), snap_u);
             let span = [crop[2] - crop[0], crop[3] - crop[1]];
-            if rect[2] > 0.0 && rect[3] > 0.0 && span[0] > 0.0 && span[1] > 0.0 {
-                // The mip covers the whole image's drawn size, not just its visible window.
-                if let Some((image, next)) = self.images.place_at(pixels, [rect[2] / span[0], rect[3] / span[1]], Some(now)) {
-                    if let Some(at) = next {
-                        arm_image_wake(&mut self.paint, &mut self.motion, self.frame.live.visible(), self.clock, self.time_scale, now, at);
-                    }
-                    let [x, y, iw, ih] = image.rect.map(|v| v as f32);
-                    // A letterboxed image rounds its own, smaller corners.
-                    let half = rect[2].min(rect[3]) * 0.5;
-                    self.instances.push(Instance {
-                        rect,
-                        radii: if n.vis.pixels_fit.is_some() { radii.map(|v| v.min(half)) } else { radii },
-                        fill: [0.0, 0.0, 0.0, o],
-                        border: [0.0; 4],
-                        params: [image.page as f32, KIND_IMAGE, image.premultiplied as u8 as f32, 1.0],
-                        // The shader samples from a whole-texel origin; the span may be fractional.
-                        uv: [x + (crop[0] * iw).round(), y + (crop[1] * ih).round(), span[0] * iw, span[1] * ih],
-                        clip,
-                        fade: crate::render::pack_fade(fade, clip, clip),
-                    });
-                }
+            let drawn = [rect[2] / span[0], rect[3] / span[1]];
+            // The mip covers the whole image's drawn size, not just its visible window.
+            let placed = if rect[2] > 0.0 && rect[3] > 0.0 && span[0] > 0.0 && span[1] > 0.0 {
+                self.images.place_at(pixels, drawn, Some(now))
+            } else {
+                None
+            };
+            // For a copy of this picture, which holds while the atlas gives the same again.
+            if let Some(picture) = self.paint.keep.picture.get_mut(i) {
+                *picture = Some(paint_keep::Picture { signature: pixels.signature(), drawn, placed: placed.map(|(image, _)| image), plays: placed.is_some_and(|(_, next)| next.is_some()) });
+            }
+            if let Some((_, Some(at))) = placed {
+                arm_image_wake(&mut self.paint, &mut self.motion, self.frame.live.visible(), self.clock, self.time_scale, now, at);
+            }
+            if let Some((image, _)) = placed {
+                let [x, y, iw, ih] = image.rect.map(|v| v as f32);
+                // A letterboxed image rounds its own, smaller corners.
+                let half = rect[2].min(rect[3]) * 0.5;
+                self.instances.push(Instance {
+                    rect,
+                    radii: if n.vis.pixels_fit.is_some() { radii.map(|v| v.min(half)) } else { radii },
+                    fill: [0.0, 0.0, 0.0, o],
+                    border: [0.0; 4],
+                    params: [image.page as f32, KIND_IMAGE, image.premultiplied as u8 as f32, 1.0],
+                    // The shader samples from a whole-texel origin; the span may be fractional.
+                    uv: [x + (crop[0] * iw).round(), y + (crop[1] * ih).round(), span[0] * iw, span[1] * ih],
+                    clip,
+                    fade: crate::render::pack_fade(fade, clip, clip),
+                });
             }
         }
         if let Some((ic, _)) = n.vis.icon {
