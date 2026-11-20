@@ -318,8 +318,11 @@ pub struct Scene {
     order: Vec<u32>,
     order_dirty: bool,
     out: Vec<Presented>,
+    /// For each of `out`: whether the node itself changed, or only one above it did.
+    out_own: Vec<bool>,
     /// What [`Scene::present`] presented after the motion trace wrote its frame, for the next.
     late: Vec<Presented>,
+    late_own: Vec<bool>,
     /// Nodes currently in [`Phase::Exiting`], in no fixed order.
     exiting: Vec<NodeId>,
     exited: Carry<NodeId>,
@@ -356,7 +359,9 @@ impl Scene {
             order: Vec::new(),
             order_dirty: false,
             out: Vec::new(),
+            out_own: Vec::new(),
             late: Vec::new(),
+            late_own: Vec::new(),
             exiting: Vec::new(),
             exited: Carry::new(),
             to_remove: Vec::new(),

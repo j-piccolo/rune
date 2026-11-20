@@ -88,6 +88,11 @@ pub(in crate::runtime) struct PaintKeep {
     /// and last: a copy that moved cuts it again where the clip is now.
     pub(in crate::runtime) hit_raw: Vec<[f32; 4]>,
     prev_hit_raw: Vec<[f32; 4]>,
+    /// What the scene presented for each node when it painted, and where it said the node comes
+    /// to rest, this paint and last. A node presented again since only because one above it was
+    /// (`carried`), with the very same values, is as it was.
+    pub(in crate::runtime) shown: Vec<Option<Shown>>,
+    prev_shown: Vec<Option<Shown>>,
     /// Each picture's place in the image atlas as it was drawn, this paint and last: a copy
     /// of it holds while the atlas still has those pixels there (`keep_pictures_hold`).
     pub(in crate::runtime) picture: Vec<Option<Picture>>,
@@ -98,8 +103,10 @@ pub(in crate::runtime) struct PaintKeep {
     sticky_frame: Vec<[f32; 8]>,
     pages: Vec<(u16, u32)>,
     prev_pages: Vec<(u16, u32)>,
-    /// Nodes presented again since the last paint.
+    /// Nodes presented again since the last paint: a value of their own changed.
     pub(in crate::runtime) moved: Vec<NodeId>,
+    /// Nodes presented again since the last paint only because a node above them was.
+    pub(in crate::runtime) carried: Vec<NodeId>,
     moved_at: Vec<bool>,
     /// The window's shared paint state at the last paint, when it could be kept from.
     key: Option<u64>,
@@ -129,6 +136,10 @@ pub(in crate::runtime) struct PaintKeep {
     /// those subtrees painted something else.
     #[cfg(test)]
     pub(in crate::runtime) moved_checks: (usize, usize),
+    /// Tests: the nodes presented again only for one above them and found as they were, and
+    /// how many subtrees, copied from where they were, painted something else.
+    #[cfg(test)]
+    pub(in crate::runtime) carried_checks: (usize, usize),
     /// Nodes copied this paint, and why the others weren't as they were (`RUNE_PAINT_KEEP_LOG`).
     kept: usize,
     why: [usize; 6],
@@ -219,6 +230,8 @@ impl RuntimeCore {
         k.pinh.resize(self.tree.nodes.len(), Inh::default());
         std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
         k.hit_raw.resize(self.tree.nodes.len(), [0.0; 4]);
+        std::mem::swap(&mut k.shown, &mut k.prev_shown);
+        k.shown.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.picture, &mut k.prev_picture);
         k.picture.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.text_cut, &mut k.prev_text_cut);
@@ -315,6 +328,17 @@ impl RuntimeCore {
         }
         k.moved_at.clear();
         k.moved_at.resize(n, false);
+        // The scene presents a whole subtree again when the node above it changes at all. One
+        // presented with what it painted from last time, nothing of its own having changed,
+        // hasn't moved; what it inherits is compared as it paints.
+        for id in &k.carried {
+            if let Some(&i) = self.tree.node_index.get(id) && i < n {
+                let was = k.prev_shown.get(k.old[i] as usize).copied().flatten();
+                k.moved_at[i] = was.is_none() || was != shown(&self.scene, *id);
+                #[cfg(test)]
+                { k.carried_checks.0 += !k.moved_at[i] as usize; }
+            }
+        }
         for id in &k.moved {
             if let Some(&i) = self.tree.node_index.get(id) && i < n {
                 k.moved_at[i] = true;
@@ -386,6 +410,7 @@ impl RuntimeCore {
         self.paint.keep.glyph_out = false;
         self.paint.keep.picture[i] = None;
         self.paint.keep.text_cut[i] = None;
+        self.paint.keep.shown[i] = shown(&self.scene, self.tree.nodes[i].id);
         self.paint.keep.recs[i] = rec;
         self.paint.keep.open.push(i);
     }
@@ -477,6 +502,7 @@ impl RuntimeCore {
                 k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
                 k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
                 k.picture[i..end].copy_from_slice(&k.prev_picture[o..o + len]);
+                k.shown[i..end].copy_from_slice(&k.prev_shown[o..o + len]);
             }
         }
         let k = &mut self.paint.keep;
@@ -597,6 +623,7 @@ impl RuntimeCore {
         self.paint.close_slide(self.instances.len(), self.env.scale);
         let k = &mut self.paint.keep;
         k.moved.clear();
+        k.carried.clear();
         if !k.recording {
             k.recs.clear();
             k.shifted = 0;
@@ -616,6 +643,7 @@ impl RuntimeCore {
         }
         for r in open.drain(..) { k.recs[r].end = n as u32; }
         k.moved.clear();
+        k.carried.clear();
         if logging() {
             eprintln!("rune: paint keep: {} of {} nodes copied, {} of them from where they were (on: {}; unfit {}, new {}, moved {}, rebuilt {}, rows {}, as they were {})", k.kept, n, k.shifted, k.on, k.why[0], k.why[1], k.why[2], k.why[3], k.why[4], k.why[5]);
             k.why = [0; 6];
@@ -662,6 +690,8 @@ impl RuntimeCore {
         if now.glyphs[1] - now.glyphs[0] != was.glyphs[1] - was.glyphs[0] { differ.push("glyph count"); }
         if k.pages[range(now.pages)] != k.prev_pages[range(was.pages)] { differ.push("atlas pages"); }
         if !differ.is_empty() {
+            #[cfg(test)]
+            { self.paint.keep.carried_checks.1 += 1; }
             eprintln!("rune: paint keep: {} would have copied what differs: {}", self.tree.nodes[r].path, differ.join(", "));
         }
     }
@@ -703,6 +733,14 @@ fn own_key(rt: &RuntimeCore, i: usize) -> u64 {
     bits(&mut h, &[rt.paint.row_dy[i], rt.paint.row_h[i], rt.paint.row_mask[i]]);
     h.write_u8((rt.tree.has_dissolve && rt.paint.dissolve_scratch.get(i).copied().unwrap_or(false)) as u8);
     h.finish()
+}
+
+/// What the scene presents for a node and the rect it says the node comes to rest at, which
+/// paint snaps a gliding node by.
+pub(in crate::runtime) type Shown = (rune_motion::Presented, Option<rune_motion::Rect>);
+
+fn shown(scene: &rune_motion::Scene, id: NodeId) -> Option<Shown> {
+    Some((scene.presented(id)?, scene.rest(id)))
 }
 
 /// What a node's own fields say: paint reads nothing for it that changes without a new epoch
