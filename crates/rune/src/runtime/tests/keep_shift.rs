@@ -249,7 +249,7 @@ fn rows_under_sticky_headers_paint_what_their_moved_copies_hold() {
 
 /// Whether two paints drew the same, but for a moved copy's rects and clips, which may differ
 /// from a fresh paint's in the last bit (`keep_check_moved`).
-fn same_paint(a: &[crate::render::Instance], b: &[crate::render::Instance]) -> bool {
+pub(super) fn same_paint(a: &[crate::render::Instance], b: &[crate::render::Instance]) -> bool {
     let near = |x: [f32; 4], y: [f32; 4]| (0..4).all(|k| x[k] == y[k] || (x[k] - y[k]).abs() < 1e-3);
     let rest = |q: &crate::render::Instance| crate::render::Instance { rect: [0.0; 4], clip: [0.0; 4], ..*q };
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| near(x.rect, y.rect) && near(x.clip, y.clip) && bytemuck::bytes_of(&rest(x)) == bytemuck::bytes_of(&rest(y)))
