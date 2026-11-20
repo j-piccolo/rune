@@ -163,7 +163,7 @@ pub(in crate::runtime) struct PaintKeep {
     #[cfg(test)]
     pub(in crate::runtime) carried_checks: (usize, usize),
     /// Nodes copied this paint, and why the others weren't as they were (`RUNE_PAINT_KEEP_LOG`).
-    kept: usize,
+    pub(in crate::runtime) kept: usize,
     why: [usize; 6],
     /// The next paint paints everything (the raster check's fresh paint).
     pub(in crate::runtime) off_once: bool,

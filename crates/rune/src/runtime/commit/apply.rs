@@ -160,15 +160,12 @@ impl RuntimeCore {
             let i = cur_i;
             if live_row.is_some_and(|(root, _)| nodes[i].parent.is_none_or(|p| p < root)) { live_row = None; }
             let id = nodes[i].id;
-            let mut scene_rect = nodes[i].local;
+            let scene_rect = nodes[i].local;
             let parent_virtual = if has_virtuals {
                 nodes[i].parent.and_then(|p| self.commit.virtuals.get(&nodes[p].path))
             } else {
                 None
             };
-            if let Some(v) = parent_virtual {
-                scene_rect.y -= v.before;
-            }
             if !live_by_id.is_empty() && let Some(&row) = live_by_id.get(&id) { live_row = Some((i, row)); }
             let shift = live_row.and_then(|(_, row)| row.shift);
             let riding = live_row.is_some_and(|(_, row)| row.ink && row.shift.is_some_and(|jump| jump != 0.0)) && !nodes[i].instant_changes;

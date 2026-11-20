@@ -141,7 +141,14 @@ impl RuntimeCore {
                 pinh.opacity *= shown;
                 pinh.paint_opacity *= shown;
             }
+            // A virtual list draws below the room its window leaves above it; its rows' places
+            // in the scene hold that room already, so they inherit the offset without it
+            // (`PaintState::row_window`), exactly as the list did: a row that stays as the
+            // window moves draws where it did.
+            let window = self.paint.row_window[i];
+            let handed_dy = if window == self.paint.row_dy[i] { pinh.dy } else { pinh.dy + (self.paint.row_dy[i] - window) };
             pinh.dy += self.paint.row_dy[i];
+            let windowed_dy = pinh.dy;
             pinh.snap.grow(self.paint.row_dy[i]);
             if let Some(a) = self.tree.nodes[i].above.clone() {
                 if let Some(j) = anchor_index_live(&self.tree.nodes, i, &a, |idx| self.subtree_exiting(idx)) {
@@ -602,7 +609,7 @@ impl RuntimeCore {
                 if self.paint.row_lifts.iter().any(|&(ri, _)| ri == i) { clip[1] = clip[1].max(r[1]); }
                 inherit_fade(&mut fade, &mut fade_origin, r, [0.0, 0.0, 0.0, self.growth_feather(i)]);
             }
-            let mut dy = pinh.dy;
+            let mut dy = if window == 0.0 { pinh.dy } else if pinh.dy == windowed_dy { handed_dy } else { handed_dy + (pinh.dy - windowed_dy) };
             let snap_off = pinh.snap.off || n.vis_flags.no_pixel_snap() || turn_index != 0;
             let mut snap = pinh.snap;
             // `El::paint_contained`: its children snap against the containing box's origin,

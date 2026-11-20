@@ -6,6 +6,12 @@
 //! page of cards, every frame of the scroll. Here the subtree's record is copied with that move
 //! applied to it, when the move is all that changed.
 //!
+//! The rows of a virtual list inherit its window (the room of the rows culled above it) in the
+//! rigid translation only, as their places in the scene hold that room already. When the window
+//! moves by whole device pixels, a row that stays inherits the translation that much further
+//! on: it comes off the row's rounded place as it goes on the translation's own rounding, so
+//! the row draws where it did, and is copied as one moved by the scroll alone.
+//!
 //! What a move changes, and so what the copy rewrites:
 //! - an instance's rect, by the move; its clip, which is the clip the subtree inherits (given
 //!   again this paint, whether or not it moved) or a clip from inside the subtree (a truncated
@@ -15,10 +21,12 @@
 //! - a text clipped to its own box (`PaintKeep::text_cut` holds the box and its soft edge), cut
 //!   and faded again where it is now;
 //! - each node's drawn rect, and the offset, clips, hover group box and rigid translation in
-//!   what it inherits and hands down; where sticky elements may stick inside it.
+//!   what it inherits and hands down, with the edges a box hands down to centre against, which
+//!   are held less the translation; where sticky elements may stick inside it.
 //!
 //! What the copy can't know, it doesn't guess. It gives the subtree back to paint when:
 //! - anything inherited differs but the offset, the clips and what follows from them;
+//! - the rigid translation moved by other than the offset and whole device pixels;
 //! - a box in it doesn't snap to whole pixels, and so moved by the offset's fraction too;
 //! - the subtree is scaled, turned, blurred, faded by an ancestor's soft edge, under a rounded
 //!   clip, in a cache, or holds a node that clips, scrolls or offsets its own children;
@@ -49,6 +57,8 @@ pub(super) struct Shift {
     full: [[f32; 4]; 2],
     group: [[f32; 4]; 2],
     rigid: [[f32; 2]; 2],
+    /// Whole device pixels the rigid translation moved past the move (a virtual list's window).
+    extra: [f32; 2],
     anchor: [f32; 2],
     cover: [f32; 2],
 }
@@ -112,14 +122,19 @@ impl Shift {
         // a move that isn't a whole number of them doesn't carry over: a scroll's is, a row
         // gliding open's needn't be.
         if !(0..2).all(|k| near(d[k] * s * 64.0, (d[k] * s * 64.0).round())) { return None; }
+        // The rigid translation moved by the same amount, or by whole device pixels more: the
+        // window of a virtual list the subtree is a row of moved past it (`row_window`), which
+        // moves the translation and not the row.
+        let extra: [f32; 2] = core::array::from_fn(|k| ((b.snap.rigid[k] - a.snap.rigid[k] - d[k]) * s).round());
+        if !(0..2).all(|k| near(b.snap.rigid[k] - a.snap.rigid[k] - extra[k] / s, d[k])) { return None; }
         // A box draws at its place less the rigid translation, rounded, plus that translation
         // rounded on its own (`pixel_snap::snap`): however far the scroll went, what it drew
-        // moved by the difference of the two roundings.
+        // moved by the difference of the two roundings. Whole pixels more of the translation
+        // come off the first rounding as they go on the second, and move nothing; a text lays
+        // out against its box's place less the translation, which they leave as it was.
         let whole = |v: f32| (v * s + 0.5).floor();
-        let px = [whole(b.snap.rigid[0]) - whole(a.snap.rigid[0]), whole(b.snap.rigid[1]) - whole(a.snap.rigid[1])];
-        // The rigid translation moved by the same amount, and the hover group's box with it or
-        // not at all (a group above the scroll).
-        if !(0..2).all(|k| near(b.snap.rigid[k] - a.snap.rigid[k], d[k])) { return None; }
+        let px = [whole(b.snap.rigid[0]) - whole(a.snap.rigid[0]) - extra[0], whole(b.snap.rigid[1]) - whole(a.snap.rigid[1]) - extra[1]];
+        // The hover group's box moved with the subtree or not at all (a group above the scroll).
         let moved = [a.group_rect[0] + d[0], a.group_rect[1] + d[1], a.group_rect[2] + d[0], a.group_rect[3] + d[1]];
         if a.group_rect != b.group_rect && !near4(moved, b.group_rect) { return None; }
         // Under a hover group that stayed put, a node shown only on hover takes hits inside the
@@ -134,6 +149,7 @@ impl Shift {
             full: [intersect(a.clip, a.paint_clip), intersect(b.clip, b.paint_clip)],
             group: [a.group_rect, b.group_rect],
             rigid: [a.snap.rigid, b.snap.rigid],
+            extra,
             anchor: a.anchor,
             cover: a.cover,
         })
@@ -244,6 +260,10 @@ impl Shift {
         let g = x.group_rect;
         x.group_rect = if g == self.group[0] { self.group[1] } else { [g[0] + self.d[0], g[1] + self.d[1], g[2] + self.d[0], g[3] + self.d[1]] };
         x.snap.rigid = self.rigid[1];
+        // The edges a box hands down to centre against are held less the rigid translation.
+        if self.extra != [0.0; 2] && let Some(p) = x.snap.parent.as_mut() {
+            *p = p.past(self.extra);
+        }
     }
 
     /// What [`carry`](Self::carry) makes of `x`, or None where it doesn't pass.
