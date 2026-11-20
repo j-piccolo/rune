@@ -222,9 +222,9 @@ impl Launches {
 
     /// A launch leaves from where its source was seen and flies to where its destination is
     /// now: it starts under the offsets outside the scene it launched against and ends under
-    /// this frame's `offset`, blending by its travel. A growth row above still resizing, a
-    /// moved virtual window, or a row whose slot moves under an offset that hides the move
-    /// (an inserted row's growth) shifts where it lands, never where it is. What to add to it.
+    /// this frame's `offset`, blending by its travel. A growth row above still resizing, or a
+    /// row whose slot moves under an offset that hides the move (an inserted row's growth),
+    /// shifts where it lands, never where it is. What to add to it.
     /// A commit's offset step comes with a layout move that hides it, so only frames with
     /// no commit between them measure the offsets' drift.
     pub(in crate::runtime) fn offset_fix(&mut self, scene: &Scene, id: NodeId, offset: [f32; 2], commit: u64) -> [f32; 2] {
