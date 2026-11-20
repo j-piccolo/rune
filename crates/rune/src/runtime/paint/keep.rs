@@ -82,6 +82,13 @@ pub(in crate::runtime) struct PaintKeep {
     vp: [f32; 4],
     /// The node painting now left a glyph of its text out, for lying outside the clip.
     pub(in crate::runtime) glyph_out: bool,
+    /// Each node's box as its hit rects are cut from it (points; x0, y0, x1, y1), this paint
+    /// and last: a copy that moved cuts it again where the clip is now.
+    pub(in crate::runtime) hit_raw: Vec<[f32; 4]>,
+    prev_hit_raw: Vec<[f32; 4]>,
+    /// The box each text is clipped to, where it is clipped to its own, this paint and last.
+    pub(in crate::runtime) text_cut: Vec<Option<shift::TextCut>>,
+    prev_text_cut: Vec<Option<shift::TextCut>>,
     sticky_frame: Vec<[f32; 8]>,
     pages: Vec<(u16, u32)>,
     prev_pages: Vec<(u16, u32)>,
@@ -108,8 +115,8 @@ pub(in crate::runtime) struct PaintKeep {
     /// Debug builds: the last paint's index of a subtree painted to check its copy.
     verify: Vec<u32>,
     verify_span: (usize, usize),
-    /// Debug builds: the move such a subtree's copy would be made with.
-    verify_shift: Vec<Option<shift::Shift>>,
+    /// Debug builds: the copy such a subtree would have got, moved.
+    verify_moved: Vec<Option<Box<shift::Moved>>>,
     /// Nodes copied this paint from where they were (`RUNE_PAINT_KEEP_LOG`).
     shifted: usize,
     /// Tests: the nodes of moved subtrees checked against their paint so far, and how many of
@@ -204,6 +211,10 @@ impl RuntimeCore {
         std::mem::swap(&mut k.pinh, &mut k.prev_pinh);
         // Not cleared: a node reads last paint's only where its record says it was written.
         k.pinh.resize(self.tree.nodes.len(), Inh::default());
+        std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
+        k.hit_raw.resize(self.tree.nodes.len(), [0.0; 4]);
+        std::mem::swap(&mut k.text_cut, &mut k.prev_text_cut);
+        k.text_cut.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.pages, &mut k.prev_pages);
         // The other pairs too, as the instances above: a paint that grows one buffer doesn't
         // leave the frame after it to grow the other.
@@ -256,8 +267,8 @@ impl RuntimeCore {
         k.verify_span = (0, 0);
         k.vp = vp;
         if cfg!(debug_assertions) {
-            k.verify_shift.clear();
-            k.verify_shift.resize(n, None);
+            k.verify_moved.clear();
+            k.verify_moved.resize_with(n, || None);
         }
         if !k.recording {
             return;
@@ -364,6 +375,7 @@ impl RuntimeCore {
             cut: false,
         };
         self.paint.keep.glyph_out = false;
+        self.paint.keep.text_cut[i] = None;
         self.paint.keep.recs[i] = rec;
         self.paint.keep.open.push(i);
     }
@@ -392,15 +404,12 @@ impl RuntimeCore {
         let shift = if r.inh == inh { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
         if cfg!(debug_assertions) {
             // The move was only tried: the subtree paints, and is checked against it.
-            if shift.is_some() {
-                self.keep_unwind(starts);
-                self.paint.keep.shifted -= end - i;
-            }
+            let moved = shift.map(|_| Box::new(self.keep_take_moved(i, end, starts)));
             // Checked as one: what it holds paints as it does, inside it.
             let (a, b) = self.paint.keep.verify_span;
             if !(a..b).contains(&i) {
                 self.paint.keep.verify[i] = o as u32;
-                self.paint.keep.verify_shift[i] = shift;
+                self.paint.keep.verify_moved[i] = moved;
                 self.paint.keep.verify_span = (i, end);
                 self.paint.keep.kept += end - i;
             }
@@ -439,6 +448,8 @@ impl RuntimeCore {
                 self.paint.seen[i..end].copy_from_slice(&k.seen[o..o + len]);
                 self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
                 k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
+                k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
+                k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
             }
         }
         let k = &mut self.paint.keep;
@@ -579,14 +590,10 @@ impl RuntimeCore {
 
     /// Debug builds: subtree `r` painted what its copy from the last paint would have.
     fn keep_check(&mut self, r: usize) {
-        let k = &self.paint.keep;
-        let o = k.verify[r] as usize;
-        let (now, was) = (k.recs[r], k.prev[o]);
-        let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
-        let bytes = bytemuck::cast_slice::<Instance, u8>;
+        let o = self.paint.keep.verify[r] as usize;
         let mut differ = Vec::new();
-        if let Some(sh) = k.verify_shift[r] {
-            self.keep_check_shifted(r, o, &sh, &mut differ);
+        if let Some(moved) = self.paint.keep.verify_moved[r].take() {
+            self.keep_check_moved(r, o, &moved, &mut differ);
             #[cfg(test)]
             {
                 let checked = self.paint.keep.end[r] as usize - r;
@@ -598,6 +605,10 @@ impl RuntimeCore {
             }
             return;
         }
+        let k = &self.paint.keep;
+        let (now, was) = (k.recs[r], k.prev[o]);
+        let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
+        let bytes = bytemuck::cast_slice::<Instance, u8>;
         if bytes(&self.instances[range(now.inst)]) != bytes(&k.instances[range(was.inst)]) { differ.push("instances"); }
         if self.hit.hits[range(now.hits)] != k.hits[range(was.hits)] { differ.push("hits"); }
         if self.hit.wheel_hits[range(now.wheel)] != k.wheel[range(was.wheel)] { differ.push("wheel hits"); }
@@ -626,6 +637,7 @@ impl RuntimeCore {
 pub(super) mod cycle;
 #[path = "keep_shift.rs"]
 mod shift;
+pub(in crate::runtime) use shift::TextCut;
 #[path = "slide.rs"]
 mod slide;
 

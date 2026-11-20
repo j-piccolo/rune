@@ -1004,6 +1004,8 @@ impl RuntimeCore {
                     instance.fade = crate::render::pack_fade(widths, origins, text_clip);
                 }
             }
+            // For a copy of these glyphs that moves, which cuts and fades them again.
+            if let Some(cut) = self.paint.keep.text_cut.get_mut(i) { *cut = Some(paint_keep::TextCut { bounds, widths, origins }); }
         }
     }
 }

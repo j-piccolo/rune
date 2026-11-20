@@ -10,7 +10,10 @@
 //! - an instance's rect, by the move; its clip, which is the clip the subtree inherits (given
 //!   again this paint, whether or not it moved) or a clip from inside the subtree (a truncated
 //!   text's box), which moved with it;
-//! - the hit, wheel, overlay, help and drop rects, each a node's box cut by the inherited clip;
+//! - the hit, wheel, overlay, help and drop rects, each a node's box cut by the inherited clip:
+//!   the record holds the box uncut (`PaintKeep::hit_raw`), so it is cut again where it is now;
+//! - a text clipped to its own box (`PaintKeep::text_cut` holds the box and its soft edge), cut
+//!   and faded again where it is now;
 //! - each node's drawn rect, and the offset, clips, hover group box and rigid translation in
 //!   what it inherits and hands down.
 //!
@@ -22,8 +25,7 @@
 //! - a text lies left of or above the window's origin, where its glyphs round the other way;
 //! - a node would cross the edge of what is drawn (it is culled on one side of the move), or a
 //!   text had a glyph outside the clip, which paint left out and the record doesn't hold;
-//! - an edge that was cut by a clip that stayed put may be cut elsewhere now: a hit rect's, or
-//!   a truncated text's clip, whose uncut edge the record doesn't hold;
+//! - a node's hit rect is cut away whole on one side of the move and not the other;
 //! - it holds an instance whose geometry isn't its rect alone (a segment, a triangle, a layer).
 
 use super::*;
@@ -73,19 +75,24 @@ pub(super) fn near4(a: [f32; 4], b: [f32; 4]) -> bool {
     (0..4).all(|k| near(a[k], b[k]) || a[k] == b[k])
 }
 
-/// One edge of a box that moved by `by`, cut by a clip whose edge was `from` and is `to` (all in
-/// one unit): `v` was that edge last paint. `rigid`: the clip's edge moved with the box, or is
-/// no edge at all. `cut`: `v` at the clip's edge may stand for an edge beyond it.
+/// A text clipped to its own box: the box (device px), and the soft edge its glyphs fade
+/// through, as `clip_text_instances` packs them against the clip.
+#[derive(Clone, Copy)]
+pub(in crate::runtime) struct TextCut {
+    pub bounds: [f32; 4],
+    pub widths: [f32; 4],
+    pub origins: [f32; 4],
+}
+
+/// `r` (x0, y0, x1, y1) inside `c`.
 #[inline]
-fn edge(v: f32, from: f32, to: f32, by: f32, low: bool, rigid: bool, cut: bool) -> Option<f32> {
-    if v != from {
-        // The box's own edge: it moved, and the clip cuts it where the clip is now.
-        let moved = v + by;
-        return Some(if low { moved.max(to) } else { moved.min(to) });
-    }
-    // The clip's edge, which the box's lay on or beyond. A clip that moved with the box still
-    // cuts it there; one that stayed may not, unless nothing was beyond it.
-    if rigid || !cut { Some(to) } else { None }
+fn cut(r: [f32; 4], c: [f32; 4]) -> [f32; 4] {
+    [r[0].max(c[0]), r[1].max(c[1]), r[2].min(c[2]), r[3].min(c[3])]
+}
+
+#[inline]
+fn empty(r: [f32; 4]) -> bool {
+    r[2] <= r[0] || r[3] <= r[1]
 }
 
 impl Shift {
@@ -115,6 +122,9 @@ impl Shift {
         if !(0..2).all(|k| near(b.snap.rigid[k] - a.snap.rigid[k], d[k])) { return None; }
         let moved = [a.group_rect[0] + d[0], a.group_rect[1] + d[1], a.group_rect[2] + d[0], a.group_rect[3] + d[1]];
         if a.group_rect != b.group_rect && !near4(moved, b.group_rect) { return None; }
+        // Under a hover group that stayed put, a node shown only on hover takes hits inside the
+        // group's box, which the uncut rect on record already holds.
+        if a.group_rect == b.group_rect && d != [0.0; 2] && a.group_rect.iter().all(|v| v.is_finite()) { return None; }
         Some(Shift {
             s, d, px,
             exact: [near(px[0], d[0] * s), near(px[1], d[1] * s)],
@@ -129,30 +139,17 @@ impl Shift {
         })
     }
 
-    /// Whether edge `e` of a clip that was `from` and is `to` (device px) moved with the
-    /// subtree, or is the edge of no clip.
+    /// A text's own box where the move puts it.
     #[inline]
-    fn rigid(&self, from: [f32; 4], to: [f32; 4], e: usize) -> bool {
-        to[e] == from[e] + self.px[e % 2] || (from[e].abs() >= NO_CLIP[2] && to[e] == from[e])
+    pub(super) fn text_cut(&self, t: &TextCut) -> TextCut {
+        let by = |v: [f32; 4]| [0, 1, 2, 3].map(|e| if v[e].abs() >= NO_CLIP[2] { v[e] } else { v[e] + self.px[e % 2] });
+        TextCut { bounds: by(t.bounds), widths: t.widths, origins: by(t.origins) }
     }
 
-    /// An instance's clip `c` (device px) under the inherited paint clip.
+    /// An instance where the move puts it. `text`: its node's text, if it has one, with the
+    /// box it is clipped to if it is; a glyph of a node with no text is an icon.
     #[inline]
-    fn clip(&self, c: [f32; 4], cut: bool) -> Option<[f32; 4]> {
-        let [from, to] = self.paint;
-        if c == from && !cut { return Some(to); }
-        let mut out = [0.0; 4];
-        for e in 0..4 {
-            out[e] = edge(c[e], from[e], to[e], self.px[e % 2], e < 2, self.rigid(from, to, e), cut)?;
-        }
-        Some(out)
-    }
-
-    /// An instance where the move puts it. `text`: its node's text, if it has one, is clipped
-    /// to its own box (`Some(true)`), so a glyph's clip may be the inherited one standing in
-    /// for a box beyond it. A glyph of a node with no text is an icon.
-    #[inline]
-    pub(super) fn instance(&self, q: &Instance, text: Option<bool>) -> Option<Instance> {
+    pub(super) fn instance(&self, q: &Instance, text: Option<Option<&TextCut>>) -> Option<Instance> {
         let kind = q.params[1];
         let glyph = kind == KIND_GLYPH;
         // Kinds whose geometry is the rect alone; an outline glyph also holds its pen.
@@ -166,45 +163,47 @@ impl Shift {
             let exact = if glyph { text.is_none() } else { q.rect[axis].fract() != 0.0 || q.rect[axis + 2].fract() != 0.0 };
             if exact && !self.exact[axis] { return None; }
         }
-        let clip = self.clip(q.clip, text == Some(true) && glyph)?;
-        // A soft or rounded edge is packed against the clip: it holds only where the clip moved
-        // as one with the instance.
-        let whole = [q.clip[0] + self.px[0], q.clip[1] + self.px[1], q.clip[2] + self.px[0], q.clip[3] + self.px[1]];
-        if q.fade != [0; 4] && clip != whole { return None; }
         let rect = [q.rect[0] + self.px[0], q.rect[1] + self.px[1], q.rect[2], q.rect[3]];
-        // A glyph outside the clip is left out by paint: one that moved there, or to its very
-        // edge, is no copy.
-        let c = self.paint[1];
-        if glyph && (rect[1] >= c[3] || rect[1] + rect[3] <= c[1] || rect[0] >= c[2] || rect[0] + rect[2] <= c[0]) { return None; }
-        // A text's baseline and pens round half away from zero, so a glyph left of or above the
-        // window's origin rounds the other way from one inside it: no whole-pixel move there.
-        for axis in 0..2 {
-            if glyph && (self.px[axis] != 0.0 || self.d[axis] != 0.0) && (q.rect[axis] < 0.0 || rect[axis] < 0.0) { return None; }
+        let [from, to] = self.paint;
+        let (clip, fade) = match text.flatten().filter(|_| glyph) {
+            // Its text's box, cut by the clip where both are now, and its soft edge against that.
+            Some(t) => {
+                if q.clip != intersect(from, t.bounds) { return None; }
+                let t = self.text_cut(t);
+                let clip = intersect(to, t.bounds);
+                (clip, crate::render::pack_fade(t.widths, t.origins, clip))
+            }
+            // The clip the subtree inherits, with no soft or rounded edge packed against it.
+            None => {
+                if q.clip != from || q.fade != [0; 4] { return None; }
+                (to, q.fade)
+            }
+        };
+        if glyph {
+            // A glyph outside the clip is left out by paint: one that moved there, or to its
+            // very edge, is no copy.
+            if rect[1] >= to[3] || rect[1] + rect[3] <= to[1] || rect[0] >= to[2] || rect[0] + rect[2] <= to[0] { return None; }
+            // A text's baseline and pens round half away from zero, so a glyph left of or above
+            // the window's origin rounds the other way from one inside it: no whole-pixel move.
+            for axis in 0..2 {
+                if (self.px[axis] != 0.0 || self.d[axis] != 0.0) && (q.rect[axis] < 0.0 || rect[axis] < 0.0) { return None; }
+            }
         }
-        Some(Instance { rect, clip, ..*q })
+        Some(Instance { rect, clip, fade, ..*q })
     }
 
-    /// A rect in points (x0, y0, x1, y1) that a node's box cut by its logical clip gave: the
-    /// subtree's root's (`root`), or one below it.
+    /// A node's uncut hit rect in points (x0, y0, x1, y1) where the move puts it.
     #[inline]
-    pub(super) fn cut_rect(&self, r: [f32; 4], root: bool) -> Option<[f32; 4]> {
+    pub(super) fn raw(&self, r: [f32; 4]) -> [f32; 4] {
+        [r[0] + self.d[0], r[1] + self.d[1], r[2] + self.d[0], r[3] + self.d[1]]
+    }
+
+    /// The logical clip in points a node's hit rects are cut by, then and now: the subtree's
+    /// root's (`root`), or a node's below it.
+    #[inline]
+    fn hit_clips(&self, root: bool) -> [[f32; 4]; 2] {
         let [from, to] = if root { self.logical } else { self.full };
-        let mut out = [0.0; 4];
-        for e in 0..4 {
-            // The box moved by the offset itself, the clip by whole pixels: they went together
-            // only where those are one move.
-            let rigid = from[e].abs() >= NO_CLIP[2] && to[e] == from[e] || (self.exact[e % 2] && self.rigid(from, to, e));
-            out[e] = edge(r[e], from[e] / self.s, to[e] / self.s, self.d[e % 2], e < 2, rigid, true)?;
-        }
-        Some(out)
-    }
-
-    /// Whether a node drawn at `r` (points; x, y, w, h), moved or not yet, lies wholly outside
-    /// the logical clip `c` (device px): it takes no wheel, and a wheel hit it would have
-    /// given is in no record.
-    #[inline]
-    fn outside(&self, r: [f32; 4], c: [f32; 4]) -> bool {
-        r[0].max(c[0] / self.s) >= (r[0] + r[2]).min(c[2] / self.s) || r[1].max(c[1] / self.s) >= (r[1] + r[3]).min(c[3] / self.s)
+        [from.map(|v| v / self.s), to.map(|v| v / self.s)]
     }
 
     /// A node's drawn rect in points (x, y, w, h).
@@ -262,6 +261,21 @@ pub(super) struct Starts {
     pub drop: usize,
 }
 
+/// Debug builds: what a moved copy added, taken back out so the subtree paints, and kept to
+/// check that paint against.
+pub(super) struct Moved {
+    instances: Vec<Instance>,
+    hits: Vec<(NodeId, [f32; 4])>,
+    wheel: Vec<(NodeId, [f32; 4])>,
+    overlay: Vec<[f32; 4]>,
+    help: Vec<(NodeId, [f32; 4], usize, Option<usize>)>,
+    drop: Vec<(NodeId, [f32; 4], usize)>,
+    drawn: Vec<[f32; 4]>,
+    inh: Vec<Inh>,
+    /// The hit list's length where the copy began, which help and drop hits count from.
+    hits_at: usize,
+}
+
 impl RuntimeCore {
     pub(super) fn keep_starts(&self) -> Starts {
         Starts { instances: self.instances.len(), hits: self.hit.hits.len(), wheel: self.hit.wheel_hits.len(), overlay: self.hit.overlay_hits.len(), help: self.hit.help_hits.len(), drop: self.hit.drop_hits.len() }
@@ -276,6 +290,25 @@ impl RuntimeCore {
         self.hit.overlay_hits.truncate(to.overlay);
         self.hit.help_hits.truncate(to.help);
         self.hit.drop_hits.truncate(to.drop);
+    }
+
+    /// Debug builds: takes a moved copy of this paint's `i..end` back out, from `to` on, for
+    /// `keep_check_moved` to hold the subtree's paint against.
+    pub(super) fn keep_take_moved(&mut self, i: usize, end: usize, to: Starts) -> Moved {
+        let moved = Moved {
+            instances: self.instances[to.instances..].to_vec(),
+            hits: self.hit.hits[to.hits..].to_vec(),
+            wheel: self.hit.wheel_hits[to.wheel..].to_vec(),
+            overlay: self.hit.overlay_hits[to.overlay..].to_vec(),
+            help: self.hit.help_hits[to.help..].to_vec(),
+            drop: self.hit.drop_hits[to.drop..].to_vec(),
+            drawn: self.paint.drawn[i..end].to_vec(),
+            inh: self.paint.inh_scratch[i..end].to_vec(),
+            hits_at: to.hits,
+        };
+        self.keep_unwind(to);
+        self.paint.keep.shifted -= end - i;
+        moved
     }
 
     /// Copies what the subtree of `len` nodes at last paint's index `o` (this paint's `i`)
@@ -302,15 +335,16 @@ impl RuntimeCore {
             self.marks.extend_from_slice(&k.marks[range(r.inst)]);
         }
         let first = self.instances.len();
+        // Help and drop hits count from the hit list.
+        let seq = self.hit.hits.len().wrapping_sub(r.hits[0] as usize);
         for j in 0..len {
             let p = k.prev[o + j];
+            let n = &self.tree.nodes[i + j];
             // A text that left a glyph out for lying outside the clip isn't all here, and a
-            // box that doesn't snap moved by the offset's fraction too.
-            if p.cut || (self.tree.nodes[i + j].vis_flags.no_pixel_snap() && sh.exact != [true; 2]) { return None; }
+            // box that doesn't snap moved by the offset's fraction too. The window's root has
+            // no clip above it to cut its hits by.
+            if p.cut || (n.vis_flags.no_pixel_snap() && sh.exact != [true; 2]) || n.parent.is_none() { return None; }
             if sh.visible(k.drawn[o + j], k.vp) != k.seen[o + j] { return None; }
-            // Clipped away whole, a node gives no wheel hit: none to copy once it shows.
-            let [from, to] = if j == 0 { sh.logical } else { sh.full };
-            if sh.outside(k.drawn[o + j], from) && !sh.outside(sh.drawn(k.drawn[o + j]), to) { return None; }
             let (mut down, mut up) = (k.inh[o + j], k.prev_pinh[o + j]);
             if !sh.passes(&down) || (j > 0 && !sh.passes(&up)) { return None; }
             sh.carry(&mut down);
@@ -320,103 +354,84 @@ impl RuntimeCore {
                 k.pinh[i + j] = up;
             }
             self.paint.drawn[i + j] = sh.drawn(k.drawn[o + j]);
-            // Its own instances: up to its first child's.
-            let own = p.inst[0] as usize..if j + 1 < len && ((o + j + 1) as u32) < p.end { k.prev[o + j + 1].inst[0] } else { p.inst[1] } as usize;
-            let text = self.tree.nodes[i + j].text.as_ref().map(|t| t.truncate_fade || t.cold.live.is_some());
-            for q in &k.instances[own] { self.instances.push(sh.instance(q, text)?); }
+            // What is its own: up to its first child's.
+            let child = if j + 1 < len && ((o + j + 1) as u32) < p.end { Some(k.prev[o + j + 1]) } else { None };
+            let own = |all: [u32; 2], first: fn(&PaintRec) -> u32| all[0] as usize..child.as_ref().map_or(all[1], first) as usize;
+            // Its text's own box, where the move puts it.
+            let text = k.prev_text_cut[o + j];
+            k.text_cut[i + j] = text.map(|t| sh.text_cut(&t));
+            let of_text = n.text.as_ref().map(|_| text.as_ref());
+            for q in &k.instances[own(p.inst, |c| c.inst[0])] { self.instances.push(sh.instance(q, of_text)?); }
+            // Its hit rects: its box, moved, cut by the clip where that is now. Cut away whole
+            // it gives no wheel or overlay hit, so one that is on only one side is no copy.
+            let raw = k.prev_hit_raw[o + j];
+            let [from, to] = sh.hit_clips(j == 0);
+            let (was, now) = (cut(raw, from), cut(sh.raw(raw), to));
+            if empty(was) != empty(now) { return None; }
+            k.hit_raw[i + j] = sh.raw(raw);
+            for at in own(p.hits, |c| c.hits[0]) {
+                if k.hits[at].1 != was { return None; }
+                self.hit.hits.push((k.hits[at].0, now));
+            }
+            for at in own(p.wheel, |c| c.wheel[0]) {
+                if k.wheel[at].1 != was { return None; }
+                self.hit.wheel_hits.push((k.wheel[at].0, now));
+            }
+            for at in own(p.overlay, |c| c.overlay[0]) {
+                if k.overlay[at] != was { return None; }
+                self.hit.overlay_hits.push(now);
+            }
+            for at in own(p.help, |c| c.help[0]) {
+                let (id, rect, s, l) = k.help[at];
+                if rect != was { return None; }
+                self.hit.help_hits.push((id, now, s.wrapping_add(seq), l));
+            }
+            for at in own(p.drop, |c| c.drop[0]) {
+                let (id, rect, s) = k.drop[at];
+                if rect != was { return None; }
+                self.hit.drop_hits.push((id, now, s.wrapping_add(seq)));
+            }
         }
         // An instance after a node's children (a layer's end) belongs to none of them.
         if self.instances.len() - first != range(r.inst).len() { return None; }
-        // The root's rects come first, cut by the clip it inherits; the rest by the clip inside it.
-        let next = if len > 1 { k.prev[o + 1] } else { r };
-        let below = |all: [u32; 2], first: u32| if len > 1 { first as usize } else { all[1] as usize };
-        let (hits, wheel, overlay, help, drop) = (below(r.hits, next.hits[0]), below(r.wheel, next.wheel[0]), below(r.overlay, next.overlay[0]), below(r.help, next.help[0]), below(r.drop, next.drop[0]));
-        let seq = self.hit.hits.len().wrapping_sub(r.hits[0] as usize);
-        for at in range(r.help) {
-            let (id, rect, s, l) = k.help[at];
-            self.hit.help_hits.push((id, sh.cut_rect(rect, at < help)?, s.wrapping_add(seq), l));
-        }
-        for at in range(r.drop) {
-            let (id, rect, s) = k.drop[at];
-            self.hit.drop_hits.push((id, sh.cut_rect(rect, at < drop)?, s.wrapping_add(seq)));
-        }
-        for at in range(r.hits) { self.hit.hits.push((k.hits[at].0, sh.cut_rect(k.hits[at].1, at < hits)?)); }
-        for at in range(r.wheel) {
-            // Clipped away whole it takes no wheel (`push_wheel_hit`), and its record goes.
-            let rect = sh.cut_rect(k.wheel[at].1, at < wheel)?;
-            if rect[2] <= rect[0] || rect[3] <= rect[1] { return None; }
-            self.hit.wheel_hits.push((k.wheel[at].0, rect));
-        }
-        for at in range(r.overlay) { self.hit.overlay_hits.push(sh.cut_rect(k.overlay[at], at < overlay)?); }
         self.paint.drawn_scale[i..i + len].copy_from_slice(&k.drawn_scale[o..o + len]);
         self.paint.seen[i..i + len].copy_from_slice(&k.seen[o..o + len]);
         k.shifted += len;
         Some(())
     }
 
-    /// Debug builds: what the subtree at `r` painted, against what `sh` would have copied for
-    /// it from last paint's index `o`. The names of what differs.
-    pub(super) fn keep_check_shifted(&self, r: usize, o: usize, sh: &Shift, differ: &mut Vec<&'static str>) {
+    /// Debug builds: what the subtree at `r` painted, against the moved copy `m` it would have
+    /// got from last paint's index `o`. The names of what differs.
+    pub(super) fn keep_check_moved(&self, r: usize, o: usize, m: &Moved, differ: &mut Vec<&'static str>) {
         let k = &self.paint.keep;
         let (now, was) = (k.recs[r], k.prev[o]);
         let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
         let len = k.end[r] as usize - r;
-        // Instances, node by node, as the copy takes them.
-        let mut at = now.inst[0] as usize;
-        let mut same = range(now.inst).len() == range(was.inst).len();
-        for j in 0..len {
-            let p = k.prev[o + j];
-            let own = p.inst[0] as usize..if j + 1 < len && ((o + j + 1) as u32) < p.end { k.prev[o + j + 1].inst[0] } else { p.inst[1] } as usize;
-            let text = self.tree.nodes[r + j].text.as_ref().map(|t| t.truncate_fade || t.cold.live.is_some());
-            for q in &k.instances[own] {
-                let (Some(want), Some(got)) = (sh.instance(q, text), self.instances.get(at)) else { same = false; break };
-                at += 1;
-                let rest = |q: &Instance| Instance { rect: [0.0; 4], clip: [0.0; 4], ..*q };
-                same &= near4(want.rect, got.rect) && near4(want.clip, got.clip) && bytemuck::bytes_of(&rest(&want)) == bytemuck::bytes_of(&rest(got));
-            }
+        let rest = |q: &Instance| Instance { rect: [0.0; 4], clip: [0.0; 4], ..*q };
+        let got = &self.instances[range(now.inst)];
+        if got.len() != m.instances.len() || got.iter().zip(&m.instances).any(|(g, w)| !near4(w.rect, g.rect) || !near4(w.clip, g.clip) || bytemuck::bytes_of(&rest(w)) != bytemuck::bytes_of(&rest(g))) {
+            differ.push("moved instances");
         }
-        if !same { differ.push("moved instances"); }
-        let rects = |name: &'static str, got: &mut dyn Iterator<Item = [f32; 4]>, want: &mut dyn Iterator<Item = Option<[f32; 4]>>, differ: &mut Vec<&'static str>| {
-            loop {
-                match (got.next(), want.next()) {
-                    (None, None) => break,
-                    (Some(g), Some(Some(w))) if near4(g, w) => {}
-                    _ => { differ.push(name); break }
-                }
-            }
-        };
-        let below = |all: [u32; 2], first: u32| if len > 1 { first as usize } else { all[1] as usize };
-        let next = if len > 1 { k.prev[o + 1] } else { was };
-        let first = range(was.hits).start;
-        let root = below(was.hits, next.hits[0]);
-        rects("moved hits", &mut self.hit.hits[range(now.hits)].iter().map(|h| h.1), &mut k.hits[range(was.hits)].iter().enumerate().map(|(n, h)| sh.cut_rect(h.1, first + n < root)), differ);
-        let first = range(was.wheel).start;
-        let root = below(was.wheel, next.wheel[0]);
-        rects("moved wheel hits", &mut self.hit.wheel_hits[range(now.wheel)].iter().map(|h| h.1), &mut k.wheel[range(was.wheel)].iter().enumerate().map(|(n, h)| sh.cut_rect(h.1, first + n < root)), differ);
-        let first = range(was.overlay).start;
-        let root = below(was.overlay, next.overlay[0]);
-        rects("moved overlay hits", &mut self.hit.overlay_hits[range(now.overlay)].iter().copied(), &mut k.overlay[range(was.overlay)].iter().enumerate().map(|(n, h)| sh.cut_rect(*h, first + n < root)), differ);
-        let first = range(was.help).start;
-        let root = below(was.help, next.help[0]);
-        rects("moved help hits", &mut self.hit.help_hits[range(now.help)].iter().map(|h| h.1), &mut k.help[range(was.help)].iter().enumerate().map(|(n, h)| sh.cut_rect(h.1, first + n < root)), differ);
-        let first = range(was.drop).start;
-        let root = below(was.drop, next.drop[0]);
-        rects("moved drop hits", &mut self.hit.drop_hits[range(now.drop)].iter().map(|h| h.1), &mut k.drop[range(was.drop)].iter().enumerate().map(|(n, h)| sh.cut_rect(h.1, first + n < root)), differ);
-        if (0..len).any(|j| !near4(self.paint.drawn[r + j], sh.drawn(k.drawn[o + j])) || self.paint.drawn_scale[r + j] != k.drawn_scale[o + j] || self.paint.seen[r + j] != k.seen[o + j]) {
+        let rects = |got: &[(NodeId, [f32; 4])], want: &[(NodeId, [f32; 4])]| got.len() == want.len() && got.iter().zip(want).all(|(g, w)| g.0 == w.0 && near4(g.1, w.1));
+        if !rects(&self.hit.hits[range(now.hits)], &m.hits) { differ.push("moved hits"); }
+        if !rects(&self.hit.wheel_hits[range(now.wheel)], &m.wheel) { differ.push("moved wheel hits"); }
+        let got = &self.hit.overlay_hits[range(now.overlay)];
+        if got.len() != m.overlay.len() || got.iter().zip(&m.overlay).any(|(g, w)| !near4(*g, *w)) { differ.push("moved overlay hits"); }
+        let got = &self.hit.help_hits[range(now.help)];
+        if got.len() != m.help.len() || got.iter().zip(&m.help).any(|(g, w)| g.0 != w.0 || !near4(g.1, w.1) || g.2 - now.hits[0] as usize != w.2 - m.hits_at || g.3 != w.3) { differ.push("moved help hits"); }
+        let got = &self.hit.drop_hits[range(now.drop)];
+        if got.len() != m.drop.len() || got.iter().zip(&m.drop).any(|(g, w)| g.0 != w.0 || !near4(g.1, w.1) || g.2 - now.hits[0] as usize != w.2 - m.hits_at) { differ.push("moved drop hits"); }
+        if (0..len).any(|j| !near4(self.paint.drawn[r + j], m.drawn[j]) || self.paint.drawn_scale[r + j] != k.drawn_scale[o + j] || self.paint.seen[r + j] != k.seen[o + j]) {
             differ.push("moved drawn rects");
         }
         // A hover group's box is moved by the offset here and placed by it there: the two may
         // differ in the last bit, and by nothing else.
-        let alike = |want: Option<Inh>, got: &Inh| want.is_some_and(|mut x| {
+        let alike = |want: &Inh, got: &Inh| {
+            let mut x = *want;
             if near4(x.group_rect, got.group_rect) { x.group_rect = got.group_rect; }
             inh_key(&x) == inh_key(got)
-        });
-        if (0..len).any(|j| !alike(sh.inh(&k.inh[o + j]), &self.paint.inh_scratch[r + j])) {
-            differ.push("moved inherited state");
-        }
-        if (1..len).any(|j| k.recs[r + j].keep && !alike(sh.inh(&k.prev_pinh[o + j]), &k.pinh[r + j])) {
-            differ.push("moved inherited state of a child");
-        }
+        };
+        if (0..len).any(|j| !alike(&m.inh[j], &self.paint.inh_scratch[r + j])) { differ.push("moved inherited state"); }
         if self.track_marks && self.marks.get(range(now.inst)) != k.marks.get(range(was.inst)) { differ.push("marks"); }
         if now.glyphs[1] - now.glyphs[0] != was.glyphs[1] - was.glyphs[0] { differ.push("glyph count"); }
         if k.pages[range(now.pages)] != k.prev_pages[range(was.pages)] { differ.push("atlas pages"); }
