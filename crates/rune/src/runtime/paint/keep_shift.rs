@@ -383,6 +383,7 @@ impl RuntimeCore {
             if empty(was) != empty(now) { return None; }
             k.hit_raw[i + j] = sh.raw(raw);
             k.picture[i + j] = k.prev_picture[o + j];
+            k.shown[i + j] = k.prev_shown[o + j];
             for at in own(p.hits, |c| c.hits[0]) {
                 if k.hits[at].1 != was { return None; }
                 self.hit.hits.push((k.hits[at].0, now));
