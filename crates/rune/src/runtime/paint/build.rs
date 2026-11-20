@@ -16,7 +16,7 @@ impl RuntimeCore {
         // Quads a text hasn't drawn with for a while go, with the layouts they hold.
         if self.paint.quads_frame % 64 == 0 {
             let frame = self.paint.quads_frame;
-            self.paint.text_quads.retain(|_, (_, used)| frame - *used < 64);
+            self.paint.text_quads.retain(|_, (_, used, _)| frame - *used < 64);
         }
         let mut pinned_pages = 0u32;
         for f in self.motion.flights() {

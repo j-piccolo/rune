@@ -14,6 +14,7 @@ mod glyph_replay;
 mod group_opacity;
 mod hold_layout;
 mod id_pruning;
+mod keep_shift;
 mod input_clipboard;
 mod layout_hover;
 mod layout_reads;
