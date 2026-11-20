@@ -199,6 +199,18 @@ impl Parent {
     pub(in crate::runtime) fn exact_off(&self, rigid: [f32; 2]) -> [f32; 2] {
         core::array::from_fn(|a| self.rest.exact[a] + rigid[a] - self.rest.at[a] - round(rigid[a]))
     }
+
+    /// The same box held against a rigid translation `by` whole device pixels (x, y) further
+    /// on than the box went: its edges less the translation, that much less.
+    pub(in crate::runtime) fn past(mut self, by: [f32; 2]) -> Parent {
+        for k in 0..4 {
+            for r in [&mut self.rest, &mut self.now] {
+                r.exact[k] -= by[k % 2];
+                r.at[k] -= by[k % 2];
+            }
+        }
+        self
+    }
 }
 
 /// The glides of the nodes moving now and the scaled layers, owned by the runtime.

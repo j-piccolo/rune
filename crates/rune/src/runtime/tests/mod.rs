@@ -15,6 +15,7 @@ mod group_opacity;
 mod id_pruning;
 mod keep_carried;
 mod keep_shift;
+mod keep_window;
 mod input_clipboard;
 mod layout_hover;
 mod layout_reads;

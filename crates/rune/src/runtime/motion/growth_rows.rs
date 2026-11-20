@@ -8,7 +8,7 @@ impl RuntimeCore {
         if self.motion.grows.get(&self.tree.nodes[i].id).is_some_and(|g| g.linear_edge) { -width } else { width }
     }
 
-    /// Fills `row_dy`, `row_h` and `row_mask` for this frame's nodes.
+    /// Fills `row_dy`, `row_h`, `row_mask` and `row_window` for this frame's nodes.
     pub(in crate::runtime) fn place_growth_rows(&mut self) {
         let (s, n_nodes) = (self.env.scale, self.tree.nodes.len());
         self.paint.row_dy.clear();
@@ -17,13 +17,20 @@ impl RuntimeCore {
         self.paint.row_h.resize(n_nodes, -1.0);
         self.paint.row_mask.clear();
         self.paint.row_mask.resize(n_nodes, -1.0);
+        self.paint.row_window.clear();
+        self.paint.row_window.resize(n_nodes, 0.0);
         self.paint.clear_row_lifts();
         let mut emptied = Vec::new();
         for (cid, stack) in &self.motion.stacks {
             let Some(&ci) = self.tree.node_index.get(cid) else { continue };
             let Some(spec) = self.tree.nodes[ci].growth.as_deref().copied() else { continue };
+            // A virtual list draws from the top of its window, below the rows culled above it
+            // (`VirtualList::before`). Its rows' places in the scene hold that room already: they
+            // inherit it only in what snaps as a whole, rounded as it always was, so a row that
+            // stays as the window moves draws where it did and is copied.
             let origin = self.commit.virtuals.get(&self.tree.nodes[ci].path).map_or(0.0, |v| v.before);
             self.paint.row_dy[ci] = grid(origin, s);
+            self.paint.row_window[ci] = self.paint.row_dy[ci];
             let mut y = stack.pad_top - origin;
             let mut first_row = true;
             for id in &stack.order {
