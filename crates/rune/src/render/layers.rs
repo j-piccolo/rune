@@ -627,7 +627,9 @@ impl Renderer {
     fn check_layer_features(&mut self, device: &wgpu::Device) -> bool {
         // A layer a cache covers counts: the cache can still miss and draw it this frame.
         let shown = || self.layers.plan.iter().enumerate().filter(|(_, l)| l.planned != Planned::Hidden);
-        let isolation = shown().any(|(index, _)| self.isolates(index));
+        // An app that asked ([`warm_layers`]) has the isolation pipelines built by its first frame.
+        let warm = WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) && matches!(self.breakers.health(breaker::Feature::Isolation), breaker::Health::Untried);
+        let isolation = warm || shown().any(|(index, _)| self.isolates(index));
         let plus_lighter = shown().any(|(_, l)| l.blend == Blend::PlusLighter);
         let blur = shown().any(|(_, l)| l.blur > 0.0);
         if !isolation && !plus_lighter && !blur && !self.breakers.checking() { return false; }
@@ -875,4 +877,15 @@ impl Renderer {
         }
         self.draw_with_effects(pass, format, cursor..range.end, target, hook);
     }
+}
+
+static WARM_LAYERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Has every renderer build the pipelines an isolated layer draws with (a group's opacity, a
+/// fade, a rounded clip cut by its viewport) on its first frame, not on the first frame that
+/// shows one. Building them compiles shaders, some 20 ms on a slow machine: left to the first
+/// hover or fade, that is a stall the user sees, and a window's first frame is slow already.
+/// Call it before the window opens.
+pub fn warm_layers() {
+    WARM_LAYERS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
