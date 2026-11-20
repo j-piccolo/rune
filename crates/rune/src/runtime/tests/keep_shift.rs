@@ -163,3 +163,86 @@ fn a_page_of_cards_paints_what_its_moved_copies_hold_through_many_offsets() {
         assert_eq!(differed, 0, "a moved copy differs from its paint at {scale}x");
     }
 }
+
+/// A wall of posters: each card a picture (some filling their box, some fitted inside it)
+/// over a title. One picture has no pixels yet.
+fn posters(pictures: &Vec<crate::Pixels>, _: &mut Cx<Vec<crate::Pixels>>) -> El {
+    let white = crate::Color::WHITE;
+    col().key("wall").size(520.0, 380.0).scroll(ScrollSpec { stick_bottom: false }).child(
+        col().w_full().gap(10.5).padding(9.25).children((0..10).map(|row| {
+            row_el().key(format!("row-{row}")).gap(8.0).children((0..5).map(|at| {
+                let picture = &pictures[(row * 5 + at) % pictures.len()];
+                let fit = if at % 2 == 0 { crate::SurfaceFit::Fill } else { crate::SurfaceFit::Fit };
+                col().key(format!("card-{row}-{at}")).w(92.0).gap(3.0)
+                    .child(crate::el().size(92.0, 130.0).radius(5.0).center().fill(ink(0.2, 0.2, 0.3))
+                        .child(crate::el().w_full().h_full().radius(5.0).pixels_fit(picture, fit)))
+                    .child(crate::text(format!("Title {row} {at}")).font(crate::TextStyle::new(12.0, 600.0)).color(white).truncate().shrink())
+            }))
+        })),
+    )
+}
+
+fn picture(w: u32, h: u32, shade: u8) -> crate::Pixels {
+    let px = crate::Pixels::new();
+    px.set(w, h, (0..w * h).flat_map(|k| [shade, (k % 251) as u8, 90, 255]).collect());
+    px
+}
+
+/// Cards with pictures move as the rest do, while the image atlas holds what they drew. A
+/// picture that arrives, or is replaced by one of another size, is painted, not copied.
+#[test]
+fn scrolled_pictures_paint_what_their_moved_copies_hold() {
+    for scale in [1.0, 1.5, 2.0] {
+        let late = crate::Pixels::new();
+        let pictures = vec![picture(60, 90, 40), picture(120, 80, 90), late.clone(), picture(48, 48, 160), picture(200, 300, 220)];
+        let swapped = pictures[1].clone();
+        let mut rt = Runtime::new(pictures, posters, (520.0, 380.0), Env::new(true, scale));
+        rt.frame(0.0);
+        rt.frame(1.0 / 120.0);
+        for (k, dy) in offsets(21, 160, 60.0).into_iter().enumerate() {
+            // Part way through, the missing picture arrives and another changes shape.
+            if k == 50 { late.set(64, 64, vec![200; 64 * 64 * 4]); }
+            if k == 90 { swapped.set(70, 140, vec![120; 70 * 140 * 4]); }
+            rt.wheel_xy(260.0, 190.0, 0.0, dy - if k < 80 { 12.0 } else { -12.0 });
+            rt.frame(1.0 / 120.0);
+            rt.frame(1.0 / 120.0);
+        }
+        let (checked, differed) = rt.paint.moved_checks();
+        assert!(checked > 1000, "moved subtrees were checked at {scale}x ({checked} nodes)");
+        assert_eq!(differed, 0, "a moved copy differs from its paint at {scale}x");
+    }
+}
+
+/// Sections under headers that stick to the top of the page as it scrolls.
+fn sections(_: &(), _: &mut Cx<()>) -> El {
+    let white = crate::Color::WHITE;
+    col().key("list").size(420.0, 320.0).scroll(ScrollSpec { stick_bottom: false }).children((0..8).map(|section| {
+        col().key(format!("section-{section}")).w_full()
+            .child(crate::row().key("header").w_full().h(28.0).padding(6.0).fill(ink(0.1, 0.1, 0.15)).sticky_top(0.0)
+                .child(crate::text(format!("Section {section}")).font(crate::TextStyle::new(13.0, 700.0)).color(white)))
+            .children((0..6).map(move |at| {
+                crate::row().key(format!("item-{at}")).w_full().gap(8.0).padding(7.5)
+                    .child(crate::el().size(24.0, 24.0).radius(12.0).fill(ink(0.3, 0.5, 0.4)))
+                    .child(crate::text(format!("Item {section}.{at} with a long enough name to be cut off at the edge")).font(crate::TextStyle::new(12.5, 400.0)).color(white).truncate().shrink())
+            }))
+    }))
+}
+
+/// Under sticky headers, rows still move as one with the scroll: where each may stick moves
+/// with it, and a header's own section paints.
+#[test]
+fn rows_under_sticky_headers_paint_what_their_moved_copies_hold() {
+    for (scale, seed) in [(1.0, 31), (1.25, 37), (2.0, 41)] {
+        let mut rt = Runtime::new((), sections, (420.0, 320.0), Env::new(true, scale));
+        rt.frame(0.0);
+        rt.frame(1.0 / 120.0);
+        for (k, dy) in offsets(seed, 240, 55.0).into_iter().enumerate() {
+            rt.wheel_xy(210.0, 160.0, 0.0, dy - if k < 120 { 14.0 } else { -14.0 });
+            rt.frame(1.0 / 120.0);
+            rt.frame(1.0 / 120.0);
+        }
+        let (checked, differed) = rt.paint.moved_checks();
+        assert!(checked > 1000, "moved subtrees were checked at {scale}x ({checked} nodes)");
+        assert_eq!(differed, 0, "a moved copy differs from its paint at {scale}x");
+    }
+}

@@ -50,11 +50,13 @@ pub(in crate::runtime) struct PaintRec {
     keep: bool,
     /// A glyph of its own text lay outside the clip and was left out (`keep_shift.rs`).
     cut: bool,
+    /// It or a node under it draws a picture, whose place in the atlas a copy has to check.
+    pictures: bool,
 }
 
 impl Default for PaintRec {
     fn default() -> Self {
-        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, inh: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false }
+        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, inh: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false, pictures: false }
     }
 }
 
@@ -86,6 +88,10 @@ pub(in crate::runtime) struct PaintKeep {
     /// and last: a copy that moved cuts it again where the clip is now.
     pub(in crate::runtime) hit_raw: Vec<[f32; 4]>,
     prev_hit_raw: Vec<[f32; 4]>,
+    /// Each picture's place in the image atlas as it was drawn, this paint and last: a copy
+    /// of it holds while the atlas still has those pixels there (`keep_pictures_hold`).
+    pub(in crate::runtime) picture: Vec<Option<Picture>>,
+    prev_picture: Vec<Option<Picture>>,
     /// The box each text is clipped to, where it is clipped to its own, this paint and last.
     pub(in crate::runtime) text_cut: Vec<Option<shift::TextCut>>,
     prev_text_cut: Vec<Option<shift::TextCut>>,
@@ -213,6 +219,8 @@ impl RuntimeCore {
         k.pinh.resize(self.tree.nodes.len(), Inh::default());
         std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
         k.hit_raw.resize(self.tree.nodes.len(), [0.0; 4]);
+        std::mem::swap(&mut k.picture, &mut k.prev_picture);
+        k.picture.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.text_cut, &mut k.prev_text_cut);
         k.text_cut.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.pages, &mut k.prev_pages);
@@ -373,8 +381,10 @@ impl RuntimeCore {
             fits: self.paint.keep.fits[i],
             keep: self.paint.keep.fits[i] && dynamic_ok(self, i, sel, marks),
             cut: false,
+            pictures: false,
         };
         self.paint.keep.glyph_out = false;
+        self.paint.keep.picture[i] = None;
         self.paint.keep.text_cut[i] = None;
         self.paint.keep.recs[i] = rec;
         self.paint.keep.open.push(i);
@@ -398,6 +408,8 @@ impl RuntimeCore {
         if !r.keep || r.end as usize - o != end - i {
             return None;
         }
+        // A picture is copied only while the atlas holds the pixels it drew, where it drew them.
+        if r.pictures && !self.keep_pictures_hold(i, o, end - i) { return None; }
         // Inheriting what it did, it is copied as it was; inheriting that but for a move, where
         // it is now.
         let starts = self.keep_starts();
@@ -417,6 +429,20 @@ impl RuntimeCore {
         }
         self.keep_copy(i, o, end, glyph_count, starts, shift.is_some());
         Some(end - i)
+    }
+
+    /// Whether every picture in the subtree of `len` nodes at last paint's `o` (this paint's
+    /// `i`) would be given the place in the image atlas it was drawn from: the same pixels, at
+    /// the same level, where they were. Asking keeps them there, as painting them does.
+    fn keep_pictures_hold(&mut self, i: usize, o: usize, len: usize) -> bool {
+        for j in 0..len {
+            let Some(was) = self.paint.keep.prev_picture[o + j] else { continue };
+            let Some(pixels) = &self.tree.nodes[i + j].vis.pixels else { return false };
+            if was.plays || pixels.signature() != was.signature { return false; }
+            let now = self.images.place_at(pixels, was.drawn, Some(self.t));
+            if now.is_some_and(|(_, next)| next.is_some()) || now.map(|(placed, _)| placed) != was.placed { return false; }
+        }
+        true
     }
 
     /// Copies the subtree at last paint's `o` as this paint's `i..end`. `moved`: `keep_move`
@@ -450,6 +476,7 @@ impl RuntimeCore {
                 k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
                 k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
                 k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
+                k.picture[i..end].copy_from_slice(&k.prev_picture[o..o + len]);
             }
         }
         let k = &mut self.paint.keep;
@@ -489,10 +516,14 @@ impl RuntimeCore {
         let k = &mut self.paint.keep;
         if !k.recording { return; }
         let start = k.recs[i].inst[0] as usize;
-        let mut ok = painted_ok;
+        // A picture's own image holds while its place in the atlas does; one that plays, or
+        // any other image (a colour glyph, a colour icon), is drawn each paint.
+        let picture = k.picture[i].is_some_and(|p| !p.plays);
+        let mut ok = painted_ok && k.picture[i].is_none_or(|p| !p.plays);
+        k.recs[i].pictures = k.picture[i].is_some();
         for q in &self.instances[start..] {
             let kind = q.params[1];
-            if kind == KIND_IMAGE || kind == KIND_EFFECT || kind == crate::render::KIND_BACKDROP_BLUR || (kind == KIND_GLYPH && q.radii[3] > 0.0) {
+            if (kind == KIND_IMAGE && !picture) || kind == KIND_EFFECT || kind == crate::render::KIND_BACKDROP_BLUR || (kind == KIND_GLYPH && q.radii[3] > 0.0) {
                 ok = false;
             } else if kind == KIND_GLYPH {
                 let (page, texels) = (q.params[2] as u16, (q.rect[2] * if q.radii[0] == 1.0 { 3.0 } else { 1.0 } * q.rect[3]) as u32);
@@ -549,8 +580,11 @@ impl RuntimeCore {
             rec.overlay[1] = self.hit.overlay_hits.len() as u32;
             rec.pages[1] = k.pages.len() as u32;
             rec.glyphs[1] = *glyph_count as u32;
-            let keep = rec.keep;
-            if let Some(p) = self.tree.nodes[r].parent { k.recs[p].keep &= keep; }
+            let (keep, pictures) = (rec.keep, rec.pictures);
+            if let Some(p) = self.tree.nodes[r].parent {
+                k.recs[p].keep &= keep;
+                k.recs[p].pictures |= pictures;
+            }
             if cfg!(debug_assertions) && self.paint.keep.verify.get(r).is_some_and(|&o| o != NONE) {
                 self.keep_check(r);
             }
@@ -638,6 +672,21 @@ pub(super) mod cycle;
 #[path = "keep_shift.rs"]
 mod shift;
 pub(in crate::runtime) use shift::TextCut;
+
+/// A picture as a paint drew it: what it asked the image atlas for and what it got. The atlas
+/// gives the same again while it holds the same pixels in the same place, and so a copy of
+/// the picture's instance still shows them.
+#[derive(Clone, Copy, PartialEq)]
+pub(in crate::runtime) struct Picture {
+    /// The pixels' identity and generation (`Pixels::signature`).
+    pub signature: (u64, u64),
+    /// The drawn size it chose a mip level by.
+    pub drawn: [f32; 2],
+    /// Where the atlas put it: none while it has no pixels.
+    pub placed: Option<crate::pixels::Placed>,
+    /// It is animated, and shows another frame later.
+    pub plays: bool,
+}
 #[path = "slide.rs"]
 mod slide;
 
@@ -661,7 +710,7 @@ fn own_key(rt: &RuntimeCore, i: usize) -> u64 {
 fn static_ok(n: &Node) -> bool {
     n.input.is_none() && !n.ime_cursor && n.scroll.is_none() && n.looping.is_none() && n.live.is_empty()
         && n.vis.surface.is_none() && n.material.is_none() && !n.vis_flags.cache() && !n.vis_flags.raise()
-        && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none() && n.vis.pixels.is_none()
+        && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none()
         && n.sticky.is_none() && n.above.is_none() && n.matched.is_none()
         && n.static_scale == 1.0 && !n.scale_track && n.vis.mark == 0
         && n.text.as_ref().is_none_or(|t| t.cold.links.is_empty() && t.cold.live.is_none() && t.cold.advance_in.is_none()
