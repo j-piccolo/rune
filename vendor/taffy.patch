@@ -1,0 +1,316 @@
+diff --git a/src/compute/flexbox.rs b/src/compute/flexbox.rs
+index 2dfb002a..d9a7eef6 100644
+--- a/src/compute/flexbox.rs
++++ b/src/compute/flexbox.rs
+@@ -61,8 +61,9 @@ struct FlexItem {
+     flex_basis_is_definite: bool,
+ 
+     /// The minimum size of the item. This differs from min_size above because it also
+-    /// takes into account content based automatic minimum sizes
+-    resolved_minimum_main_size: f32,
++    /// takes into account content based automatic minimum sizes, which are measured only when
++    /// a step of the algorithm can depend on them (see [`ResolvedMinimum`]).
++    resolved_minimum_main_size: ResolvedMinimum,
+ 
+     /// The `position: relative` offset of this item, resolved to (width, height) in the
+     /// container's coordinate space (zero for non-relative items)
+@@ -117,7 +118,119 @@ struct FlexItem {
+     oof_candidates: OofCandidates,
+ }
+ 
++/// A flex item's resolved minimum main size: known, or an automatic minimum (`min-width: auto` in
++/// a row, 4.5) not measured yet.
++///
++/// The automatic minimum is the item's min-content main size, clamped by its main size and its
++/// transferred max main size and floored by its padding and border. Measuring it means laying
++/// out the item's whole subtree at min-content, and when the item's main size is definite its
++/// result is mostly unused: the minimum is then at most that size, so it only holds the item when
++/// its line shrinks. Such a minimum is left [`ResolvedMinimum::Deferred`] with the range it lies
++/// in, and each step that reads it (`FlexItem::with_minimum`), all monotone in it, measures it
++/// only if its result differs at the two ends of that range. Debug builds measure it up front as
++/// well and check each such step against it.
++#[derive(Debug, Clone, Copy)]
++enum ResolvedMinimum {
++    /// The resolved minimum main size.
++    Known(f32),
++    /// An automatic minimum not measured yet.
++    Deferred(AutoMinimum),
++}
++
++/// An automatic minimum main size not measured yet: the range it lies in, and how
++/// `determine_flex_base_size` would have measured it (the container's sizes change after it).
++#[derive(Debug, Clone, Copy)]
++struct AutoMinimum {
++    /// The minimum lies in `lo..=hi`: the clamp at min-content sizes of minus and plus infinity.
++    lo: f32,
++    hi: f32,
++    known_dimensions: Size<Option<f32>>,
++    parent_size: Size<Option<f32>>,
++    available_space: Size<AvailableSpace>,
++    /// The item's main size and transferred max main size, which clamp the min-content size, and
++    /// its main padding and border, which floor it.
++    size: Option<f32>,
++    max_size: Option<f32>,
++    padding_border: Option<f32>,
++    /// Measured up front in debug builds, to check every step that doesn't measure it.
++    #[cfg(debug_assertions)]
++    eager: f32,
++}
++
++impl AutoMinimum {
++    /// 4.5. Automatic Minimum Size of Flex Items: the min-content main size, clamped and floored.
++    /// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
++    fn clamp(&self, min_content_main_size: f32) -> f32 {
++        let clamped_min_content_size = min_content_main_size.maybe_min(self.size).maybe_min(self.max_size);
++        clamped_min_content_size.maybe_max(self.padding_border)
++    }
++
++    fn measure(&self, tree: &mut impl LayoutFlexboxContainer, node: NodeId, dir: FlexDirection) -> f32 {
++        debug_log!("COMPUTE CHILD MIN SIZE:");
++        let min_content_main_size = tree.measure_child_size(
++            node,
++            self.known_dimensions,
++            self.parent_size,
++            self.available_space,
++            SizingMode::ContentSize,
++            dir.main_axis(),
++            Line::FALSE,
++        );
++        self.clamp(min_content_main_size)
++    }
++
++    /// Checks, in debug builds, that a step which skipped measuring the minimum got what it would
++    /// have with it measured.
++    #[cfg(debug_assertions)]
++    fn check(&self, with_minimum: f32, unmeasured: f32) {
++        debug_assert_eq!(
++            with_minimum.to_bits(),
++            unmeasured.to_bits(),
++            "a flex item's unmeasured automatic minimum {} in {}..={} changed a step's result: {} measured, {} not",
++            self.eager,
++            self.lo,
++            self.hi,
++            with_minimum,
++            unmeasured
++        );
++    }
++}
++
+ impl FlexItem {
++    /// The item's resolved minimum main size, measuring a deferred automatic minimum.
++    fn minimum(&mut self, tree: &mut impl LayoutFlexboxContainer, dir: FlexDirection) -> f32 {
++        match self.resolved_minimum_main_size {
++            ResolvedMinimum::Known(minimum) => minimum,
++            ResolvedMinimum::Deferred(auto) => {
++                let minimum = auto.measure(tree, self.node, dir);
++                #[cfg(debug_assertions)]
++                debug_assert_eq!(minimum.to_bits(), auto.eager.to_bits(), "a flex item's automatic minimum measured late differs");
++                self.resolved_minimum_main_size = ResolvedMinimum::Known(minimum);
++                minimum
++            }
++        }
++    }
++
++    /// `step` of the item's resolved minimum main size, for a `step` monotone in it. A deferred
++    /// automatic minimum is measured only if `step` differs at the two ends of its range: if it
++    /// doesn't, every value in the range gives that result.
++    fn with_minimum(
++        &mut self,
++        tree: &mut impl LayoutFlexboxContainer,
++        dir: FlexDirection,
++        step: impl Fn(f32) -> f32,
++    ) -> f32 {
++        if let ResolvedMinimum::Deferred(auto) = self.resolved_minimum_main_size {
++            let (lo, hi) = (step(auto.lo), step(auto.hi));
++            if lo.to_bits() == hi.to_bits() {
++                #[cfg(debug_assertions)]
++                auto.check(step(auto.eager), lo);
++                return lo;
++            }
++        }
++        step(self.minimum(tree, dir))
++    }
++
+     /// The size that the item's size styles exclude: padding + border for `box-sizing: content-box`, otherwise zero
+     fn box_sizing_adjustment(&self, style: &impl CoreStyle) -> Size<f32> {
+         if style.box_sizing() == BoxSizing::ContentBox {
+@@ -446,7 +559,7 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
+     // 6. Resolve the flexible lengths of all the flex items to find their used main size.
+     debug_log!("resolve_flexible_lengths");
+     for line in &mut flex_lines {
+-        resolve_flexible_lengths(line, &constants);
++        resolve_flexible_lengths(tree, line, &constants);
+     }
+ 
+     // 9.4. Cross Size Determination
+@@ -855,7 +968,7 @@ fn generate_anonymous_flex_items(
+                 violation: 0.0,
+                 frozen: false,
+ 
+-                resolved_minimum_main_size: 0.0,
++                resolved_minimum_main_size: ResolvedMinimum::Known(0.0),
+                 hypothetical_inner_size: Size::zero(),
+                 hypothetical_outer_size: Size::zero(),
+                 target_size: Size::zero(),
+@@ -1172,38 +1285,50 @@ fn determine_flex_base_size(
+         let style_min_main_size =
+             child.min_size.or(child.overflow.map(Overflow::maybe_into_automatic_min_size).into()).main(dir);
+ 
+-        child.resolved_minimum_main_size = style_min_main_size.unwrap_or_else(|| {
+-            let min_content_main_size = {
+-                let child_available_space = Size::MIN_CONTENT.with_cross(dir, cross_axis_available_space);
+-
+-                debug_log!("COMPUTE CHILD MIN SIZE:");
+-                tree.measure_child_size(
+-                    child.node,
+-                    child_known_dimensions,
+-                    child_parent_size,
+-                    child_available_space,
+-                    SizingMode::ContentSize,
+-                    dir.main_axis(),
+-                    Line::FALSE,
+-                )
+-            };
+-
+-            // 4.5. Automatic Minimum Size of Flex Items
+-            // https://www.w3.org/TR/css-flexbox-1/#min-size-auto
+-            let clamped_min_content_size =
+-                min_content_main_size.maybe_min(child.size.main(dir)).maybe_min(transferred_max_size.main(dir));
+-            clamped_min_content_size.maybe_max(padding_border_axes_sums.main(dir))
+-        });
++        child.resolved_minimum_main_size = match style_min_main_size {
++            Some(minimum) => ResolvedMinimum::Known(minimum),
++            None => {
++                let mut auto = AutoMinimum {
++                    lo: 0.0,
++                    hi: 0.0,
++                    known_dimensions: child_known_dimensions,
++                    parent_size: child_parent_size,
++                    available_space: Size::MIN_CONTENT.with_cross(dir, cross_axis_available_space),
++                    size: child.size.main(dir),
++                    max_size: transferred_max_size.main(dir),
++                    padding_border: padding_border_axes_sums.main(dir),
++                    #[cfg(debug_assertions)]
++                    eager: 0.0,
++                };
++                (auto.lo, auto.hi) = (auto.clamp(f32::NEG_INFINITY), auto.clamp(f32::INFINITY));
++                // Capped by the item's main size or max main size: measured when a step needs it.
++                if auto.hi.is_finite() {
++                    #[cfg(debug_assertions)]
++                    {
++                        auto.eager = auto.measure(tree, child.node, dir);
++                        debug_assert!(auto.lo <= auto.eager && auto.eager <= auto.hi);
++                    }
++                    ResolvedMinimum::Deferred(auto)
++                } else {
++                    ResolvedMinimum::Known(auto.measure(tree, child.node, dir))
++                }
++            }
++        };
+ 
+         // Sizes transferred through the aspect ratio clamp the hypothetical main size,
+         // but do not participate in resolving flexible lengths or clamping the final size.
+         // https://github.com/w3c/csswg-drafts/issues/10997
+-        let hypothetical_inner_min_main = child
+-            .resolved_minimum_main_size
+-            .maybe_max(transferred_min_size.main(constants.dir))
+-            .maybe_max(padding_border_axes_sums.main(constants.dir));
+-        let hypothetical_inner_size =
+-            child.flex_basis.maybe_clamp(Some(hypothetical_inner_min_main), transferred_max_size.main(constants.dir));
++        let (flex_basis, transferred_min_main, transferred_max_main, padding_border_main) = (
++            child.flex_basis,
++            transferred_min_size.main(constants.dir),
++            transferred_max_size.main(constants.dir),
++            padding_border_axes_sums.main(constants.dir),
++        );
++        let hypothetical_inner_size = child.with_minimum(tree, dir, |minimum| {
++            let hypothetical_inner_min_main =
++                minimum.maybe_max(transferred_min_main).maybe_max(padding_border_main);
++            flex_basis.maybe_clamp(Some(hypothetical_inner_min_main), transferred_max_main)
++        });
+         let hypothetical_outer_size = hypothetical_inner_size + child.margin.main_axis_sum(constants.dir);
+ 
+         child.hypothetical_inner_size.set_main(constants.dir, hypothetical_inner_size);
+@@ -1540,19 +1665,42 @@ fn determine_container_main_size(
+                         let flex_basis_min = clamping_basis.filter(|_| item.flex_shrink == 0.0);
+                         let flex_basis_max = clamping_basis.filter(|_| item.flex_grow == 0.0);
+ 
+-                        let min_main_size = style_min
+-                            .maybe_max(flex_basis_min)
+-                            .or(flex_basis_min)
+-                            .unwrap_or(item.resolved_minimum_main_size)
+-                            .max(item.resolved_minimum_main_size);
++                        let min_main_size =
++                            |minimum: f32| style_min.maybe_max(flex_basis_min).or(flex_basis_min).unwrap_or(minimum).max(minimum);
+                         let max_main_size =
+                             style_max.maybe_min(flex_basis_max).or(flex_basis_max).unwrap_or(f32::INFINITY);
+ 
+-                        let content_contribution = match (min_main_size, style_preferred, max_main_size) {
++                        // The first two arms, which read the minimum: `None` when neither applies.
++                        let clamped_contribution = |min_main_size: f32| match (min_main_size, style_preferred, max_main_size) {
+                             // If the clamping values are such that max <= min, then we can avoid the expensive step of computing the content size
+                             // as we know that the clamping values will override it anyway
+-                            (min, Some(pref), max) if max <= min || max <= pref => pref.min(max).max(min) + margin_sum,
+-                            (min, _, max) if max <= min => min + margin_sum,
++                            (min, Some(pref), max) if max <= min || max <= pref => Some(pref.min(max).max(min) + margin_sum),
++                            (min, _, max) if max <= min => Some(min + margin_sum),
++                            _ => None,
++                        };
++                        // Whether an arm applies and what it gives are both monotone in the minimum, so
++                        // a deferred one is measured only if they differ at the two ends of its range.
++                        let clamped = match item.resolved_minimum_main_size {
++                            ResolvedMinimum::Known(minimum) => clamped_contribution(min_main_size(minimum)),
++                            ResolvedMinimum::Deferred(auto) => {
++                                let lo = clamped_contribution(min_main_size(auto.lo));
++                                let hi = clamped_contribution(min_main_size(auto.hi));
++                                if lo.map(f32::to_bits) == hi.map(f32::to_bits) {
++                                    #[cfg(debug_assertions)]
++                                    debug_assert_eq!(
++                                        clamped_contribution(min_main_size(auto.eager)).map(f32::to_bits),
++                                        lo.map(f32::to_bits),
++                                        "a flex item's unmeasured automatic minimum changed its content contribution"
++                                    );
++                                    lo
++                                } else {
++                                    clamped_contribution(min_main_size(item.minimum(tree, dir)))
++                                }
++                            }
++                        };
++
++                        let content_contribution = match (clamped, style_preferred) {
++                            (Some(contribution), _) => contribution,
+ 
+                             // Else compute the min- or -max content size and apply the full formula for computing the
+                             // min- or max- content contribution
+@@ -1562,7 +1710,7 @@ fn determine_container_main_size(
+                             // contribution (an inherent-size measure of the item would return it), floored
+                             // by the item's main-axis padding+border, so measuring the item can be skipped.
+                             // Min/max clamping is applied in the same way as for measured contributions.
+-                            (_, Some(pref), _) => {
++                            (_, Some(pref)) => {
+                                 let item_pb_main = item.padding.main_axis_sum(constants.dir)
+                                     + item.border.main_axis_sum(constants.dir);
+                                 let inner_main_size = pref.max(item_pb_main);
+@@ -1744,7 +1892,7 @@ fn determine_container_main_size(
+ ///
+ /// # [9.7. Resolving Flexible Lengths](https://www.w3.org/TR/css-flexbox-1/#resolve-flexible-lengths)
+ #[inline]
+-fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
++fn resolve_flexible_lengths(tree: &mut impl LayoutFlexboxContainer, line: &mut FlexLine, constants: &AlgoConstants) {
+     let total_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), line.items.len());
+ 
+     // 1. Determine the used flex factor. Sum the outer hypothetical main sizes of all
+@@ -1901,9 +2049,11 @@ fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
+         //    If the item’s target main size was made larger by this, it’s a min violation.
+ 
+         let total_violation = line.items.iter_mut().filter(|child| !child.frozen).fold(0.0, |acc, child| -> f32 {
+-            let resolved_min_main: Option<f32> = child.resolved_minimum_main_size.into();
+             let max_main = child.max_size.main(constants.dir);
+-            let clamped = child.target_size.main(constants.dir).maybe_clamp(resolved_min_main, max_main).max(0.0);
++            let target_main = child.target_size.main(constants.dir);
++            let clamped = child.with_minimum(tree, constants.dir, |minimum| {
++                target_main.maybe_clamp(Some(minimum), max_main).max(0.0)
++            });
+             child.violation = clamped - child.target_size.main(constants.dir);
+             child.target_size.set_main(constants.dir, clamped);
+             child.outer_target_size.set_main(
