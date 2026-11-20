@@ -695,7 +695,15 @@ impl RuntimeCore {
         // Motion reduced mid-ease: a wheel's ease lands where it was going, at once.
         let land_wheels = !self.wheel_glides();
         let mut moving = false;
-        for i in 0..self.tree.nodes.len() {
+        // Each viewport, in tree order, from the index (a step changes no nodes).
+        self.prepare_viewports();
+        #[cfg(debug_assertions)]
+        {
+            let walked: Vec<u32> = (0..self.tree.nodes.len()).filter(|&i| self.tree.nodes[i].scroll.is_some()).map(|i| i as u32).collect();
+            debug_assert_eq!(self.tree.viewports.nodes(), &walked[..], "the indexed scroll viewports differ from the nodes'");
+        }
+        for k in 0..self.tree.viewports.nodes().len() {
+            let i = self.tree.viewports.nodes()[k] as usize;
             let Some(sp) = self.tree.nodes[i].scroll else { continue };
             if self.subtree_exiting(i) { continue; }
             let id = self.tree.nodes[i].id;
@@ -778,6 +786,7 @@ impl RuntimeCore {
             let _ = scroll_mode::step(&mut st.mode, ModeEvent::Laid(laid));
             if sp.stick_bottom && axes.y() && slack_dt > 0.0 { moving |= self.step_slack(i, slack_dt); }
         }
+        debug_assert!(self.viewports().is_some(), "a scroll step changed the nodes under the viewport index");
         moving
     }
 }

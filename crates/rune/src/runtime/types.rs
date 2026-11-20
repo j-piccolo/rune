@@ -649,6 +649,8 @@ pub(crate) struct TreeState {
     key_index: key_index::KeyIndex,
     /// Packed explicit piecewise-linear scroll-fade stops (`ScrollFade::stops`) for `Globals::flags[2..4]`.
     pub(in crate::runtime) fade_stops: [f32; 2],
+    /// The scroll viewports and their direct children (`runtime/scroll/viewports.rs`).
+    pub(in crate::runtime) viewports: scroll_viewports::Viewports,
 }
 
 impl TreeState {
@@ -682,6 +684,7 @@ impl TreeState {
             exit_mask: Default::default(),
             key_index: Default::default(),
             fade_stops: [0.0; 2],
+            viewports: Default::default(),
         }
     }
 
@@ -748,6 +751,7 @@ impl TreeState {
     pub(super) fn nodes_replaced(&mut self) {
         self.key_index.forget();
         self.exit_mask.forget();
+        self.viewports.forget();
     }
 
     #[inline]
