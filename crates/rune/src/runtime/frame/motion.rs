@@ -92,7 +92,7 @@ impl RuntimeCore {
             animating = sources != 0;
             self.scene.present();
         }
-        self.paint.record_moved(self.scene.changed().iter().map(|p| p.node));
+        self.paint.record_moved(self.scene.changed().iter().map(|p| p.node).zip(self.scene.changed_own().iter().copied()));
         if self.fill_text() { animating = true; sources |= AnimSource::TEXT_FILL; }
         let mut source = |on: bool, bit: u16| { if on { sources |= bit; } on };
         self.begin_exit_mask();

@@ -307,8 +307,11 @@ pub struct Scene {
     /// How many nodes are exiting, so a frame with none asks no node for its phase.
     exiting: u32,
     out: Vec<Presented>,
+    /// For each of `out`: whether the node itself changed, or only one above it did.
+    out_own: Vec<bool>,
     /// What [`Scene::present`] presented after the motion trace wrote its frame, for the next.
     late: Vec<Presented>,
+    late_own: Vec<bool>,
     exited: Carry<NodeId>,
     to_remove: Vec<u32>,
     /// Who is on a screen path, in the order the paths started. It only says who travels and in
@@ -340,7 +343,9 @@ impl Scene {
             order_dirty: false,
             exiting: 0,
             out: Vec::new(),
+            out_own: Vec::new(),
             late: Vec::new(),
+            late_own: Vec::new(),
             exited: Carry::new(),
             to_remove: Vec::new(),
             travelling: Vec::new(),

@@ -203,8 +203,10 @@ impl PaintState {
     }
 
     #[inline]
-    pub(in crate::runtime) fn record_moved(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        self.keep.moved.extend(ids);
+    pub(in crate::runtime) fn record_moved(&mut self, ids: impl IntoIterator<Item = (NodeId, bool)>) {
+        for (id, own) in ids {
+            if own { self.keep.moved.push(id) } else { self.keep.carried.push(id) }
+        }
     }
 
     #[inline]
@@ -337,6 +339,14 @@ impl PaintState {
     #[cfg(test)]
     pub(in crate::runtime) fn moved_checks(&self) -> (usize, usize) {
         self.keep.moved_checks
+    }
+
+    /// Tests: the nodes presented again only because one above them was and found as they
+    /// were, and the subtrees a debug build would have copied in place that painted something
+    /// else (`keep_carried.rs`).
+    #[cfg(test)]
+    pub(in crate::runtime) fn carried_checks(&self) -> (usize, usize) {
+        self.keep.carried_checks
     }
 
     #[cfg(test)]
