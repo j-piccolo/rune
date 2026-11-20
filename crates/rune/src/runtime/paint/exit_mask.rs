@@ -42,8 +42,10 @@ impl RuntimeCore {
     pub(in crate::runtime) fn begin_exit_mask(&mut self) {
         let mut exiting = std::mem::take(&mut self.tree.exit_mask).into_flags();
         exiting.clear();
+        // With nothing on its way out the mask is all clear: no node is asked.
+        if !self.scene.any_exiting() { exiting.resize(self.tree.nodes.len(), false); }
         exiting.reserve(self.tree.nodes.len());
-        for i in 0..self.tree.nodes.len() {
+        for i in exiting.len()..self.tree.nodes.len() {
             let n = &self.tree.nodes[i];
             let up = n.parent.is_some_and(|p| if p < i { exiting[p] } else { self.subtree_exiting(p) });
             exiting.push(up || self.is_exiting(n.id));
@@ -56,6 +58,7 @@ impl RuntimeCore {
     }
 
     pub(crate) fn subtree_exiting(&self, mut i: usize) -> bool {
+        if !self.scene.any_exiting() { return false; }
         if let Some(exiting) = self.tree.exit_mask.get(i, self.tree.nodes.len(), self.commit.commit_gen()) {
             return exiting;
         }

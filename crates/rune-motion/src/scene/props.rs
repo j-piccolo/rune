@@ -152,4 +152,35 @@ mod tests {
         s.remove(id);
         assert!(!s.is_resting_at(id, r1), "exiting node is not resting");
     }
+
+    /// The scene counts the nodes on their way out, however each exit ends: played out, cut
+    /// short by an unmount, or turned back by the node mounting again.
+    #[test]
+    fn any_exiting_follows_exits_to_each_of_their_ends() {
+        let mut s = Scene::new();
+        let r = Rect::new(0.0, 0.0, 40.0, 20.0);
+        let (a, b, c) = (NodeId(1), NodeId(2), NodeId(3));
+        for id in [a, b, c] {
+            s.insert(id, NodeSpec::new(r), Mount::Initial);
+        }
+        assert!(!s.any_exiting());
+        for id in [a, b, c] {
+            s.remove(id);
+        }
+        assert!(s.any_exiting());
+        // One is unmounted mid-exit, one mounts again, and the last plays out.
+        s.unmount(a);
+        assert!(s.any_exiting());
+        s.insert(b, NodeSpec::new(r), Mount::Animated);
+        assert_eq!(s.phase(b).map(|p| matches!(p, Phase::Exiting { .. })), Some(false));
+        assert!(s.any_exiting());
+        s.frame_at(30.0);
+        assert!(!s.contains(c), "the exit played out");
+        assert!(!s.any_exiting());
+        // A slot used again starts with nothing on its way out.
+        s.insert(c, NodeSpec::new(r), Mount::Initial);
+        assert!(!s.any_exiting());
+        s.remove(c);
+        assert!(s.any_exiting());
+    }
 }
