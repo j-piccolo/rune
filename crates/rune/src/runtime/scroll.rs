@@ -13,6 +13,7 @@ pub(super) mod requests;
 pub(super) mod reveal;
 pub(super) mod sticky;
 pub(super) mod touch;
+pub(super) mod viewports;
 pub(super) mod watch;
 pub(super) mod wheel;
 pub(super) mod x;

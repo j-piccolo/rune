@@ -10,6 +10,8 @@ impl RuntimeCore {
         let (_paint_time, _blend) = (crate::frame::profile::Scope::new(crate::frame::profile::Phase::Paint), crate::theme::scope(self.paint.srgb_blend));
         let s = self.env.scale;
         let snap_px = |v: f32| grid(v, s) * s;
+        // Every scroll viewport asks for its children (`bottom_offset`).
+        self.prepare_viewports();
         self.keep_swap();
         self.instances.clear();
         self.paint.quads_frame += 1;
