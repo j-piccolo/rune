@@ -7,6 +7,7 @@ mod context_menu_key;
 mod draw_on;
 mod edit;
 mod enter_in_instant;
+mod entering_text;
 mod event_markers;
 mod find_key;
 mod fold_glide;
