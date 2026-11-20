@@ -241,7 +241,9 @@ impl RuntimeCore {
                 pose::step_static_scale(&mut self.paint.static_scales, &mut self.paint.scale_frame, n.id, tracked_scale, self.t, self.settled, has_live_scale)
             } else { false };
             let store = self.scene.store();
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || store.is_animating(n.id, prop::PRESENCE)
+            // A presence that only fades or slides scales nothing: text under it draws as it
+            // rests, not from its outlines.
+            let scale_animating = store.is_animating(n.id, prop::SCALE) || (store.is_animating(n.id, prop::PRESENCE) && self.scene.presence_scales(n.id))
                 || (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
                 || (n.scale_track && store.is_animating(n.id, P_SCALE))
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
