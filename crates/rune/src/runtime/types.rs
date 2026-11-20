@@ -619,6 +619,10 @@ pub(crate) struct TreeState {
     pub(in crate::runtime) has_paint_order: bool,
     /// Some element is `El::anchored` / `El::above`.
     pub(in crate::runtime) has_above: bool,
+    /// Some element is `El::hover_alone`, or shares its hover (`El::hover_group_shared`): with
+    /// neither, a frame doesn't look through every node for the ones under the pointer.
+    pub(in crate::runtime) has_hover_alone: bool,
+    pub(in crate::runtime) has_hover_share: bool,
     pub(in crate::runtime) has_cache: bool,
     /// Some picture sizes a side from its image's ratio (`pixel_aspect`).
     pub(in crate::runtime) has_pixel_aspect: bool,
@@ -659,6 +663,8 @@ impl TreeState {
             has_raise: false,
             has_paint_order: false,
             has_above: false,
+            has_hover_alone: false,
+            has_hover_share: false,
             has_cache: false,
             has_pixel_aspect: false,
             has_drawn_layout: false,
