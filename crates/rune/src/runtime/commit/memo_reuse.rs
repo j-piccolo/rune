@@ -86,15 +86,10 @@ impl CommitState {
             if !span.same_path || span.len == 0 || span.old_start + span.len > tree.nodes.len() || span.new_start + span.len > nodes.len() { continue; }
             let (r_new, r_old) = (&nodes[span.new_start], &tree.nodes[span.old_start]);
             if !scene.contains(r_new.id) || matches!(scene.phase(r_new.id), Some(PresencePhase::Exiting { .. })) { continue; }
-            let mut scene_rect = r_new.local;
-            if !self.virtuals.is_empty() && let Some(v) = r_new.parent.and_then(|p| self.virtuals.get(&nodes[p].path)) { scene_rect.y -= v.before; }
+            let scene_rect = r_new.local;
             let parent_top_clean = r_new.in_row != RowLayout::Snaps
                 || r_new.parent.is_none_or(|p| {
-                    nodes.get(p + 1).is_none_or(|first_sib| {
-                        let mut sr = first_sib.local;
-                        if !self.virtuals.is_empty() && let Some(v) = self.virtuals.get(&nodes[p].path) { sr.y -= v.before; }
-                        scene.get(first_sib.id, prop::FRAME) == Some(sr)
-                    })
+                    nodes.get(p + 1).is_none_or(|first_sib| scene.get(first_sib.id, prop::FRAME) == Some(first_sib.local))
                 });
             let root_clean = Self::node_clean_for_apply(tree, scene, motion, r_new, r_old, any_animating)
                 && parent_top_clean

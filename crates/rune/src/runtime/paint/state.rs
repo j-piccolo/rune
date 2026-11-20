@@ -39,6 +39,10 @@ pub(crate) struct PaintState {
     pub(in crate::runtime) row_dy: Vec<f32>,
     pub(in crate::runtime) row_h: Vec<f32>,
     pub(in crate::runtime) row_mask: Vec<f32>,
+    /// Per node index this frame: the part of a virtual list's `row_dy` that is its window's,
+    /// the room of the rows culled above it. The list draws with it; its rows, whose places in
+    /// the scene hold that room already, inherit it only in what snaps as a whole.
+    pub(in crate::runtime) row_window: Vec<f32>,
     /// The scale each node's text drew at (its own and its ancestors'), for text hit tests.
     pub(crate) drawn_scale: Vec<f32>,
     /// Per node: it drew inside its clip and the window in the last build.
@@ -127,6 +131,7 @@ impl PaintState {
             row_dy: Vec::new(),
             row_h: Vec::new(),
             row_mask: Vec::new(),
+            row_window: Vec::new(),
             drawn_scale: Vec::new(),
             seen: Vec::new(),
             video_signature: 0,
@@ -554,6 +559,12 @@ impl PaintState {
     #[cfg(test)]
     pub(in crate::runtime) fn moved_checks(&self) -> (usize, usize) {
         self.keep.moved_checks
+    }
+
+    /// Tests: the nodes the last paint copied, or in a debug build checked as copies.
+    #[cfg(test)]
+    pub(in crate::runtime) fn kept(&self) -> usize {
+        self.keep.kept
     }
 
     /// Tests: from now on copy as a release build does, rather than paint what would be copied
