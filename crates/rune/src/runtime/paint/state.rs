@@ -446,6 +446,13 @@ impl PaintState {
         self.keep.moved_checks
     }
 
+    /// Tests: from now on copy as a release build does, rather than paint what would be copied
+    /// and check it (`keep_shift.rs`).
+    #[cfg(test)]
+    pub(in crate::runtime) fn copy_for_real(&mut self) {
+        self.keep.real_copies = true;
+    }
+
     /// Tests: the nodes presented again only because one above them was and found as they
     /// were, and the subtrees a debug build would have copied in place that painted something
     /// else (`keep_carried.rs`).
