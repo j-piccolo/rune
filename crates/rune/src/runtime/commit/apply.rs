@@ -27,8 +27,14 @@ impl RuntimeCore {
         if !self.commit.virtual_culled.is_empty() {
             scratch.culled.clear();
             scratch.culled.resize(self.tree.nodes.len(), false);
+            // A node's id is its path's (`Measurement::place`), so the culled rows are found by
+            // id, and only a node with one of their ids has its path compared.
+            let culled_ids: Vec<NodeId> = self.commit.virtual_culled.iter().filter_map(|p| self.tree.path_ids.get(p).copied()).collect();
+            let by_id = culled_ids.len() == self.commit.virtual_culled.len();
             for (i, n) in self.tree.nodes.iter().enumerate() {
-                if self.commit.virtual_culled.contains(&n.path) || n.parent.is_some_and(|p| scratch.culled[p]) {
+                let culled_row = if by_id { culled_ids.contains(&n.id) && self.commit.virtual_culled.contains(&n.path) } else { self.commit.virtual_culled.contains(&n.path) };
+                debug_assert_eq!(culled_row, self.commit.virtual_culled.contains(&n.path), "a culled row's node has its path's id");
+                if culled_row || n.parent.is_some_and(|p| scratch.culled[p]) {
                     scratch.culled[i] = true;
                     self.scene.unmount(n.id);
                     self.motion.grows.remove(&n.id);
@@ -119,7 +125,7 @@ impl RuntimeCore {
         let can_skip_apply = !first && !tx.commit.lands() && !concealing && reduced_motion_unchanged && !self.scene.tracing();
         let mut skip_spans = std::mem::take(&mut self.commit.memo.skip_scratch);
         self.commit.clean_apply_spans(&self.tree, &self.scene, &self.motion, &nodes, &memo_reused, can_skip_apply, |i| self.reorder_jump(&nodes, i), &mut skip_spans);
-        let unseen = self.unseen_before_and_after(&nodes, &skip_spans);
+        let unseen = self.unseen_before_and_after(&nodes, &skip_spans, &drew_nothing);
         // `El::matched` elements of this tree: (id, index, newly mounted).
         let mut arrivals = std::mem::take(&mut scratch.arrivals);
         arrivals.clear();
@@ -136,6 +142,13 @@ impl RuntimeCore {
         let mut top_moved = std::mem::take(&mut scratch.top_moved);
         top_moved.clear();
         let has_virtuals = !self.commit.virtuals.is_empty();
+        // Where this tree's virtual lists are, found once by id (a node's id is its path's)
+        // rather than by path at every node.
+        let virtual_at: Vec<usize> = if has_virtuals {
+            self.commit.virtuals.keys()
+                .filter_map(|p| self.tree.path_ids.get(p).and_then(|id| self.tree.node_index.get(id)).copied().filter(|&k| nodes.get(k).is_some_and(|n| n.path == *p)))
+                .collect()
+        } else { Vec::new() };
         let mut last = paint_tracks::Finder::default();
         let mut skip_cursor = 0usize;
         // A crossing carries its paint and exits; a resizing row carries its inset. Its
@@ -161,7 +174,8 @@ impl RuntimeCore {
             if live_row.is_some_and(|(root, _)| nodes[i].parent.is_none_or(|p| p < root)) { live_row = None; }
             let id = nodes[i].id;
             let scene_rect = nodes[i].local;
-            let parent_virtual = if has_virtuals {
+            // Read only for whether a change replaced what its list showed.
+            let parent_virtual = if any_replaced {
                 nodes[i].parent.and_then(|p| self.commit.virtuals.get(&nodes[p].path))
             } else {
                 None
@@ -178,7 +192,8 @@ impl RuntimeCore {
             {
                 continue;
             }
-            let is_virtual = has_virtuals && self.commit.virtuals.contains_key(&nodes[i].path);
+            let is_virtual = virtual_at.contains(&i);
+            debug_assert_eq!(is_virtual, has_virtuals && self.commit.virtuals.contains_key(&nodes[i].path), "a virtual list is found by its path's id");
             let parent_id = nodes[i].parent.map(|p| nodes[p].id);
             let (spring_l, anim_l) = tx.motion.map_or_else(
                 || { let spring = nodes[i].motion; (spring, spring.into()) },
