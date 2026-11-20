@@ -277,6 +277,7 @@ impl RuntimeCore {
     /// The innermost `hover_alone` element under the pointer: the elements around it show no
     /// hover.
     fn hovered_alone(&self) -> Option<usize> {
+        if !self.tree.has_hover_alone { return None; }
         let (x, y) = self.pointer.pos?;
         (0..self.tree.nodes.len())
             .filter(|&i| self.tree.nodes[i].vis.hover_alone && !self.subtree_exiting(i) && self.allowed(i) && self.node_contains(i, x, y))
@@ -292,6 +293,7 @@ impl RuntimeCore {
 
     /// The `hover_group_shared` keys of the elements under the pointer or holding keyboard focus.
     fn shared_hovered(&self) -> Vec<Rc<str>> {
+        if !self.tree.has_hover_share { return Vec::new(); }
         let (x, y) = self.pointer.pos.unwrap_or((f32::NAN, f32::NAN));
         (0..self.tree.nodes.len())
             .filter_map(|i| {

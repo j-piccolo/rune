@@ -26,7 +26,7 @@ impl RuntimeCore {
     pub(in crate::runtime) fn refresh_node_flags(&mut self) -> bool {
         let (mut dissolve, mut cache, mut pix, mut drawn_ly, mut key_up, mut sticky, mut raise, mut any_loop) =
             (false, false, false, false, false, false, false, false);
-        let mut ordered = false;
+        let (mut ordered, mut hover_alone, mut hover_share) = (false, false, false);
         let mut fade_stops: Option<[f32; 2]> = None;
         for n in &self.tree.nodes {
             dissolve |= n.vis_flags.blend() == crate::render::Blend::PlusLighter;
@@ -47,6 +47,8 @@ impl RuntimeCore {
                 );
                 fade_stops = Some(packed);
             }
+            hover_alone |= n.vis.hover_alone;
+            hover_share |= n.vis.hover_share.is_some();
         }
         self.tree.has_dissolve = dissolve;
         self.tree.has_cache = cache;
@@ -57,6 +59,8 @@ impl RuntimeCore {
         self.tree.has_raise = raise;
         self.tree.has_paint_order = ordered;
         self.tree.fade_stops = fade_stops.unwrap_or([0.0; 2]);
+        self.tree.has_hover_alone = hover_alone;
+        self.tree.has_hover_share = hover_share;
         any_loop
     }
 
