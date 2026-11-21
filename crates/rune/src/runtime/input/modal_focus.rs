@@ -206,6 +206,28 @@ impl RuntimeCore {
         cb_dirty
     }
 
+    /// Outside a modal, an `El::autofocus` control that mounted in this commit takes focus when
+    /// nothing has it, as HTML's attribute does on insertion: a search field a window opens
+    /// with, a passphrase field a row opens. One already showing never takes it back.
+    pub(in crate::runtime) fn sync_autofocus(&mut self, app: &mut dyn AppDriver) {
+        if self.active_modal().is_some() {
+            return;
+        }
+        let shown: Vec<String> = self.tree.nodes.iter().filter(|node| node.focus.autofocus).map(|node| node.path.clone()).collect();
+        if shown.is_empty() && self.kbd.autofocus_seen.is_empty() {
+            return;
+        }
+        let fresh = shown.iter().find(|path| !self.kbd.autofocus_seen.contains(path)).cloned();
+        if let Some(path) = fresh
+            && self.focused_index().is_none()
+            && let Some(j) = self.tree.nodes.iter().position(|node| node.path == path)
+            && self.can_focus(j)
+        {
+            self.set_focus(app, Some(path), false);
+        }
+        self.kbd.autofocus_seen = shown;
+    }
+
     fn modal_step(&mut self, app: &mut dyn AppDriver, event: ModalEvent) -> bool {
         let effects = self.kbd.step_modal(event);
         let mut cb_dirty = false;

@@ -296,6 +296,9 @@ pub(crate) struct KeyboardState {
     /// This commit's focus is a `Tx::return_focus` hand-back, which a modal opening in it
     /// doesn't take as where focus was.
     focus_returned: bool,
+    /// The `El::autofocus` controls outside any modal the last commit showed: one that isn't
+    /// among them mounted since, and takes focus if nothing has it.
+    pub(in crate::runtime) autofocus_seen: Vec<String>,
 }
 
 impl KeyboardState {
@@ -321,6 +324,7 @@ impl KeyboardState {
             focus_returned: false,
             unmounted_focused: Vec::new(),
             modal_scope: None,
+            autofocus_seen: Vec::new(),
         }
     }
 
