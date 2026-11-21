@@ -6,7 +6,7 @@ use crate::text::{ATLAS_SIZE, Atlas};
 mod backdrop_blur;
 mod breaker;
 mod cleared;
-#[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+#[cfg(not(target_os = "macos"))]
 mod damaged;
 mod device;
 mod dxbc;
@@ -22,7 +22,7 @@ mod outlines;
 mod pass;
 mod pipelines;
 // The kept frame it checks exists only where partial frames do (`damaged`).
-#[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+#[cfg(not(target_os = "macos"))]
 mod pixel_check;
 #[cfg(target_os = "macos")]
 mod prewarm;
@@ -75,7 +75,7 @@ mod webgl_shader_tests;
 
 use pass::{ActivePass, Backdrop};
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 pub(crate) use damaged::MAX_RECTS;
 pub(crate) use shader_check::ShaderError;
 pub(crate) use surface_setup::{SurfaceSetupError, format_window_setup_error};
@@ -150,9 +150,9 @@ pub(crate) const ATLAS_START_ROWS: u32 = 256;
 /// `RUNE_LOOP_CHECK=2` found a picture that differed from the whole frame's (`pixel_check`), so the
 /// process's exit code is 3. Never on macOS and Linux, which have no loop-only frames.
 pub(crate) fn loop_pixel_check_failed() -> bool {
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     return pixel_check::failed();
-    #[cfg(not(any(target_os = "windows", target_arch = "wasm32")))]
+    #[cfg(target_os = "macos")]
     false
 }
 
@@ -365,10 +365,10 @@ pub struct Renderer {
     /// limit from JavaScript (about 35 µs), which a frame's layers used to pay.
     max_texture_dim: u32,
     /// The one instance per rectangle that clears a damaged one (`arm_damage`), made on first use.
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     clear_quad: std::sync::OnceLock<wgpu::Buffer>,
     /// The kept frame and the rectangles the next `draw` may redraw alone (`damaged`).
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     damage: std::sync::Mutex<damaged::DamageState>,
 }
 
@@ -488,6 +488,11 @@ impl Renderer {
         clear: [f32; 4],
         hook: &mut EffectBackdropHook<'_>,
     ) {
+        // A partial frame (`damaged`), as `draw` takes one: only when nothing but the instances
+        // draws there, so there's no effect slot for `hook` to fill. (The web arms and draws its
+        // own, `platform/web/gpu.rs`.)
+        #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+        if self.armed() && self.draw_armed(encoder, &view.texture()) { return; }
         self.encode_layers_with_backdrop(encoder, hook);
         let clear = wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 };
         self.draw_target_range_with(encoder, view, self.format, wgpu::LoadOp::Clear(clear), 0..self.count, hook);
@@ -649,7 +654,7 @@ impl Renderer {
     }
 
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, clear: [f32; 4]) {
-        #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+        #[cfg(not(target_os = "macos"))]
         if self.armed() && self.draw_armed(encoder, &view.texture()) { return; }
         self.draw_timed(encoder, view, clear, None);
     }

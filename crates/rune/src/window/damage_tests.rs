@@ -141,9 +141,41 @@ fn changed_order_check_handles_inserts_deletes_duplicates_and_reorders() {
     let new_dup = [r(0.0), r(15.0), r(30.0), r(30.0), r(90.0)];
     assert!(matches!(changed(&old_dup, &new_dup, size, &mut s), Area::Rects(ref rs) if !rs.is_empty()));
 
-    // Swapping two unchanged instances triggers full redraw (`Area::All`).
+    // Lists of one length compare in place: swapping two instances redraws where both draw,
+    // since every pixel the swap changed lies under one of them.
     let swapped = [r(0.0), r(60.0), r(30.0), r(90.0)];
-    assert_eq!(changed(&old, &swapped, size, &mut s), Area::All);
+    let Area::Rects(rs) = changed(&old, &swapped, size, &mut s) else { panic!("a swap is two rectangles' change") };
+    for x in [30.0, 60.0] {
+        let b = bounds(&r(x), size).unwrap();
+        assert!(rs.iter().any(|q| q[0] <= b[0] && q[1] <= b[1] && q[2] >= b[2] && q[3] >= b[3]), "{rs:?} misses {b:?}");
+    }
+
+    // With the length changed too, a reorder among what both lists have still draws whole.
+    let swapped_and_more = [r(0.0), r(60.0), r(30.0), r(90.0), r(120.0)];
+    assert_eq!(changed(&old, &swapped_and_more, size, &mut s), Area::All);
+}
+
+#[test]
+fn a_scroll_draws_whole_without_hashing_the_lists() {
+    let row = |n: usize, dy: f32| Instance {
+        rect: [10.0 + (n % 40) as f32 * 30.0, (n / 40) as f32 * 30.0 + dy, 20.0, 20.0],
+        fill: [1.0; 4],
+        params: [0.0, KIND_RECT, 0.0, 1.0],
+        clip: NO_CLIP,
+        ..Instance::zeroed()
+    };
+    let size = (1280, 1024);
+    let mut s = Scratch::default();
+    let old: Vec<Instance> = (0..800).map(|n| row(n, 0.0)).collect();
+    // Every instance moved, the list the same length: past `MANY` differ in place.
+    let moved: Vec<Instance> = (0..800).map(|n| row(n, 3.0)).collect();
+    assert_eq!(changed(&old, &moved, size, &mut s), Area::Many);
+    // Moved, and a row more mounted: the sample finds the new instances nowhere near their places.
+    let mounted: Vec<Instance> = (0..840).map(|n| row(n, 3.0)).collect();
+    assert_eq!(changed(&old, &mounted, size, &mut s), Area::Many);
+    // A row mounted without moving the rest: only it changed.
+    let only_mounted: Vec<Instance> = (0..840).map(|n| row(n, 0.0)).collect();
+    assert!(matches!(changed(&old, &only_mounted, size, &mut s), Area::Rects(ref rs) if !rs.is_empty()));
 }
 
 #[test]

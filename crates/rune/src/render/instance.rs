@@ -598,9 +598,9 @@ impl Instance {
         Some([x0, y0, x1, y1])
     }
 
-    /// Pre-clip bounds for Windows damage (`window/win32/damage.rs`): `quad_bounds` plus
+    /// Pre-clip bounds for partial frames (`window/damage.rs`): `quad_bounds` plus
     /// `Kind::Effect` (`params[2].max(0) + 1`) and `Kind::BackdropBlur` (`1`).
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     #[inline(always)]
     pub(crate) fn damage_quad_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         self.bounds_core::<true>(0.0)

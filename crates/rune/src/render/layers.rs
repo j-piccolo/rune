@@ -79,7 +79,7 @@ impl Layers {
     /// parent's pass, or into a target composited back at its own place, neither turned nor
     /// blurred, so a changed instance changes only the pixels its bounds cover
     /// (`Renderer::redraws_in_place`).
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn in_place(&self) -> bool {
         self.plan.iter().enumerate().all(|(i, l)| match self.planner.dispositions.get(i) {
             Some(Disposition::Inline | Disposition::Skip) | None => true,

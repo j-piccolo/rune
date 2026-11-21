@@ -81,6 +81,8 @@ pub(in crate::window) struct Native {
     pub(in crate::window) drop_seq: crate::machine::Seq,
     /// Unregisters the window's Wayland drop target before the window's `wl_surface` drops.
     pub(in crate::window) drop_target: Option<crate::platform::wayland_drop::DropTarget>,
+    /// What its last frames changed, so the next redraws only that (`damage`).
+    pub(in crate::window) damage: crate::window::damage::Damage,
 }
 
 #[cfg(target_os = "windows")]
@@ -102,7 +104,7 @@ pub(in crate::window) struct Native {
     /// Paces sub-frame `poll` wakes onto the display's vblank grid (`poll_pace`).
     pub(in crate::window) poll_pace: crate::window::win32::poll_pace::PollPace,
     /// What its last frames changed, so the next redraws only that (`damage`).
-    pub(in crate::window) damage: crate::window::win32::damage::Damage,
+    pub(in crate::window) damage: crate::window::damage::Damage,
     /// Whether the CPU renderer or the GPU draws its frames (`cpu_frame`).
     pub(in crate::window) mode: crate::window::win32::handover::SurfaceMode,
     /// Whether its accessibility adapter waits for the first frame (`Host::a11y_after_frame`).

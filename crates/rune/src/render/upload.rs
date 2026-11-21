@@ -339,9 +339,9 @@ impl Renderer {
         }
         let has_layers = self.uploads.has_layers;
         // A loop-only frame that draws no layer leaves them as the last frame drew them.
-        #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+        #[cfg(not(target_os = "macos"))]
         let layers_kept = self.uploads.patched && self.cycle_leaves_layers();
-        #[cfg(not(any(target_os = "windows", target_arch = "wasm32")))]
+        #[cfg(target_os = "macos")]
         let layers_kept = false;
         if !layers_kept { self.prepare_layers(device, queue, if has_layers { instances } else { &[] }, viewport); }
         self.sync_resident_caches(&mut atlas.resident_caches);

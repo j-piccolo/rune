@@ -334,6 +334,10 @@ fn run_headless(prep: HeadlessPrep, config: HeadlessConfig, app: &mut dyn Headle
         snap_crop: &snap_crop,
         cpu_boot: &cpu_boot,
         loop_check: super::loop_check::Tally::default(),
+        #[cfg(not(target_os = "macos"))]
+        damage: Default::default(),
+        #[cfg(not(target_os = "macos"))]
+        target_made: 0,
         cpu_ms: Vec::new(),
         anim_ms: Vec::new(),
         rest_ms: Vec::new(),
