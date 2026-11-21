@@ -5,6 +5,7 @@ use crate::text::{ATLAS_SIZE, Atlas};
 
 mod backdrop_blur;
 mod breaker;
+mod cleared;
 #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
 mod damaged;
 mod device;
@@ -305,6 +306,8 @@ pub struct Renderer {
     image_batches: Vec<(std::ops::Range<u32>, BatchBind)>,
     instances: rune_staging::GrowBuffer,
     count: u32,
+    /// The rects at the head of the list that a pass clearing to their colour leaves out (`cleared`).
+    cleared: cleared::Cleared,
     springs: Option<crate::gpu::springs::Bindings>,
     spring_instances: usize,
     layers: layers::Layers,
@@ -448,6 +451,7 @@ impl Renderer {
         if range.is_empty() && range.end != self.count { return; }
         self.validate_layer_range(&range);
         self.flush_uploads(encoder);
+        let range = if range.start == 0 { self.cleared_start(load).min(range.end)..range.end } else { range };
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -610,6 +614,7 @@ impl Renderer {
             t
         });
         let blurs = self.has_backdrop_blur();
+        let start = self.cleared_start(load);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -624,13 +629,13 @@ impl Renderer {
             multiview_mask: None,
         });
         if !blurs {
-            self.draw_range(&mut pass, self.format, 0..self.count);
+            self.draw_range(&mut pass, self.format, start..self.count);
             return;
         }
         // Backdrop blurs split the frame pass, which needs it owned along with the encoder.
         let pass = pass.forget_lifetime();
         let mut active = ActivePass::owned_timed(pass, encoder, view, timestamps);
-        self.draw_layer_range(&mut active, self.format, 0..self.count, None, &mut |_, _| {});
+        self.draw_layer_range(&mut active, self.format, start..self.count, None, &mut |_, _| {});
     }
 }
 
