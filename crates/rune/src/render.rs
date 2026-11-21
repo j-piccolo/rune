@@ -76,7 +76,7 @@ mod webgl_shader_tests;
 use pass::{ActivePass, Backdrop};
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) use damaged::MAX_RECTS;
+pub(crate) use damaged::{MAX_ARMED, MAX_RECTS};
 pub(crate) use shader_check::ShaderError;
 pub(crate) use surface_setup::{SurfaceSetupError, format_window_setup_error};
 #[cfg(target_os = "windows")]
@@ -492,7 +492,7 @@ impl Renderer {
         // draws there, so there's no effect slot for `hook` to fill. (The web arms and draws its
         // own, `platform/web/gpu.rs`.)
         #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
-        if self.armed() && self.draw_armed(encoder, &view.texture()) { return; }
+        if self.armed() && self.draw_armed(encoder, &view.texture(), Some(view)) { return; }
         self.encode_layers_with_backdrop(encoder, hook);
         let clear = wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 };
         self.draw_target_range_with(encoder, view, self.format, wgpu::LoadOp::Clear(clear), 0..self.count, hook);
@@ -655,7 +655,7 @@ impl Renderer {
 
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, clear: [f32; 4]) {
         #[cfg(not(target_os = "macos"))]
-        if self.armed() && self.draw_armed(encoder, &view.texture()) { return; }
+        if self.armed() && self.draw_armed(encoder, &view.texture(), Some(view)) { return; }
         self.draw_timed(encoder, view, clear, None);
     }
 

@@ -10,11 +10,21 @@
 //! another way leaves the kept texture behind, and the next armed one draws it whole. Every
 //! instance still goes through the pass, each scissor kept inside the rectangle
 //! (`ActivePass::borrowed_within`), so what lands there is exactly what a whole frame draws there.
+//!
+//! A scroll moves most of the window without changing it. The kept frame then holds the scrolled
+//! viewport rolled (`Roll`): the scroll moves none of its pixels, only where the viewport starts
+//! in it, and the copy to the drawable straightens it. What came in is redrawn on the drawable
+//! and copied back to where the roll keeps it. A scroll frame so shades a strip and copies the
+//! window once, as any partial frame does. A rectangle's clear is one colour written, not the
+//! uber shader blending it (`SOLID_WGSL`), and each rectangle draws only the instances that
+//! reach it (`cull_armed`).
 
 use super::*;
 
 /// Rectangles a frame redraws at most.
 pub(crate) const MAX_RECTS: usize = 4;
+/// Rectangles `arm_damage` takes at most: a scroll's are more, and further apart.
+pub(crate) const MAX_ARMED: usize = 8;
 
 /// What the armed rectangles came to.
 pub(super) type Drawn = Result<(), &'static str>;
@@ -25,6 +35,100 @@ pub(super) struct Retained {
     view: wgpu::TextureView,
     current: bool,
 }
+
+/// A viewport (`band`, `[x, y, width, height]`) whose pixels the kept frame holds rolled: the
+/// window's pixel (x, y) there is kept at `band.xy + ((x, y) - band.xy + off) mod band.wh`. A scroll
+/// then moves nothing in the kept frame: it changes `off`, and what scrolls in is drawn where what
+/// scrolled out was. The copy to the drawable, which a frame makes anyway, straightens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Roll {
+    band: [u32; 4],
+    off: [u32; 2],
+}
+
+/// A rectangle of the window (`[x, y, width, height]`) and where the kept frame holds it.
+type Piece = ([u32; 4], [u32; 2]);
+
+impl Roll {
+    /// The roll after the pixels at `from` (`[x, y, width, height]`) moved to `to`: `roll`, or a
+    /// new one, of the viewport they moved in. `None`: `roll` is of another viewport.
+    fn moved(roll: Option<Roll>, from: [u32; 4], to: [u32; 2]) -> Option<Roll> {
+        let band = [from[0].min(to[0]), from[1].min(to[1]), from[2] + from[0].abs_diff(to[0]), from[3] + from[1].abs_diff(to[1])];
+        let roll = roll.unwrap_or(Roll { band, off: [0, 0] });
+        if roll.band != band { return None; }
+        let step = |off: u32, from: u32, to: u32, size: u32| (i64::from(off) + i64::from(from) - i64::from(to)).rem_euclid(i64::from(size)) as u32;
+        Some(Roll { band, off: [step(roll.off[0], from[0], to[0], band[2]), step(roll.off[1], from[1], to[1], band[3])] })
+    }
+
+    /// `rect` (`[x, y, width, height]`, the window's pixels) in pieces, each with where the kept
+    /// frame holds it: itself outside the viewport, and inside it split where the roll wraps.
+    fn pieces(roll: Option<Roll>, rect: [u32; 4], out: &mut Vec<Piece>) {
+        let [x, y, w, h] = rect;
+        if w == 0 || h == 0 { return; }
+        let Some(Roll { band: [bx, by, bw, bh], off }) = roll else { return out.push((rect, [x, y])) };
+        let (x1, y1) = (x + w, y + h);
+        let (ix0, iy0, ix1, iy1) = (x.max(bx), y.max(by), x1.min(bx + bw), y1.min(by + bh));
+        if ix0 >= ix1 || iy0 >= iy1 { return out.push((rect, [x, y])); }
+        let mut plain = |r: [u32; 4]| if r[2] > 0 && r[3] > 0 { out.push((r, [r[0], r[1]])) };
+        plain([x, y, w, iy0 - y]);
+        plain([x, iy1, w, y1 - iy1]);
+        plain([x, iy0, ix0 - x, iy1 - iy0]);
+        plain([ix1, iy0, x1 - ix1, iy1 - iy0]);
+        // Along one axis: (start, length, where it's kept), before the seam and from it.
+        let spans = |lo: u32, hi: u32, b: u32, size: u32, off: u32| {
+            let seam = b + size - off;
+            [(lo, hi.min(seam).saturating_sub(lo), lo + off), (lo.max(seam), hi.saturating_sub(lo.max(seam)), (lo.max(seam) + off).wrapping_sub(size))]
+        };
+        for (sx, sw, kx) in spans(ix0, ix1, bx, bw, off[0]) {
+            for (sy, sh, ky) in spans(iy0, iy1, by, bh, off[1]) {
+                if sw > 0 && sh > 0 { out.push(([sx, sy, sw, sh], [kx, ky])); }
+            }
+        }
+    }
+}
+
+/// One opaque colour over the viewport: the clear of a rectangle a partial frame redraws. Nothing
+/// blends and nothing is computed for a pixel, where the uber shader's rect costs a rounded box,
+/// a clip and a blend each.
+const SOLID_WGSL: &str = "
+struct In { @builtin(vertex_index) vi: u32, @location(2) fill: vec4<f32> };
+struct Out { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) fill: vec4<f32> };
+@vertex fn vs(i: In) -> Out {
+    var o: Out;
+    o.pos = vec4<f32>(f32(i.vi & 1u) * 2.0 - 1.0, 1.0 - f32(i.vi >> 1u) * 2.0, 0.0, 1.0);
+    o.fill = i.fill;
+    return o;
+}
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> { return i.fill; }
+";
+
+fn solid_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("solid"), source: wgpu::ShaderSource::Wgsl(SOLID_WGSL.into()) });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("solid"),
+        layout: None,
+        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[Some(metallib::uber_vertex_layout())] },
+        primitive: metallib::uber_primitive(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn copy_at(t: &wgpu::Texture, x: u32, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+    let mut c = t.as_image_copy();
+    c.origin = wgpu::Origin3d { x, y, z: 0 };
+    c
+}
+
+fn extent(width: u32, height: u32) -> wgpu::Extent3d { wgpu::Extent3d { width, height, depth_or_array_layers: 1 } }
 
 /// The renderer's side of a partial frame.
 #[derive(Default)]
@@ -43,6 +147,20 @@ pub(super) struct DamageState {
     /// Whether a run of the armed rectangles holds a layer's scope.
     layers_reached: bool,
     clear: [f32; 4],
+    /// Pixels the armed frame moves first, `([x, y, width, height], to)`: a scroll moving what it
+    /// moved (`window::damage::Shift`).
+    shift: Option<([u32; 4], [u32; 2])>,
+    /// How the kept frame holds a scrolled viewport: rolled, so a scroll moves none of its pixels.
+    roll: Option<Roll>,
+    /// `runs` are of a frame whose list changed (`cull_armed`): they only say what to draw where,
+    /// and its layers are planned and drawn as any frame's.
+    listed: bool,
+    /// The armed frame draws whole (`arm_whole`): into the kept frame, which is then current.
+    behind: bool,
+    /// The armed frame changes nothing (`arm_same`): no pass, only the copy out.
+    same: bool,
+    /// Fills a rectangle with one opaque colour, for the format it was made for (`solid_pipeline`).
+    solid: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     drawn: Option<Drawn>,
     /// The armed rectangles are a loop-only frame's (`arm_loop`), for `RUNE_LOOP_CHECK=2`.
     pub(super) looped: bool,
@@ -52,7 +170,9 @@ pub(super) struct DamageState {
 impl Renderer {
     /// The next `draw` may redraw only `rects` (`[x, y, width, height]` each, target pixels, at
     /// most `MAX_RECTS`) of a `size` drawable of `format`, cleared to `clear`.
-    pub(crate) fn arm_damage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rects: &[[u32; 4]], clear: [f32; 4], size: (u32, u32), format: wgpu::TextureFormat) {
+    /// With `shift`, the pixels at `shift.0` (`[x, y, width, height]`) move to `shift.1` first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn arm_damage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rects: &[[u32; 4]], clear: [f32; 4], size: (u32, u32), format: wgpu::TextureFormat, shift: Option<([u32; 4], [u32; 2])>) {
         let mut d = self.damage.lock().unwrap();
         if d.retained.as_ref().is_none_or(|r| (r.texture.width(), r.texture.height()) != size || r.texture.format() != format) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -62,13 +182,18 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[self.format],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.format), ..Default::default() });
             d.retained = Some(Retained { texture, view, current: false });
+            d.roll = None;
         }
-        let fills: Vec<Instance> = rects.iter().take(MAX_RECTS).map(|&[x, y, w, h]| Instance {
+        // Where WGSL compiles as the renderer starts (Vulkan, GL); elsewhere the uber shader clears.
+        if cfg!(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32"))) && d.solid.as_ref().is_none_or(|(f, _)| *f != self.format) {
+            d.solid = Some((self.format, solid_pipeline(device, self.format)));
+        }
+        let fills: Vec<Instance> = rects.iter().take(MAX_ARMED).map(|&[x, y, w, h]| Instance {
             rect: [x as f32, y as f32, w as f32, h as f32],
             radii: [0.0; 4],
             fill: clear,
@@ -80,15 +205,19 @@ impl Renderer {
         }).collect();
         let quads = self.clear_quad.get_or_init(|| device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("damage clear"),
-            size: (std::mem::size_of::<Instance>() * MAX_RECTS) as u64,
+            size: (std::mem::size_of::<Instance>() * MAX_ARMED) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
         // Through the renderer's staging, as a layer's quad: `Queue::write_buffer` makes a buffer each call.
         if !fills.is_empty() { self.uploads.staging(device, queue).write_buffer(quads, 0, bytemuck::cast_slice(&fills)); }
-        d.armed = rects.iter().take(MAX_RECTS).copied().collect();
+        d.armed = rects.iter().take(MAX_ARMED).copied().collect();
         d.runs.clear();
+        d.listed = false;
+        d.behind = false;
+        d.same = false;
         d.clear = clear;
+        d.shift = shift;
         d.drawn = Some(Err("drawn by the compositor"));
     }
 
@@ -112,7 +241,7 @@ impl Renderer {
                 c?
             }
         };
-        self.arm_damage(device, queue, &rects, clear, size, format);
+        self.arm_damage(device, queue, &rects, clear, size, format, None);
         let mut d = self.damage.lock().unwrap();
         d.runs = runs;
         d.layers_reached = layers;
@@ -151,7 +280,7 @@ impl Renderer {
             }
         };
         let (draw, runs, layers) = cull_runs(instances, &units, &rects, patched);
-        self.arm_damage(device, queue, &draw, clear, size, format);
+        self.arm_damage(device, queue, &draw, clear, size, format, None);
         if super::pixel_check::on() { self.pixel_check_arm(device, size, format); }
         let mut d = self.damage.lock().unwrap();
         d.runs = runs;
@@ -159,11 +288,45 @@ impl Renderer {
         Ok(rects)
     }
 
+    /// After `arm_damage`, for a frame drawing `instances` (the list uploaded for it): each armed
+    /// rectangle draws only the instances that reach it. A frame's instances are a thousand quads
+    /// to put through the vertex stage and bin for every rectangle, most of them nowhere near it.
+    #[cfg_attr(any(target_os = "macos", target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn cull_armed(&self, instances: &[Instance], size: (u32, u32)) {
+        let mut d = self.damage.lock().unwrap();
+        if d.armed.is_empty() || instances.len() != self.count as usize { return; }
+        let Ok(units) = units(instances, size) else { return };
+        let rects: Vec<[i32; 4]> = d.armed.iter().map(|r| [r[0] as i32, r[1] as i32, (r[0] + r[2]) as i32, (r[1] + r[3]) as i32]).collect();
+        let (_, runs, layers) = cull_runs(instances, &units, &rects, &[]);
+        d.runs = runs;
+        d.layers_reached = layers;
+        d.listed = true;
+    }
+
+    /// After `arm_damage`, for a frame whose instances are the last frame's: the armed rectangle
+    /// redraws nothing, since the kept frame holds it already.
+    #[cfg_attr(any(target_os = "macos", target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn arm_same(&self) {
+        let mut d = self.damage.lock().unwrap();
+        d.runs = vec![Vec::new(); d.armed.len()];
+        d.listed = true;
+        d.same = true;
+    }
+
+    /// The next `draw` draws all of a `size` drawable of `format`, into the kept frame: a frame
+    /// that changed too much to redraw in part. Drawn straight to the drawable it would leave the
+    /// kept frame behind, and the frame after it would draw whole as well.
+    #[cfg_attr(any(target_os = "macos", target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn arm_whole(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, clear: [f32; 4], size: (u32, u32), format: wgpu::TextureFormat) {
+        self.arm_damage(device, queue, &[[0, 0, size.0, size.1]], clear, size, format, None);
+        self.damage.lock().unwrap().behind = true;
+    }
+
     /// The armed frame redraws its rectangles over a current kept frame, and no layer is among
     /// what it draws there: `prepare` leaves the layers as the last frame planned and drew them.
     pub(super) fn cycle_leaves_layers(&self) -> bool {
         let d = self.damage.lock().unwrap();
-        !d.armed.is_empty() && !d.runs.is_empty() && !d.layers_reached && d.retained.as_ref().is_some_and(|r| r.current)
+        !d.armed.is_empty() && !d.runs.is_empty() && !d.listed && !d.layers_reached && d.retained.as_ref().is_some_and(|r| r.current)
     }
 
     /// After every frame: whether it redrew only the armed rectangles, or why not. A frame that
@@ -171,6 +334,10 @@ impl Renderer {
     pub(crate) fn damage_drawn(&self) -> Drawn {
         let mut d = self.damage.lock().unwrap();
         d.armed.clear();
+        d.shift = None;
+        d.listed = false;
+        d.behind = false;
+        d.same = false;
         d.looped = false;
         if let Some(c) = d.pixel.as_mut() { c.frame_ended(); }
         let drawn = d.drawn.take().unwrap_or(Err("not armed"));
@@ -197,7 +364,13 @@ impl Renderer {
 
     /// `draw`'s part, when armed: redraws the armed rectangles into the kept frame (all of it
     /// when it's behind) and copies it to `dst`. False when `draw` should draw whole.
-    pub(crate) fn draw_armed(&self, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Texture) -> bool {
+    ///
+    /// A scroll (`arm_damage`'s `shift`) goes the other way round, when `view` is `dst`'s and
+    /// `dst` can be copied from: the kept frame is copied to `dst` first, moved (`Roll`), the
+    /// rectangles are redrawn there, and only they are copied back. The frame then copies the
+    /// window's pixels once, as any partial frame does, where moving them in the kept frame as
+    /// well would copy them twice more.
+    pub(crate) fn draw_armed(&self, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Texture, view: Option<&wgpu::TextureView>) -> bool {
         let mut guard = self.damage.lock().unwrap();
         let d = &mut *guard;
         let looped = std::mem::take(&mut d.looped);
@@ -208,65 +381,125 @@ impl Renderer {
         }
         let rects = std::mem::take(&mut d.armed);
         let runs = std::mem::take(&mut d.runs);
+        let shift = d.shift.take();
         let layers_reached = d.layers_reached;
+        let listed = std::mem::take(&mut d.listed);
+        let behind = std::mem::take(&mut d.behind);
+        let unchanged = std::mem::take(&mut d.same);
         let clear = d.clear;
         let (Some(quads), Some(kept)) = (self.clear_quad.get(), d.retained.as_mut()) else { return false };
+        if behind { kept.current = false; }
         if (dst.width(), dst.height()) != (kept.texture.width(), kept.texture.height()) {
             d.drawn = Some(Err("size"));
             return false;
         }
         let partial = kept.current;
+        let size = [dst.width(), dst.height()];
+        // Through the drawable: a scroll, and every frame after it while the kept frame is rolled.
+        let through = kept.current && (shift.is_some() || d.roll.is_some());
+        let through_view = view.filter(|_| dst.usage().contains(wgpu::TextureUsages::COPY_SRC));
+        if through && through_view.is_none() {
+            // The rectangles were planned for moved pixels, which this drawable can't give back.
+            d.roll = None;
+            d.drawn = Some(Err("no copies"));
+            return false;
+        }
         if kept.current {
             // No layer reaches the rectangles: their targets aren't drawn from, nor made again.
             // The uploads go into this encoder ahead of the pass either way (`encode_layers_timed`
             // flushes them too), not in a submission of their own: a submit costs the CPU about as
             // much as the rest of a loop-only frame.
-            if runs.is_empty() || layers_reached { self.encode_layers_timed(encoder, None, &mut |_, _| {}); } else { self.flush_uploads(encoder); }
+            if runs.is_empty() || layers_reached || listed { self.encode_layers_timed(encoder, None, &mut |_, _| {}); } else { self.flush_uploads(encoder); }
             self.submit_uploads();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame (damage)"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &kept.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            let size = [dst.width(), dst.height()];
-            // frame-profile, `RUNE_LOOP_CHECK_SPOIL=1`: a loop-only frame skips its redraw, so the kept
-            // picture goes stale and `RUNE_LOOP_CHECK=2` must find it (its failing row).
-            #[cfg(feature = "frame-profile")]
-            let spoil = looped && super::pixel_check::spoiled();
-            #[cfg(not(feature = "frame-profile"))]
-            let spoil = false;
-            for (n, &rect) in rects.iter().enumerate().filter(|_| !spoil) {
-                let [x, y, w, h] = rect;
-                pass.set_scissor_rect(x, y, w, h);
-                pass.set_pipeline(self.draw_pipeline(self.format, None));
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, quads.slice(..));
-                pass.draw(0..4, n as u32..n as u32 + 1);
-                let mut active = ActivePass::borrowed_within(&mut pass, rect);
-                active.set_scissor(None, size);
-                match runs.get(n) {
-                    // Only what reaches the rectangle (`arm_cycle`): none of the rest draws there.
-                    Some(runs) => for run in runs { self.draw_layer_range(&mut active, self.format, run.clone(), None, &mut |_, _| {}); },
-                    None => self.draw_layer_range(&mut active, self.format, 0..self.count, None, &mut |_, _| {}),
+            let mut pieces = Vec::new();
+            if through {
+                if let Some((from, to)) = shift {
+                    let mut roll = Roll::moved(d.roll, from, to);
+                    if roll.is_none() {
+                        // Another viewport's scroll: the kept frame is straightened first, through
+                        // the drawable, which this frame overwrites anyway.
+                        Roll::pieces(d.roll, [0, 0, size[0], size[1]], &mut pieces);
+                        for (s, k) in pieces.drain(..) { encoder.copy_texture_to_texture(copy_at(&kept.texture, k[0], k[1]), copy_at(dst, s[0], s[1]), extent(s[2], s[3])); }
+                        if let Some(Roll { band: [x, y, w, h], .. }) = d.roll { encoder.copy_texture_to_texture(copy_at(dst, x, y), copy_at(&kept.texture, x, y), extent(w, h)); }
+                        roll = Roll::moved(None, from, to);
+                    }
+                    d.roll = roll;
                 }
+                Roll::pieces(d.roll, [0, 0, size[0], size[1]], &mut pieces);
+                for (s, k) in pieces.drain(..) { encoder.copy_texture_to_texture(copy_at(&kept.texture, k[0], k[1]), copy_at(dst, s[0], s[1]), extent(s[2], s[3])); }
+            }
+            // Nothing changed: no pass at all, where one would load and store a target to draw nothing.
+            if !unchanged {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("frame (damage)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: through_view.filter(|_| through).unwrap_or(&kept.view),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                // frame-profile, `RUNE_LOOP_CHECK_SPOIL=1`: a loop-only frame skips its redraw, so the kept
+                // picture goes stale and `RUNE_LOOP_CHECK=2` must find it (its failing row).
+                #[cfg(feature = "frame-profile")]
+                let spoil = looped && super::pixel_check::spoiled();
+                #[cfg(not(feature = "frame-profile"))]
+                let spoil = false;
+                // An opaque clear is the pass's own clear over the rectangle: one colour, nothing blended, and
+                // the rects at the head of the list that paint only that colour change nothing after it
+                // (`cleared_start`, as in a frame drawn whole).
+                let opaque = clear[3] == 1.0;
+                let solid = d.solid.as_ref().filter(|(format, _)| opaque && *format == self.format).map(|(_, p)| p);
+                let start = if opaque { self.cleared_start(wgpu::LoadOp::Clear(wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 })) } else { 0 };
+                for (n, &rect) in rects.iter().enumerate().filter(|_| !spoil) {
+                    let [x, y, w, h] = rect;
+                    pass.set_scissor_rect(x, y, w, h);
+                    pass.set_vertex_buffer(0, quads.slice(..));
+                    match solid {
+                        Some(solid) => {
+                            pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                            pass.set_pipeline(solid);
+                            pass.draw(0..4, n as u32..n as u32 + 1);
+                            pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                        }
+                        None => {
+                            pass.set_pipeline(self.draw_pipeline(self.format, None));
+                            pass.set_bind_group(0, &self.bind_group, &[]);
+                            pass.draw(0..4, n as u32..n as u32 + 1);
+                        }
+                    }
+                    let mut active = ActivePass::borrowed_within(&mut pass, rect);
+                    active.set_scissor(None, size);
+                    match runs.get(n) {
+                        // Only what reaches the rectangle (`arm_cycle`): none of the rest draws there.
+                        Some(runs) => for run in runs {
+                            let run = run.start.max(start)..run.end;
+                            if !run.is_empty() { self.draw_layer_range(&mut active, self.format, run, None, &mut |_, _| {}); }
+                        },
+                        None => self.draw_layer_range(&mut active, self.format, start..self.count, None, &mut |_, _| {}),
+                    }
+                }
+            }
+            if through {
+                // What was redrawn, back where the kept frame holds it.
+                for &rect in rects.iter().filter(|_| !unchanged) { Roll::pieces(d.roll, rect, &mut pieces); }
+                for (s, k) in pieces.drain(..) { encoder.copy_texture_to_texture(copy_at(dst, s[0], s[1]), copy_at(&kept.texture, k[0], k[1]), extent(s[2], s[3])); }
+                d.drawn = Some(Ok(()));
+                return true;
             }
         } else {
             // Behind: this frame draws whole, into the kept frame.
             self.draw_timed(encoder, &kept.view, clear, None);
             kept.current = true;
+            d.roll = None;
         }
         // `RUNE_LOOP_CHECK=2`: this loop-only frame's picture, and the whole frame's beside it.
         if looped && partial && let Some(c) = d.pixel.as_mut() { self.pixel_check_encode(encoder, c, &kept.texture, clear, &rects); }
-        let whole = wgpu::Extent3d { width: dst.width(), height: dst.height(), depth_or_array_layers: 1 };
-        encoder.copy_texture_to_texture(kept.texture.as_image_copy(), dst.as_image_copy(), whole);
+        encoder.copy_texture_to_texture(kept.texture.as_image_copy(), dst.as_image_copy(), extent(size[0], size[1]));
         d.drawn = Some(Ok(()));
         true
     }
@@ -365,3 +598,7 @@ fn cull_runs(instances: &[Instance], units: &Units, rects: &[[i32; 4]], always: 
     let layers = units.iter().any(|(u, _)| instances[u.start as usize].kind() == Some(Kind::Layer) && runs.iter().flatten().any(|r| r.start <= u.start && u.end <= r.end));
     (rects.iter().map(|r| [r[0] as u32, r[1] as u32, (r[2] - r[0]) as u32, (r[3] - r[1]) as u32]).collect(), runs, layers)
 }
+
+#[cfg(test)]
+#[path = "damaged_tests.rs"]
+mod tests;
