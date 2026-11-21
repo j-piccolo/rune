@@ -91,6 +91,7 @@ impl Damage {
     /// moved a viewport's content may copy it within the kept frame (`Plan::Part::shift`); a target
     /// presented in dirty rectangles (Windows) leaves it off.
     pub(crate) fn plan(&mut self, instances: &[Instance], size: (u32, u32), clear: [f32; 4], swap: u64, in_place: bool, scroll: bool) -> Plan {
+        self.scratch.differ_all = false;
         let (now, why) = match (in_place && !whole_frames(), self.shape == Some((size, clear, swap))) {
             (false, _) => (Area::All, "not in place"),
             (_, false) => (Area::All, "new size, colour or swap chain"),
@@ -117,8 +118,14 @@ impl Damage {
                 }
             }
         };
-        self.last.clear();
-        self.last.extend_from_slice(instances);
+        // Compared in place, the instances that differ are known: only they are copied, where
+        // copying the list is a hundred kilobytes a frame, most frames to say the same again.
+        if std::mem::take(&mut self.scratch.differ_all) && self.last.len() == instances.len() {
+            for &i in &self.scratch.differ { self.last[i as usize] = instances[i as usize]; }
+        } else {
+            self.last.clear();
+            self.last.extend_from_slice(instances);
+        }
         self.shape = Some((size, clear, swap));
         match now {
             Area::All | Area::Many => Plan::All(why),
@@ -216,6 +223,10 @@ pub(super) struct Scratch {
     new: Vec<u64>,
     counts: Counts,
     each: Vec<[u32; 4]>,
+    /// Where the lists last compared in place differ, and whether that is every place they do
+    /// (`changed` found them all): `plan` then brings its copy of the list up to date from these.
+    differ: Vec<u32>,
+    differ_all: bool,
 }
 
 fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch) -> Area {
@@ -235,10 +246,13 @@ fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch
             }
         }
         s.each.clear();
-        for (a, b) in old.iter().zip(new).filter(|(a, b)| !same(a, b)) {
+        s.differ.clear();
+        for (i, (a, b)) in old.iter().zip(new).enumerate().filter(|(_, (a, b))| !same(a, b)) {
             s.each.extend(bounds(a, size));
             s.each.extend(bounds(b, size));
+            s.differ.push((start + i) as u32);
         }
+        s.differ_all = true;
         return gathered(&mut s.each);
     }
     // A scroll that mounted or let go of rows changes the length too: if most of a sample of
