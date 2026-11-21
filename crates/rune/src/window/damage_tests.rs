@@ -155,6 +155,38 @@ fn changed_order_check_handles_inserts_deletes_duplicates_and_reorders() {
     assert_eq!(changed(&old, &swapped_and_more, size, &mut s), Area::All);
 }
 
+/// Where the lists compared in place, a plan brings its copy of the last frame's up to date from
+/// what differed: frame after frame it then plans what a planner given only the last two frames
+/// plans, and holds the list it was last given.
+#[test]
+fn a_list_compared_in_place_is_kept_up_to_date() {
+    let r = |x: f32, y: f32| Instance { rect: [x, y, 20.0, 20.0], fill: [1.0; 4], params: [0.0, KIND_RECT, 0.0, 1.0], clip: NO_CLIP, ..Instance::zeroed() };
+    let (size, clear) = ((256, 256), [0.0, 0.0, 0.0, 1.0]);
+    let base: Vec<Instance> = (0..8).map(|n| r(n as f32 * 30.0, 10.0)).collect();
+    // One changed in place, two more (one of them back), nothing, one added, one changed, the first again.
+    let mut frames = vec![base.clone()];
+    let mut f = base.clone();
+    f[2] = r(65.0, 40.0);
+    frames.push(f.clone());
+    f[5] = r(155.0, 80.0);
+    f[2] = r(60.0, 10.0);
+    frames.push(f.clone());
+    frames.push(f.clone());
+    f.push(r(10.0, 200.0));
+    frames.push(f.clone());
+    f[0] = r(5.0, 120.0);
+    frames.push(f.clone());
+    frames.push(base);
+    let mut kept = Damage::default();
+    kept.plan(&frames[0], size, clear, 0, GlyphAtlas::default(), true, false);
+    for pair in frames.windows(2) {
+        let mut fresh = Damage::default();
+        fresh.plan(&pair[0], size, clear, 0, GlyphAtlas::default(), true, false);
+        assert_eq!(kept.plan(&pair[1], size, clear, 0, GlyphAtlas::default(), true, false), fresh.plan(&pair[1], size, clear, 0, GlyphAtlas::default(), true, false));
+        assert_eq!(bytemuck::cast_slice::<Instance, u8>(&kept.last), bytemuck::cast_slice::<Instance, u8>(&pair[1]));
+    }
+}
+
 #[test]
 fn a_scroll_draws_whole_without_hashing_the_lists() {
     let row = |n: usize, dy: f32| Instance {
