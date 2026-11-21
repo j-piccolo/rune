@@ -132,6 +132,18 @@ pub(super) struct HeadlessFrame<'a, 'b, F> {
     pub(super) fp_cpu0: Option<crate::frame::profile::ThreadCpuMark>,
     #[cfg(feature = "frame-profile")]
     pub(super) fp_events: usize,
+    /// This thread's CPU in each stage after the update (`frame::profile::STAGES`).
+    #[cfg(feature = "frame-profile")]
+    pub(super) fp_stages: [f64; crate::frame::profile::STAGES],
+}
+
+/// Adds this thread's CPU since `since` to stage `stage` of the frame's profile, and returns now.
+#[cfg(feature = "frame-profile")]
+#[inline]
+fn staged(stages: &mut [f64; crate::frame::profile::STAGES], stage: usize, since: f64) -> f64 {
+    let now = crate::frame::profile::thread_cpu_ms();
+    stages[stage] += now - since;
+    now
 }
 
 impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
@@ -250,8 +262,12 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         // An image's pixels changed where its instances didn't: the whole frame draws (`damage`).
         #[cfg(not(target_os = "macos"))]
         let images_changed = self.app.rt().images.pages.iter().any(|p| p.dirty.is_some());
+        #[cfg(feature = "frame-profile")]
+        let cpu = crate::frame::profile::thread_cpu_ms();
         prepare_gpu_resources(&mut s.renderer, s.gpu, self.app.rt_mut(), (s.wp, s.hp), false);
         let encoder = s.gpu.device.create_command_encoder(&Default::default());
+        #[cfg(feature = "frame-profile")]
+        let cpu = staged(&mut self.fp_stages, 0, cpu);
         // Only what changed is redrawn, as a window redraws it (`window::damage`).
         #[cfg(not(target_os = "macos"))]
         {
@@ -270,6 +286,8 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 crate::window::damage::Plan::All(_) => {}
             }
         }
+        #[cfg(feature = "frame-profile")]
+        staged(&mut self.fp_stages, 1, cpu);
         let in_range = self.k >= s.start_frame && self.k < s.start_frame + s.frames;
         let shot = Shot {
             k: self.k,
@@ -288,6 +306,8 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
     #[inline]
     fn render(&mut self, prepared: &mut PreparedHeadlessFrame, info: &StepInfo) -> bool {
         let s = &mut *self.state;
+        #[cfg(feature = "frame-profile")]
+        let cpu = crate::frame::profile::thread_cpu_ms();
         let view = s.alpha.as_ref().map_or(&s.target.view, |a| &a.view);
         let comp_animating = if s.has_comp {
             self.app.render_compositor(HeadlessRenderArgs {
@@ -328,14 +348,20 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             for (shot, px) in s.readback.make_room(&s.gpu.device) { (self.deliver)(shot, px); }
             s.readback.copy(&mut prepared.encoder, &s.target, prepared.shot);
         }
+        #[cfg(feature = "frame-profile")]
+        staged(&mut self.fp_stages, 2, cpu);
         comp_animating
     }
 
     #[inline]
     fn submit_and_present(&mut self, prepared: PreparedHeadlessFrame, _info: &StepInfo) -> Instant {
         let s = &mut *self.state;
+        #[cfg(feature = "frame-profile")]
+        let cpu = crate::frame::profile::thread_cpu_ms();
         let submission = s.renderer.submit(&s.gpu.queue, prepared.encoder);
         s.in_flight.push(submission);
+        #[cfg(feature = "frame-profile")]
+        staged(&mut self.fp_stages, 3, cpu);
         self.encoded_stamp = s.reports.stamp();
         if self.want_pixels { s.readback.submitted(); }
         crate::time::now()
@@ -351,11 +377,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         let s = &mut *self.state;
         s.reports.drawn(self.encoded_stamp, None, self.frame_start, info.update_ms);
         let ms = self.frame_start.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "frame-profile")]
+        let cpu = crate::frame::profile::thread_cpu_ms();
         if s.has_comp {
             // Pace like a display link so a compositor's async readbacks (GPU timers) land between frames.
             rune_gpu::health::poll(&s.gpu.device, wgpu::PollType::wait_indefinitely()).ok();
             s.in_flight.clear();
         }
+        #[cfg(feature = "frame-profile")]
+        staged(&mut self.fp_stages, 4, cpu);
         #[cfg(feature = "frame-profile")]
         {
             // Convert the frame's raw CPU mark before taking phase deltas so that once Windows'
@@ -368,6 +398,7 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             let rt = self.app.rt_mut();
             s.profile.push(crate::frame::profile::Row {
                 phases,
+                stages: self.fp_stages,
                 update_ms: info.update_ms,
                 encode_ms: ms - info.update_ms,
                 events: self.fp_events,

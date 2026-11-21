@@ -428,6 +428,8 @@ fn run_headless(prep: HeadlessPrep, config: HeadlessConfig, app: &mut dyn Headle
             fp_cpu0: cpu0,
             #[cfg(feature = "frame-profile")]
             fp_events: next_ev - events0,
+            #[cfg(feature = "frame-profile")]
+            fp_stages: [0.0; crate::frame::profile::STAGES],
         };
         crate::frame::host_step::run(&mut host);
     }
