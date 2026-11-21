@@ -550,6 +550,7 @@ impl RuntimeCore {
         self.tree.built = false;
         self.subscribe_live();
         self.sync_modals(app);
+        self.sync_autofocus(app);
         self.sync_follows(app);
         self.motion.sync_loops(&self.tree.nodes, &self.scene, self.t, self.clock, self.time_scale, time_scaled, any_loop, tx.commit.lands() || self.reduced_motion);
         taffy.compact_if_sparse(|me, slot| self.tree.nodes[me as usize].taffy = slot);
