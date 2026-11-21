@@ -58,7 +58,7 @@ fn configured(surface: &wgpu::Surface) {
 /// The number of `surface`'s last successful configuration (0 before any). A surface dropped and
 /// another made at its address configures before it draws, so it never reads the old number.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))), allow(dead_code))]
 pub(crate) fn generation(surface: &wgpu::Surface) -> u64 {
     let key = std::ptr::from_ref(surface) as usize;
     CONFIGURED.lock().unwrap().iter().find(|(k, _)| *k == key).map_or(0, |e| e.1)

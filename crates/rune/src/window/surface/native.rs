@@ -67,6 +67,8 @@ mod tests;
 #[derive(Default)]
 pub(in crate::window) struct Native {
     pub(in crate::window) activator: Option<crate::platform::activation::Activator>,
+    /// What its last frames changed, so the next redraws only that (`damage`).
+    pub(in crate::window) damage: crate::window::damage::Damage,
 }
 
 #[cfg(target_os = "windows")]
@@ -81,7 +83,7 @@ pub(in crate::window) struct Native {
     /// Whether its swap chain can take the next frame (`slot`).
     pub(in crate::window) slot: crate::window::win32::slot::Slot,
     /// What its last frames changed, so the next redraws only that (`damage`).
-    pub(in crate::window) damage: crate::window::win32::damage::Damage,
+    pub(in crate::window) damage: crate::window::damage::Damage,
     /// Whether the CPU renderer or the GPU draws its frames (`cpu_frame`).
     pub(in crate::window) mode: crate::window::win32::handover::SurfaceMode,
     /// Whether its accessibility adapter waits for the first frame (`Host::a11y_after_frame`).
