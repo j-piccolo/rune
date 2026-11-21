@@ -290,6 +290,9 @@ pub(super) fn submit_and_present(live: &mut Live, renderer: &Renderer, gpu: &Gpu
     {
         let _ = (rt, prewarm);
         renderer.submit(&gpu.queue, encoder);
+        // Its next frame waits for the compositor to draw this one (`OverlayCore::awaits_frame`).
+        #[cfg(all(unix, not(target_os = "ios"), not(target_os = "android")))]
+        if let Backing::Layer(layer) = &mut live.backing { layer.ask_frame(); }
         gpu.queue.present(frame);
     }
 }

@@ -139,6 +139,60 @@ pub(crate) mod readiness {
     }
 }
 
+/// Whether the compositor has drawn the last frame the surface presented. Each present asks it to
+/// say so (`wl_surface.frame`), and the surface presents no other until it has. A present with
+/// vsync waits for that answer itself, on the thread every surface draws on, and a compositor
+/// answers a surface it is not drawing (under a fullscreen window, on an output asleep) about once
+/// a second, or not at all: waiting here costs that surface its own frames and no other's.
+pub(crate) mod frame {
+    use std::time::Duration;
+
+    use crate::time::Instant;
+
+    /// How long the loop keeps a deadline while a frame waits for its answer. The answer is read
+    /// off the socket by winit, which turns the loop for its own events alone unless it waits on
+    /// a deadline; a compositor that answers a surface it is not drawing does so within a second.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+    pub(crate) const ANSWER: Duration = Duration::from_millis(1500);
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum State {
+        /// The compositor has drawn everything presented: a frame may go.
+        #[default]
+        Free,
+        /// Frame `ask`, presented at `since`, has no answer yet.
+        Asked { ask: u64, since: Instant },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Event {
+        /// A frame is about to be presented, asking as `ask`.
+        Presents { ask: u64, now: Instant },
+        /// The compositor answered `ask`.
+        Answered { ask: u64 },
+    }
+
+    /// The wait after `event`. No effect: the draw reads `asked`. An answer to a frame before the
+    /// last one presented says nothing of that one.
+    pub(crate) fn step(state: &mut State, event: Event) {
+        match (*state, event) {
+            (_, Event::Presents { ask, now }) => *state = State::Asked { ask, since: now },
+            (State::Asked { ask, .. }, Event::Answered { ask: answered }) if ask == answered => *state = State::Free,
+            (_, Event::Answered { .. }) => {}
+        }
+    }
+
+    impl State {
+        /// When the frame still waiting for its answer was presented.
+        pub(crate) fn asked(&self) -> Option<Instant> {
+            match self {
+                State::Asked { since, .. } => Some(*since),
+                State::Free => None,
+            }
+        }
+    }
+}
+
 /// Layer-shell keyboard focus transitions, persisted modifier masks, command-chord translation,
 /// and `KeyPolicy` capability checks, kept cross-platform so they compile and run tests on every
 /// host.

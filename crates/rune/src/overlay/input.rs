@@ -324,8 +324,9 @@ impl OverlayCore {
         // the next frame runs once a frame, however often other events turn the loop.
         let deadline = crate::window::timer_deadline_core(app.rt());
         if deadline.is_some_and(|deadline| deadline <= now) {
-            // Backing off, the frame waits for the retry and would leave the timer due.
-            if !self.frameless() && !self.backing_off(now) {
+            // Backing off, the frame waits for the retry and would leave the timer due; so
+            // would one waiting for the compositor to draw the last.
+            if !self.frameless() && !self.backing_off(now) && self.awaits_frame().is_none() {
                 // Like the window host, poll once in the upcoming frame, after acquiring
                 // the drawable. A false poll result does not keep the display loop alive.
                 // Resting, it may draw nothing new (`Quiet`).
@@ -379,6 +380,15 @@ impl OverlayCore {
 
     /// Waiting for a missed frame's retry, or for the timer pacing unpaced motion.
     pub(super) fn backing_off(&self, now: Instant) -> bool { self.backoff.waiting(now) }
+
+    /// When a layer surface presented the frame the compositor has yet to draw, which its next
+    /// frame waits for (`layer_shell_machine::frame`). Other surfaces never wait: their
+    /// present's vsync paces them.
+    pub(super) fn awaits_frame(&self) -> Option<Instant> {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live() { return layer.awaits_frame(); }
+        None
+    }
 
     /// What paces the overlay's frames, for its stats.
     pub(super) fn pacing_state(&self, moving: bool) -> crate::Pacing {

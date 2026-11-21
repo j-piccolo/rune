@@ -91,6 +91,14 @@ impl FrameHost for OverlayFrame<'_> {
         if self.core.surface.live().is_none() || self.core.renderer.is_none() || self.core.gpu.is_none() {
             return Gate::Skip;
         }
+        // The compositor has yet to draw the last frame presented: this one comes with its
+        // answer, built from what has changed by then. The present would wait for it otherwise,
+        // and every other surface behind it.
+        if !self.prewarm && self.core.awaits_frame().is_some() {
+            // The timer frame it would have been is still due.
+            if timer { self.core.quiet.step(frame::QuietEvent::TimerDue { resting: true }); }
+            return Gate::Skip;
+        }
         // `sync_occlusion` below reads, once a turn, the panel hosting the surface: the window
         // the acquire would check again.
         #[cfg(target_os = "macos")]
@@ -421,7 +429,9 @@ impl FrameHost for OverlayFrame<'_> {
         {
             let _ = submitted;
             if !self.prewarm { self.core.meter.set_pacing(if self.core.idle { crate::Pacing::Idle } else { crate::Pacing::Vsync }); }
-            self.more = !self.core.idle;
+            // A layer surface's next frame comes with the compositor's answer to this one, which
+            // turns the loop (`wake_deadline`); any other's vsync paces a loop kept turning.
+            self.more = !self.core.idle && self.core.awaits_frame().is_none();
         }
     }
 }
