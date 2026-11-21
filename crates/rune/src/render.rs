@@ -117,6 +117,8 @@ pub use layers::LayerStats;
 pub use offscreen::OFFSCREEN_FORMAT;
 pub use offscreen::Offscreen;
 pub use offscreen::write_png;
+#[cfg(not(target_arch = "wasm32"))]
+pub use offscreen::snapshot;
 pub use rune_core::Blend;
 pub use warmup::warm_gpu;
 pub use warmup::warm_gpu_with;
