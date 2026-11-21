@@ -6,7 +6,7 @@ use super::{
     upload, variant,
 };
 
-#[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+#[cfg(not(target_os = "macos"))]
 use super::damaged;
 
 /// The `Send` state of a [`Renderer`]: every field except `surfaces` (the lazy native surface
@@ -52,9 +52,9 @@ pub(super) struct WarmRenderer {
     pub(super) fills: std::sync::Mutex<Option<fill::PendingFills>>,
     pub(super) device_key: crate::compose::DeviceKey,
     pub(super) max_texture_dim: u32,
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     pub(super) clear_quad: std::sync::OnceLock<wgpu::Buffer>,
-    #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+    #[cfg(not(target_os = "macos"))]
     pub(super) damage: std::sync::Mutex<damaged::DamageState>,
 }
 
@@ -107,9 +107,9 @@ impl Renderer {
             fills,
             device_key,
             max_texture_dim,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             clear_quad,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             damage,
         } = warm;
         Renderer {
@@ -153,9 +153,9 @@ impl Renderer {
             fills,
             device_key,
             max_texture_dim,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             clear_quad,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             damage,
         }
     }
@@ -208,9 +208,9 @@ impl Renderer {
             fills,
             device_key,
             max_texture_dim,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             clear_quad,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             damage,
         } = self;
         Some(WarmRenderer {
@@ -252,9 +252,9 @@ impl Renderer {
             fills,
             device_key,
             max_texture_dim,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             clear_quad,
-            #[cfg(any(target_os = "windows", target_arch = "wasm32"))]
+            #[cfg(not(target_os = "macos"))]
             damage,
         })
     }

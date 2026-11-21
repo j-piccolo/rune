@@ -1,4 +1,4 @@
-//! GPU resource preparation, Windows partial damage planning, compositor/UI encoding,
+//! GPU resource preparation, partial damage planning, compositor/UI encoding,
 //! presentation and `frame-profile` live-log stamping for [`super::Host`].
 
 #[cfg(any(target_os = "macos", feature = "frame-profile"))]
@@ -6,8 +6,10 @@ use super::stepping::FrameMove;
 use super::{CompositorFrame, Host};
 use crate::frame::host_step::{RenderPrep, StepInfo, draw_ui, prepare_gpu_resources_with};
 use crate::time::Instant;
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+use crate::window::damage;
 #[cfg(target_os = "windows")]
-use crate::window::win32::{damage, handover};
+use crate::window::win32::handover;
 
 /// First frame encoded mark (`crate::marks`).
 static FIRST_ENCODED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -22,6 +24,9 @@ pub(super) struct PreparedWindowFrame {
     pub(super) part: Option<Vec<[i32; 4]>>,
     #[cfg(target_os = "windows")]
     pub(super) present_rect: Option<Vec<[i32; 4]>>,
+    /// The frame was armed to redraw only what changed (`damage`).
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    pub(super) armed: bool,
 }
 
 /// Optional `frame-profile` timestamps and diagnostics carried across one window frame.
@@ -163,9 +168,9 @@ impl FrameProfile {
                     #[cfg(not(target_os = "windows"))]
                     damage: None,
                     whole: self.whole_why,
-                    #[cfg(target_os = "windows")]
+                    #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
                     change: host.win.as_ref().and_then(|l| l.native.damage.seen),
-                    #[cfg(not(target_os = "windows"))]
+                    #[cfg(not(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
                     change: None,
                     looped: looped.map(Vec::len),
                     loop_why: self.loop_why,
@@ -227,7 +232,7 @@ pub(super) fn prepare_window_render(
         crate::window::surface::corners::prepare(&mut l.corners, &gpu.device, &gpu.queue, size, target_format, corners);
     }
     // An image's pixels changed where its instances didn't: the whole frame draws (`damage`).
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
     let images_changed = host.app.rt().images.pages.iter().any(|p| p.dirty.is_some());
     {
         let rt = host.app.rt_mut();
@@ -289,6 +294,22 @@ pub(super) fn prepare_window_render(
             }
         }
     };
+    // Here the drawable takes the whole kept frame (no dirty rectangles to present), but a frame
+    // still shades only what changed.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    let armed = {
+        let rt = host.app.rt();
+        let whole = if l.alpha.is_some() { Some("alpha") } else if images_changed { Some("image") }
+            else if !l.config.usage.contains(wgpu::TextureUsages::COPY_DST) { Some("no copies") } else { None };
+        let swap = l.surface.as_ref().map_or(0, crate::window::surface::configure::generation);
+        match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none()) {
+            damage::Plan::All(why) => { profile.set_whole_why(whole.unwrap_or(why)); false }
+            damage::Plan::Part { draw, .. } => {
+                renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format);
+                true
+            }
+        }
+    };
     RenderPrep::Ready(PreparedWindowFrame {
         frame: drawable,
         view,
@@ -299,6 +320,8 @@ pub(super) fn prepare_window_render(
         part,
         #[cfg(target_os = "windows")]
         present_rect: None,
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        armed,
     })
 }
 
@@ -336,6 +359,8 @@ pub(super) fn render_window_frame(
         (Err(why), Some(_)) => profile.set_whole_why(why),
         (Err(_), None) => {}
     }
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    if let (Err(why), true) = (renderer.damage_drawn(), prepared.armed) { profile.set_whole_why(why); }
     // A client-side frame's rounded bottom corners: faded off the premultiplied composition,
     // before a surface that takes straight alpha converts it.
     crate::window::surface::corners::draw(l.corners.as_ref(), &mut prepared.encoder, target, corners);

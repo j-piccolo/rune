@@ -28,6 +28,8 @@ use crate::tooling::Chrome;
 
 mod app_events;
 mod chrome;
+#[cfg(not(target_os = "macos"))]
+pub(crate) mod damage;
 mod event_loop;
 mod file_drop;
 mod handle;
