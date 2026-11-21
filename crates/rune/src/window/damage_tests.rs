@@ -571,3 +571,59 @@ fn scrolled_frames_match_whole_frames() {
     }
     assert!(shifted >= 5, "the scrolls copied: {shifted}");
 }
+
+/// On a target that keeps its pixels (`Renderer::arm_kept_target`) nothing is copied out: a frame
+/// is redrawn on the target as it stands, and the kept frame, which only a scroll needs, catches
+/// up from the target first. Hovers between scrolls, a frame that changes nothing, a jump drawn
+/// whole and scrolls on from each: every frame holds the same bytes as that frame drawn whole.
+#[test]
+fn frames_on_a_target_that_keeps_its_pixels_match_whole_frames() {
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    let gpu = Gpu::headless();
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let size = (256, 192);
+    let mut text = crate::text::TextSystem::new(&[], ("Inter", "Inter"));
+    let clear = [0.1, 0.1, 0.1, 1.0];
+    let target = Offscreen::new(device, size.0, size.1);
+    let whole_target = Offscreen::new(device, size.0, size.1);
+    let mut renderer = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut whole = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut damage = Damage::default();
+    let (mut shifted, mut part, mut same) = (0, 0, 0);
+    // (scrolled by, the card lit). Lit cards far apart, more than the kept frame lags in before
+    // they are one rectangle; scrolls with a card lit, after a whole frame, and past where the
+    // roll wraps; a scroll of nothing but the light.
+    let steps: [(f32, Option<usize>); 22] = [
+        (0.0, None), (0.0, Some(3)), (0.0, Some(3)), (0.0, Some(9)), (12.0, Some(9)), (30.0, None), (30.0, Some(4)), (30.0, Some(14)),
+        (30.0, Some(7)), (30.0, Some(11)), (30.0, Some(17)), (30.0, Some(2)), (61.0, Some(2)), (75.0, None), (170.0, Some(5)), (150.0, Some(5)),
+        (150.0, Some(8)), (151.0, Some(8)), (40.0, None), (3.0, Some(6)), (0.0, Some(6)), (0.0, None),
+    ];
+    for (n, (dy, lit)) in steps.into_iter().enumerate() {
+        let mut list = rows(dy, size);
+        if let Some(at) = lit { list[at].fill = [0.9, 0.8, 0.2, 1.0]; }
+        renderer.prepare(device, queue, &mut text.atlas, &list, size);
+        match damage.plan(&list, size, clear, 0, GlyphAtlas::default(), true, true) {
+            Plan::Part { draw, shift, same: nothing, .. } => {
+                shifted += usize::from(shift.is_some());
+                part += usize::from(shift.is_none() && !nothing);
+                same += usize::from(nothing);
+                renderer.arm_damage(device, queue, &draw, clear, size, OFFSCREEN_FORMAT, shift.map(|s| (s.from, s.to)));
+                if nothing { renderer.arm_same(); } else { renderer.cull_armed(&list, size); }
+            }
+            Plan::All(_) => renderer.arm_whole(device, queue, clear, size, OFFSCREEN_FORMAT),
+        }
+        renderer.arm_kept_target();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, clear);
+        assert_eq!(renderer.damage_drawn(), Ok(()), "frame {n}");
+        target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        whole.prepare(device, queue, &mut text.atlas, &list, size);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        whole.draw(&mut encoder, &whole_target.view, clear);
+        whole_target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        assert!(target.read(device) == whole_target.read(device), "frame {n} (scrolled {dy}, lit {lit:?}) differs from the whole one");
+    }
+    assert!(shifted >= 5 && part >= 8 && same >= 1, "scrolls copied {shifted}, frames redrew in part {part}, changed nothing {same}");
+}
