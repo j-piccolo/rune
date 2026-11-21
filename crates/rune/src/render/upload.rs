@@ -291,6 +291,8 @@ impl Renderer {
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }
         self.count = instances.len() as u32;
+        // GPU springs move instances in the vertex stage, off the pixels `Cleared` checks.
+        self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(instances) };
         if !self.uploads.batched {
             self.batch(instances);
         } else {
