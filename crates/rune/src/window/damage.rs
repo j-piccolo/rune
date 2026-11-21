@@ -12,6 +12,13 @@
 //! everything changed. Lists of one length are compared in place instead, which needs no hashing:
 //! the instances that differ there, old and new, bound every pixel that changed.
 //!
+//! A scroll changes every instance of a viewport and few of its pixels: `scrolled` pairs the
+//! new list with the old one moved by a whole number of pixels, and the frame copies what moved
+//! (`Shift`) and redraws the strip that came in, what changed and what stayed put over the copy.
+//! A row the viewport's edge cuts is copied too: its clip, on whole pixels, lets through the same
+//! copied pixels as before. Where there's no dirty-rectangle present (Linux, headless runs), a
+//! frame that still has to draw whole draws into the kept frame, so the next one needn't.
+//!
 //! The whole window is drawn when anything else could have moved pixels (`Renderer::
 //! redraws_in_place`), when the size or clear colour changed, after a new swap chain, and when
 //! the change is most of the window anyway.
@@ -30,6 +37,8 @@ const MOST: f32 = 0.6;
 const MANY: usize = 256;
 /// Rectangles a change is gathered into, at most.
 pub(super) const RECTS: usize = crate::render::MAX_RECTS;
+/// Rectangles a scroll's redraw is gathered into, at most.
+const SCROLL_RECTS: usize = crate::render::MAX_ARMED;
 
 /// The last frames' changes.
 #[derive(Default)]
@@ -53,6 +62,16 @@ pub(super) enum Area {
     /// More than `MANY` instances.
     Many,
     Rects(Vec<[u32; 4]>),
+    /// A scroll (`scrolled`): the kept frame's pixels move by a shift, and these redraw.
+    Scroll(Shift, Vec<[u32; 4]>),
+}
+
+/// Pixels a partial frame copies within the kept frame before it redraws: the `[x, y, width,
+/// height]` at `from` go to `to`. A scroll moves what it moved this way instead of shading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Shift {
+    pub(crate) from: [u32; 4],
+    pub(crate) to: [u32; 2],
 }
 
 /// What a frame draws.
@@ -60,22 +79,38 @@ pub(super) enum Area {
 pub(crate) enum Plan {
     /// Everything, and why.
     All(&'static str),
-    /// Redraw `draw` (`[x, y, width, height]` each), present `present` (`[x0, y0, x1, y1]` each).
-    Part { draw: Vec<[u32; 4]>, present: Vec<[i32; 4]> },
+    /// Redraw `draw` (`[x, y, width, height]` each), present `present` (`[x0, y0, x1, y1]` each),
+    /// after copying `shift` within the kept frame. `same`: nothing changed, and `draw` is one
+    /// pixel only because a present needs one.
+    Part { draw: Vec<[u32; 4]>, present: Vec<[i32; 4]>, shift: Option<Shift>, same: bool },
 }
 
 impl Damage {
     /// The frame about to draw `instances` into a `size` target cleared to `clear`, on swap chain
-    /// `swap`; `in_place` when nothing but its instances draws there.
-    pub(crate) fn plan(&mut self, instances: &[Instance], size: (u32, u32), clear: [f32; 4], swap: u64, in_place: bool) -> Plan {
+    /// `swap`; `in_place` when nothing but its instances draws there. With `scroll`, a frame that
+    /// moved a viewport's content may copy it within the kept frame (`Plan::Part::shift`); a target
+    /// presented in dirty rectangles (Windows) leaves it off.
+    pub(crate) fn plan(&mut self, instances: &[Instance], size: (u32, u32), clear: [f32; 4], swap: u64, in_place: bool, scroll: bool) -> Plan {
         let (now, why) = match (in_place && !whole_frames(), self.shape == Some((size, clear, swap))) {
             (false, _) => (Area::All, "not in place"),
             (_, false) => (Area::All, "new size, colour or swap chain"),
             _ => {
-                let now = changed(&self.last, instances, size, &mut self.scratch);
-                self.seen = match &now { Area::Rects(r) => r.iter().copied().reduce(join), Area::All | Area::Many => None };
+                let most = |r: &[[u32; 4]]| r.iter().map(|r| area(*r)).sum::<u32>() as f32 > MOST * (size.0 * size.1) as f32;
+                // A scroll moves most of the list: asked first where a sample of it says so, since
+                // finding what changed in such a list hashes all of it only to say most did.
+                let first = if scroll && moved_mostly(&self.last, instances) { scrolled(&self.last, instances, size) } else { None };
+                let mut now = match first {
+                    Some((shift, rects)) => Area::Scroll(shift, rects),
+                    None => changed(&self.last, instances, size, &mut self.scratch),
+                };
+                // What would draw whole may be a scroll: then most of it is copied, not shaded.
+                let whole = match &now { Area::Rects(r) => most(r), Area::Scroll(..) => false, _ => true };
+                if scroll && whole && !moved_mostly(&self.last, instances) && let Some((shift, rects)) = scrolled(&self.last, instances, size) {
+                    now = Area::Scroll(shift, rects);
+                }
+                self.seen = match &now { Area::Rects(r) | Area::Scroll(_, r) => r.iter().copied().reduce(join), Area::All | Area::Many => None };
                 match now {
-                    Area::Rects(r) if r.iter().map(|r| area(*r)).sum::<u32>() as f32 > MOST * (size.0 * size.1) as f32 => (Area::All, "most of it changed"),
+                    Area::Rects(r) | Area::Scroll(_, r) if most(&r) => (Area::All, "most of it changed"),
                     Area::All => (Area::All, "reordered"),
                     Area::Many => (Area::All, "many changed"),
                     other => (other, ""),
@@ -88,10 +123,19 @@ impl Damage {
         match now {
             Area::All | Area::Many => Plan::All(why),
             // Nothing changed: one pixel keeps the present, which DWM composes again as is.
-            Area::Rects(r) if r.is_empty() => Plan::Part { draw: vec![[0, 0, 1, 1]], present: vec![[0, 0, 1, 1]] },
+            Area::Rects(r) if r.is_empty() => Plan::Part { draw: vec![[0, 0, 1, 1]], present: vec![[0, 0, 1, 1]], shift: None, same: true },
             Area::Rects(r) => Plan::Part {
                 draw: r.iter().map(|r| [r[0], r[1], r[2] - r[0], r[3] - r[1]]).collect(),
                 present: r.iter().map(|r| r.map(|v| v as i32)).collect(),
+                shift: None,
+                same: false,
+            },
+            // The copy changes pixels all over the viewport: the whole target is presented.
+            Area::Scroll(shift, r) => Plan::Part {
+                draw: r.iter().map(|r| [r[0], r[1], r[2] - r[0], r[3] - r[1]]).collect(),
+                present: vec![[0, 0, size.0 as i32, size.1 as i32]],
+                shift: Some(shift),
+                same: false,
             },
         }
     }
@@ -115,7 +159,7 @@ impl Damage {
     }
 }
 /// `RUNE_WHOLE_FRAMES=1`: every frame draws whole, to check partial frames against.
-fn whole_frames() -> bool {
+pub(crate) fn whole_frames() -> bool {
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WHOLE.get_or_init(|| std::env::var_os("RUNE_WHOLE_FRAMES").is_some_and(|v| v == "1"))
 }
@@ -256,6 +300,35 @@ fn gathered(each: &mut [[u32; 4]]) -> Area {
     for r in each.iter().copied() { add(&mut rects, r); }
     Area::Rects(rects)
 }
+
+/// `each` as at most `SCROLL_RECTS` rectangles, for a scroll: what redraws there is a strip at
+/// one edge and whatever changed elsewhere, often far apart. Past the limit the two that grow
+/// least as one are joined (not the newcomer into its nearest, which can take a strip at the
+/// bottom and a label at the top into one rectangle the height of the window).
+fn gathered_apart(each: &mut [[u32; 4]]) -> Vec<[u32; 4]> {
+    each.sort_unstable_by_key(|r| (r[1], r[0]));
+    let mut rects: Vec<[u32; 4]> = Vec::new();
+    let absorb = |rects: &mut Vec<[u32; 4]>, mut r: [u32; 4]| {
+        while let Some(i) = rects.iter().position(|q| near(*q, r)) { r = join(rects.swap_remove(i), r); }
+        rects.push(r);
+    };
+    for r in each.iter().copied() {
+        absorb(&mut rects, r);
+        while rects.len() > SCROLL_RECTS {
+            let mut best = (u64::MAX, 0, 1);
+            for i in 0..rects.len() {
+                for j in i + 1..rects.len() {
+                    let grow = u64::from(area(join(rects[i], rects[j]))).saturating_sub(u64::from(area(rects[i])) + u64::from(area(rects[j])));
+                    if grow < best.0 { best = (grow, i, j); }
+                }
+            }
+            let b = rects.swap_remove(best.2);
+            let a = rects.swap_remove(best.1);
+            absorb(&mut rects, join(a, b));
+        }
+    }
+    rects
+}
 /// Adds `r` to `rects`: into one it touches, or as its own until there are `RECTS`, then into
 /// the one it grows least.
 fn add(rects: &mut Vec<[u32; 4]>, r: [u32; 4]) {
@@ -277,8 +350,23 @@ fn near(a: [u32; 4], b: [u32; 4]) -> bool {
 
 fn join(a: [u32; 4], b: [u32; 4]) -> [u32; 4] { [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])] }
 
+/// `i` shades the pixels of its rect inside its clip and no others: a plain rect (no border,
+/// softened edge or rounded corner) on whole pixels, inside a clip on whole pixels that fades
+/// nothing. The shader's coverage and clip ramps are exactly 0 at every pixel centre outside.
+fn crisp(i: &Instance) -> bool {
+    let [x, y, w, h] = i.rect;
+    i.kind() == Some(crate::render::Kind::Rect) && i.params[0] == 0.0 && i.params[2] <= 0.5 && i.radii == [0.0; 4] && i.fade == [0; 4]
+        && [x, y, x + w, y + h].iter().chain(&i.clip).all(|v| v.fract() == 0.0)
+}
+
 /// The pixels an instance can touch: its quad as the shader grows it, inside its clip.
 fn bounds(i: &Instance, size: (u32, u32)) -> Option<[u32; 4]> {
+    if crisp(i) {
+        let ([x, y, w, h], c) = (i.rect, i.clip);
+        let (x0, y0) = (x.max(c[0]).max(0.0), y.max(c[1]).max(0.0));
+        let (x1, y1) = ((x + w).min(c[2]).min(size.0 as f32), (y + h).min(c[3]).min(size.1 as f32));
+        return (x1 > x0 && y1 > y0).then_some([x0 as u32, y0 as u32, x1 as u32, y1 as u32]);
+    }
     let (x0, y0, x1, y1) = i.damage_quad_bounds()?;
     if x1 <= x0 || y1 <= y0 { return None; }
     let c = i.clip;
@@ -288,6 +376,213 @@ fn bounds(i: &Instance, size: (u32, u32)) -> Option<[u32; 4]> {
 }
 
 fn area(r: [u32; 4]) -> u32 { (r[2] - r[0]) * (r[3] - r[1]) }
+
+/// Most of a sample of the new list isn't where it was in the old one, nor the same from the
+/// end: what a scroll does to a list, and little else.
+fn moved_mostly(old: &[Instance], new: &[Instance]) -> bool {
+    const SAMPLES: usize = 16;
+    if new.len() < 2 * SAMPLES || old.len() < 2 * SAMPLES { return false; }
+    let differs = (0..SAMPLES).filter(|k| {
+        let at = (2 * k + 1) * new.len() / (2 * SAMPLES);
+        let from_end = new.len() - at;
+        !old.get(at).is_some_and(|o| same(o, &new[at])) && !old.len().checked_sub(from_end).is_some_and(|o| same(&old[o], &new[at]))
+    }).count();
+    differs * 4 > SAMPLES * 3
+}
+
+/// A frame that moved a viewport's content by whole pixels, as a scroll does: the shift that
+/// copies it within the kept frame, and what still redraws (`[x0, y0, x1, y1]` each). The new
+/// list is walked in order beside the old, each instance paired with the old one it is, moved; a
+/// copied pixel is exactly what the frame would shade there when every instance under it moved
+/// by the shift (`moved`) or lies under all of them and shades it uniformly (`uniform_below`).
+/// The rest redraws: what came into the viewport, what changed, and what moved otherwise.
+fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shift, Vec<[u32; 4]>)> {
+    let start = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
+    let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| same(a, b)).count();
+    let (om, nm) = (&old[start..old.len() - end], &new[start..new.len() - end]);
+    // The shift, voted by new instances spread through the middle, each with every move that
+    // takes an old one near its place to it: a glyph or a card like it elsewhere offers a wrong
+    // one, which few agree on. (The first instances are often a row the viewport's edge cuts,
+    // whose clip changed as it moved.) Then how far ahead the old middle runs there.
+    let probes: Vec<usize> = (1..8).map(|k| k * nm.len() / 8).filter(|&j| j < nm.len()).collect();
+    // Near its place first (a scroll alone leaves the list as long as it was), then further (rows
+    // came into the list or left it): a wide look at every probe costs a frame thousands of
+    // comparisons.
+    let voted = |reach: usize| {
+        let window = |j: usize| j.saturating_sub(reach)..(j + reach + 1).min(om.len());
+        let mut votes: Vec<([f32; 2], usize)> = Vec::new();
+        for &j in &probes {
+            let mut offers: Vec<[f32; 2]> = Vec::new();
+            for i in window(j) {
+                if let Some(d) = moved(&om[i], &nm[j]) && !offers.contains(&d) { offers.push(d); }
+            }
+            for d in offers {
+                match votes.iter_mut().find(|(v, _)| *v == d) { Some(e) => e.1 += 1, None => votes.push((d, 1)) }
+            }
+        }
+        let (d, support) = votes.into_iter().max_by_key(|(_, n)| *n)?;
+        if support * 2 <= probes.len() { return None; }
+        let ahead = probes.iter().find_map(|&j| {
+            window(j).filter(|&i| moved(&om[i], &nm[j]) == Some(d)).min_by_key(|&i| i.abs_diff(j)).map(|i| i as isize - j as isize)
+        })?;
+        Some((d, ahead))
+    };
+    let (d, mut ahead) = voted(24).or_else(|| voted(256))?;
+    if d[0].fract() != 0.0 || d[1].fract() != 0.0 || !on_grid(d[0]) || !on_grid(d[1]) { return None; }
+    // Moved first: it tells most pairs apart by their size and kind alone.
+    let fits = |o: &Instance, n: &Instance| moved(o, n) == Some(d) || bytemuck::bytes_of(o) == bytemuck::bytes_of(n);
+    let mut paired = vec![false; om.len()];
+    let (mut un_new, mut stayed, mut fixed, mut along) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut first_moved = None;
+    // A row that came into the list or left it is hundreds of instances in one place: found by
+    // looking further (`FAR`) for where the lists meet again, a few times a frame at most.
+    const FAR: usize = 512;
+    let (mut came, mut searches, mut lost) = (0usize, 8, false);
+    for (j, n) in nm.iter().enumerate() {
+        // One of a run that came in: the old one due waits for the new one after them.
+        if came > 0 {
+            came -= 1;
+            ahead -= 1;
+            un_new.push(j);
+            continue;
+        }
+        let old_at = |k: isize| usize::try_from(j as isize + ahead + k).ok().filter(|&o| o < om.len());
+        // Paired where it's due, or a few further on when old ones went.
+        let mut found = (0..=8).find_map(|k| old_at(k).filter(|&o| fits(&om[o], n)).map(|o| (k, o)));
+        // Or it came in (the old one due here pairs a later new one), or it changed.
+        let mut after = if found.is_some() { None } else { old_at(0).and_then(|o| (1..=8).find(|&m| nm.get(j + m).is_some_and(|later| fits(&om[o], later)))) };
+        // Once where the pairing stops, not for each instance of a run that changed.
+        if found.is_none() && after.is_none() && searches > 0 && !std::mem::replace(&mut lost, true) {
+            searches -= 1;
+            found = (9..=FAR as isize).find_map(|k| old_at(k).filter(|&o| fits(&om[o], n)).map(|o| (k, o)));
+            after = old_at(0).and_then(|o| (9..=FAR).find(|&m| nm.get(j + m).is_some_and(|later| fits(&om[o], later))));
+            // The nearer meeting: the fewer instances given up as gone or new.
+            if let (Some((k, _)), Some(m)) = (found, after) { if (k as usize) <= m { after = None; } else { found = None; } }
+        }
+        let Some((k, o)) = found else {
+            if let Some(m) = after {
+                ahead -= 1;
+                came = m - 1;
+            }
+            un_new.push(j);
+            continue;
+        };
+        lost = false;
+        ahead += k;
+        paired[o] = true;
+        if om[o].rect == n.rect { stayed.push(start + j); continue; }
+        if !moves_exactly(&om[o], n) { paired[o] = false; un_new.push(j); continue; }
+        first_moved.get_or_insert(start + j);
+        if om[o].clip == n.clip { fixed.push((o, j)); } else { along.push((o, j)); }
+    }
+    let first_moved = first_moved?;
+    // The viewport: the clip most moved instances keep, on whole pixels. Those keeping another
+    // move in a viewport of their own, which the copy doesn't follow: they redraw.
+    let mut clips: Vec<([f32; 4], usize)> = Vec::new();
+    for &(_, j) in &fixed {
+        match clips.iter_mut().find(|(c, _)| *c == nm[j].clip) { Some(e) => e.1 += 1, None => clips.push((nm[j].clip, 1)) }
+    }
+    // None keeps one (every row in a clip of its own): what their clips reach, before and after.
+    let reach = || along.iter().flat_map(|&(o, j)| [om[o].clip, nm[j].clip])
+        .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+    let v = clips.iter().max_by_key(|(_, n)| *n).map(|(c, _)| *c).or_else(reach)?;
+    for &(o, j) in &fixed {
+        if nm[j].clip != v { paired[o] = false; un_new.push(j); }
+    }
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let v = [v[0].max(0.0), v[1].max(0.0), v[2].min(w), v[3].min(h)];
+    if v.iter().any(|c| c.fract() != 0.0) || v[2] <= v[0] || v[3] <= v[1] { return None; }
+    let inside = |c: [f32; 4]| c[0] >= v[0] && c[1] >= v[1] && c[2] <= v[2] && c[3] <= v[3];
+    let r = [v[0].max(v[0] + d[0]), v[1].max(v[1] + d[1]), v[2].min(v[2] + d[0]), v[3].min(v[3] + d[1])];
+    if r[2] <= r[0] || r[3] <= r[1] { return None; }
+    // A clip of its own (a row's, cut by the viewport's edge, or one that moved along): it must
+    // lie in the viewport, or the instance draws outside it, and it must let through the same
+    // copied pixels as it did where they came from. Its edges on whole pixels, a pixel is in or
+    // out, so a pixel the copy fills holds exactly what the instance gave it before the move.
+    let meet = |c: [f32; 4]| {
+        let m = [c[0].max(r[0]), c[1].max(r[1]), c[2].min(r[2]), c[3].min(r[3])];
+        (m[2] > m[0] && m[3] > m[1]).then_some(m)
+    };
+    for &(o, j) in &along {
+        let (was, is) = (om[o].clip, nm[j].clip);
+        let whole = was.map(f32::fract) == [0.0; 4] && is.map(f32::fract) == [0.0; 4];
+        let same_copied = meet([was[0] + d[0], was[1] + d[1], was[2] + d[0], was[3] + d[1]]) == meet(is);
+        if !whole || !same_copied || !inside(was) || !inside(is) { paired[o] = false; un_new.push(j); }
+    }
+    let (from, r) = (r.map(|c| c as u32), r.map(|c| c as u32));
+    let from = [(from[0] as f32 - d[0]) as u32, (from[1] as f32 - d[1]) as u32];
+    let shift = Shift { from: [from[0], from[1], r[2] - r[0], r[3] - r[1]], to: [r[0], r[1]] };
+    // Where the copy puts the pixels of `b`: moved, inside what it fills.
+    let moved_by = |b: [u32; 4]| {
+        let x = |c: u32| (c as f32 + d[0]).clamp(r[0] as f32, r[2] as f32) as u32;
+        let y = |c: u32| (c as f32 + d[1]).clamp(r[1] as f32, r[3] as f32) as u32;
+        [x(b[0]), y(b[1]), x(b[2]), y(b[3])]
+    };
+    // What redraws: the viewport the copy doesn't fill, what's new, what's gone (where it was and
+    // where its copied pixels land), and what stayed put over the copy (where it is, and where
+    // the copy put its pixels) unless it shades all of the copy alike from under what moved.
+    let vi = v.map(|c| c as u32);
+    let mut each = vec![[vi[0], vi[1], vi[2], r[1]], [vi[0], r[3], vi[2], vi[3]], [vi[0], vi[1], r[0], vi[3]], [r[2], vi[1], vi[2], vi[3]]];
+    each.extend(un_new.iter().filter_map(|&j| bounds(&nm[j], size)));
+    for (o, _) in paired.iter().enumerate().filter(|(_, p)| !**p) {
+        let Some(b) = bounds(&om[o], size) else { continue };
+        // In the viewport, where it was is copied over or redrawn as a strip; outside, it redraws.
+        if !(b[0] >= vi[0] && b[1] >= vi[1] && b[2] <= vi[2] && b[3] <= vi[3]) { each.push(b); }
+        each.push(moved_by(b));
+    }
+    let copied = [r[0].min(from[0]), r[1].min(from[1]), r[2].max(from[0] + shift.from[2]), r[3].max(from[1] + shift.from[3])];
+    let meets = |b: [u32; 4]| b[0] < copied[2] && copied[0] < b[2] && b[1] < copied[3] && copied[1] < b[3];
+    for at in (0..start).chain(stayed).chain(new.len() - end..new.len()) {
+        let Some(b) = bounds(&new[at], size) else { continue };
+        if !meets(b) || (at < first_moved && uniform_below(&new[at], copied)) { continue; }
+        each.push(b);
+        each.push(moved_by(b));
+    }
+    each.retain(|b| b[2] > b[0] && b[3] > b[1]);
+    let rects = gathered_apart(&mut each);
+    Some((shift, rects))
+}
+
+/// `n` is `o` moved: every byte the same but the rect's place and the clip (which `scrolled`
+/// checks once it knows what the copy fills). The move, or `None`. Compared where they lie: a
+/// frame asks this of thousands of pairs.
+fn moved(o: &Instance, n: &Instance) -> Option<[f32; 2]> {
+    // Most pairs asked about differ in size or in what they are: told apart before the rest.
+    if o.rect[2].to_bits() != n.rect[2].to_bits() || o.rect[3].to_bits() != n.rect[3].to_bits() || o.params[1].to_bits() != n.params[1].to_bits() { return None; }
+    let (a, b) = (bytemuck::bytes_of(o), bytemuck::bytes_of(n));
+    // Bytes: 0..8 the rect's place, 8..16 its size, 96..112 the clip; the rest must match.
+    if a[8..96] != b[8..96] || a[112..] != b[112..] || a[..8] == b[..8] { return None; }
+    Some([n.rect[0] - o.rect[0], n.rect[1] - o.rect[1]])
+}
+
+/// A moved instance whose pixels move with it exactly: its kind shades a pixel from where it lies
+/// relative to the rect (a turned glyph samples the interpolated position, which moves with
+/// rounding), it fades nothing, and its rect and clip lie on a quarter-pixel grid near the origin,
+/// so the shader's sums, half-sizes and differences round nothing.
+fn moves_exactly(o: &Instance, n: &Instance) -> bool {
+    use crate::render::Kind;
+    let kind = matches!(n.kind(), Some(Kind::Rect | Kind::Shadow | Kind::Inset | Kind::Gradient | Kind::Image | Kind::Dashed | Kind::Radial))
+        || (n.kind() == Some(Kind::Glyph) && n.params[0] == 0.0);
+    let grid = |v: [f32; 4]| v.map(on_grid) == [true; 4];
+    let clip_ok = |c: [f32; 4]| c == crate::render::NO_CLIP || grid(c);
+    kind && n.fade == [0; 4] && grid(o.rect) && grid(n.rect) && clip_ok(o.clip) && (o.clip == n.clip || clip_ok(n.clip))
+}
+
+/// On the quarter-pixel grid, under 2^19: sums of two such values and their halves are exact in f32.
+fn on_grid(v: f32) -> bool { (v * 4.0).fract() == 0.0 && v.abs() < 524_288.0 }
+
+/// `i`, drawn under everything that moved, shades every pixel of `region` (`[x0, y0, x1, y1]`)
+/// alike: a plain rect on whole pixels with nothing but its fill, covering it, inside its clip.
+/// The copy then keeps what it gives each pixel.
+fn uniform_below(i: &Instance, region: [u32; 4]) -> bool {
+    let [x, y, w, h] = i.rect;
+    let c = i.clip;
+    let [x0, y0, x1, y1] = region.map(|v| v as f32);
+    i.kind() == Some(crate::render::Kind::Rect) && i.params[0] == 0.0 && i.params[2] <= 0.5 && i.radii == [0.0; 4] && i.fade == [0; 4]
+        && [x, y, x + w, y + h].iter().all(|v| v.fract() == 0.0)
+        && x <= x0 && y <= y0 && x + w >= x1 && y + h >= y1
+        && c[0] <= x0 && c[1] <= y0 && c[2] >= x1 && c[3] >= y1
+}
 
 #[cfg(test)]
 #[path = "damage_tests.rs"]

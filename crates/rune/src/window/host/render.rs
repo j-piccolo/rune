@@ -285,10 +285,11 @@ pub(super) fn prepare_window_render(
             l.native.damage.patched(&rt.instances, p);
             Some(present)
         } else {
-            match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none()) {
+            // Presented in dirty rectangles: a scroll's copy would make most of the window one.
+            match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none(), false) {
                 damage::Plan::All(why) => { profile.set_whole_why(whole.unwrap_or(why)); None }
-                damage::Plan::Part { draw, present } => {
-                    renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format);
+                damage::Plan::Part { draw, present, .. } => {
+                    renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format, None);
                     Some(present)
                 }
             }
@@ -302,10 +303,19 @@ pub(super) fn prepare_window_render(
         let whole = if l.alpha.is_some() { Some("alpha") } else if images_changed { Some("image") }
             else if !l.config.usage.contains(wgpu::TextureUsages::COPY_DST) { Some("no copies") } else { None };
         let swap = l.surface.as_ref().map_or(0, crate::window::surface::configure::generation);
-        match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none()) {
-            damage::Plan::All(why) => { profile.set_whole_why(whole.unwrap_or(why)); false }
-            damage::Plan::Part { draw, .. } => {
-                renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format);
+        // A scroll's moved pixels pass through the drawable, which must be one to copy from.
+        let scroll = l.config.usage.contains(wgpu::TextureUsages::COPY_SRC);
+        match l.native.damage.plan(&rt.instances, size, rt.clear_color(), swap, whole.is_none(), scroll) {
+            damage::Plan::All(why) => {
+                profile.set_whole_why(whole.unwrap_or(why));
+                // Whole, but into the kept frame, so the next frame may redraw part of it.
+                let kept = matches!(whole, None | Some("image")) && !damage::whole_frames();
+                if kept { renderer.arm_whole(&gpu.device, &gpu.queue, rt.clear_color(), size, l.config.format); }
+                kept
+            }
+            damage::Plan::Part { draw, shift, same, .. } => {
+                renderer.arm_damage(&gpu.device, &gpu.queue, &draw, rt.clear_color(), size, l.config.format, shift.map(|s| (s.from, s.to)));
+                if same { renderer.arm_same(); } else { renderer.cull_armed(&rt.instances, size); }
                 true
             }
         }
