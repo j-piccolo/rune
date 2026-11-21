@@ -694,7 +694,7 @@ impl RuntimeCore {
         // geometry without inventing pointer-move or drag events on animation frames. Tooltips
         // follow the hold this decides.
         let queued = self.frame.queue.len();
-        let held = self.pointer.pos.map(|(x, y)| self.refresh_hover(x, y));
+        let (held, tracked) = self.pointer.pos.map(|(x, y)| self.refresh_hover_tracks(x, y)).unzip();
         self.frame.queue.observe_since(queued);
         self.update_help();
         self.paint.layer_scratch = layers;
@@ -715,7 +715,9 @@ impl RuntimeCore {
         // Retarget from the new geometry and schedule the frame that samples that paint. A
         // commit that moved the indices left keyboard focus hover (`El::hover_group`) to
         // this pass too.
-        let interaction = (self.pointer.pos.is_some() || self.kbd.focus.keyboard()) && self.update_interaction(held);
+        // (The hover tracks `refresh_hover_tracks` looked at above stand: nothing since has moved
+        // the pointer, changed the tree or what was drawn, or turned a hover.)
+        let interaction = (self.pointer.pos.is_some() || self.kbd.focus.keyboard()) && self.update_interaction_tracked(held, tracked.unwrap_or(false));
         self.frame.queue.len() > queued || interaction
     }
 }
