@@ -28,7 +28,11 @@ impl OverlayCore {
         // A Windows fade-out steps its alpha once a frame.
         #[cfg(target_os = "windows")]
         let deadline = deadline.into_iter().chain(self.presence.fading().then(|| crate::time::now() + crate::window::TIMER_FRAME)).min();
-        deadline.into_iter().chain(self.backoff.deadline().filter(|_| self.presence.drawing())).chain(self.presence.deadline())
+        // A frame waiting for the compositor to draw the last comes with its answer, which
+        // winit reads: the loop waits on a deadline until then, so that read turns it.
+        let answer = self.awaits_frame().filter(|_| self.presence.drawing() && (self.dirty || !self.idle))
+            .map(|since| since + crate::platform::layer_shell_machine::frame::ANSWER).filter(|at| *at > crate::time::now());
+        deadline.into_iter().chain(answer).chain(self.backoff.deadline().filter(|_| self.presence.drawing())).chain(self.presence.deadline())
             .chain(self.hidden_pace.deadline().filter(|_| !self.presence.drawing())).min()
     }
 

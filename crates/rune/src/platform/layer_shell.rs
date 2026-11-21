@@ -17,6 +17,7 @@ use winit::event::MouseScrollDelta;
 use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use wayland_backend::client::Backend;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -31,7 +32,7 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1:
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1};
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1};
 
-use super::layer_shell_machine::{keyboard, readiness, touch};
+use super::layer_shell_machine::{frame, keyboard, readiness, touch};
 use crate::el::Align;
 use crate::overlay::{Placement, ScreenEdge};
 use crate::runtime::Waker;
@@ -80,6 +81,8 @@ struct State {
     /// How far the compositor has got with the surface: its first configure is what makes it
     /// drawable, and closing it is final.
     readiness: readiness::State,
+    /// Whether the compositor has drawn the last frame presented.
+    frame: frame::State,
     input: Vec<Input>,
     surface: Option<WlSurface>,
     over: Over,
@@ -414,6 +417,14 @@ impl Dispatch<WlSurface, ()> for State {
         }
     }
 }
+/// A frame callback, with the number its present asked as.
+impl Dispatch<WlCallback, u64> for State {
+    fn event(state: &mut Self, _: &WlCallback, event: wl_callback::Event, ask: &u64, _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_callback::Event::Done { .. } = event {
+            frame::step(&mut state.frame, frame::Event::Answered { ask: *ask });
+        }
+    }
+}
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
     fn event(state: &mut Self, layer: &ZwlrLayerSurfaceV1, event: zwlr_layer_surface_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         match event {
@@ -521,6 +532,8 @@ pub(crate) struct LayerSurface {
     /// region last sent (none: no blur).
     blur: Option<ExtBackgroundEffectSurfaceV1>,
     blur_sent: Option<Vec<[i32; 4]>>,
+    /// Frames presented, to tell each one's answer from an earlier one's.
+    asks: u64,
     display: NonNull<std::ffi::c_void>,
     wakes: Option<Wakes>,
 }
@@ -588,7 +601,7 @@ impl LayerSurface {
         });
         let mut this = LayerSurface {
             registry, seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, output, seat,
-            options: options.clone(), queue, state, role, surface, blur, blur_sent: None, display: display.display, wakes,
+            options: options.clone(), queue, state, role, surface, blur, blur_sent: None, asks: 0, display: display.display, wakes,
         };
         if let Some(seat) = &this.seat { this.state.update_seat(seat, &this.queue.handle()); }
         this.place(at);
@@ -761,6 +774,18 @@ impl LayerSurface {
         self.surface.commit();
         self.queue.flush().ok();
     }
+
+    /// Asks the compositor to say when it has drawn the frame about to be presented. The request
+    /// rides the commit wgpu's present makes; no frame is presented before the answer
+    /// (`awaits_frame`).
+    pub fn ask_frame(&mut self) {
+        self.asks += 1;
+        self.surface.frame(&self.queue.handle(), self.asks);
+        frame::step(&mut self.state.frame, frame::Event::Presents { ask: self.asks, now: crate::time::now() });
+    }
+
+    /// When the frame the compositor has yet to draw was presented, as of the last `dispatch`.
+    pub fn awaits_frame(&self) -> Option<crate::time::Instant> { self.state.frame.asked() }
 
     pub fn set_buffer_scale(&mut self, scale: i32) {
         if self.surface.version() >= 3 {

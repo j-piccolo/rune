@@ -3,7 +3,7 @@
 //! any order, as can a finger's down, motion, lift and cancel. Touch is checked against a
 //! transcription of the code it replaced, so the conversion can't quietly change what an app sees.
 
-use super::{readiness, touch};
+use super::{frame, readiness, touch};
 
 /// Every sequence of up to `depth` symbols, shortest first, through `each`.
 fn each_sequence<T: Copy>(alphabet: &[T], depth: usize, seq: &mut Vec<T>, each: &mut impl FnMut(&[T])) {
@@ -187,6 +187,32 @@ fn a_second_configure_replaces_the_size_nobody_read() {
     readiness::step(&mut state, readiness::Event::Closed);
     assert!(state.closed());
     assert_eq!(state.take_size(), None);
+}
+
+#[test]
+fn a_frame_waits_for_the_answer_to_the_last_one_presented() {
+    let t = crate::time::now();
+    let ms = |n| t + std::time::Duration::from_millis(n);
+    let mut state = frame::State::default();
+    assert_eq!(state.asked(), None, "nothing presented: the first frame goes at once");
+    // An answer nobody asked for (a surface made anew) changes nothing.
+    frame::step(&mut state, frame::Event::Answered { ask: 7 });
+    assert_eq!(state.asked(), None);
+    frame::step(&mut state, frame::Event::Presents { ask: 1, now: ms(0) });
+    assert_eq!(state.asked(), Some(ms(0)));
+    frame::step(&mut state, frame::Event::Answered { ask: 1 });
+    assert_eq!(state.asked(), None, "the compositor drew it: the next may go");
+    // A frame presented over one still waiting (a prewarm frame): the earlier one's answer says
+    // nothing of it, and the wait is counted from the later present.
+    frame::step(&mut state, frame::Event::Presents { ask: 2, now: ms(16) });
+    frame::step(&mut state, frame::Event::Presents { ask: 3, now: ms(20) });
+    frame::step(&mut state, frame::Event::Answered { ask: 2 });
+    assert_eq!(state.asked(), Some(ms(20)));
+    frame::step(&mut state, frame::Event::Answered { ask: 3 });
+    assert_eq!(state.asked(), None);
+    // Answered twice: the second says nothing.
+    frame::step(&mut state, frame::Event::Answered { ask: 3 });
+    assert_eq!(state, frame::State::Free);
 }
 
 #[test]
