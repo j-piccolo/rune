@@ -86,6 +86,8 @@ pub(crate) struct Row {
     pub shaped: u32,
     pub animating: bool,
     pub cpu_ms: Option<f64>,
+    /// Wall time from the frame's submit until the GPU had drawn it (0 with no compositor: nothing waits).
+    pub gpu_wait_ms: f64,
 }
 
 /// A headless run's frames. With `RUNE_FRAME_LOG=FILE`, each frame is also written to FILE as a
@@ -116,7 +118,7 @@ impl Log {
                 "k": self.rows.len(), "ms": row.update_ms + row.encode_ms, "cpu_ms": row.cpu_ms, "events": row.events, "update_ms": row.update_ms, "encode_ms": row.encode_ms,
                 "view_cpu": p[PHASES], "commit_cpu": p[PHASES + 1], "layout_cpu": p[PHASES + 2], "text_cpu": p[PHASES + 3],
                 "paint_cpu": p[PHASES + 4], "apply_cpu": p[PHASES + 5], "allocations": row.allocations,
-                "commits": row.commits, "shaped": row.shaped, "animating": row.animating,
+                "commits": row.commits, "shaped": row.shaped, "animating": row.animating, "gpu_wait_ms": row.gpu_wait_ms,
             });
             if row.commits > 0 { line["why"] = crate::runtime::CommitWhy::names(row.why).into(); }
             writeln!(out, "{line}").expect("RUNE_FRAME_LOG write");

@@ -206,20 +206,20 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     // First frame always draws whole and records the baseline atlas state.
     let mut damage = Damage::default();
     assert!(matches!(
-        damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true),
+        damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false),
         Plan::All(_)
     ));
 
     // Unchanged instances and clean atlas keep the 1x1 partial present.
     assert_eq!(
-        damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true),
-        Plan::Part { draw: vec![[0, 0, 1, 1]], present: vec![[0, 0, 1, 1]] }
+        damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false),
+        Plan::Part { draw: vec![[0, 0, 1, 1]], present: vec![[0, 0, 1, 1]], shift: None, same: true }
     );
 
     // Dirty CPU rows on page 0 with unchanged instances must draw whole.
     text.atlas.dirty = Some((0, 16));
     assert!(
-        matches!(damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true), Plan::All(_)),
+        matches!(damage.plan(&base_instances, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false), Plan::All(_)),
         "dirty page 0 glyph rows with unchanged instances must redraw whole"
     );
     text.atlas.dirty = None;
@@ -236,7 +236,7 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     // Typing a new glyph whose instance was added stays partial (no eviction occurred).
     let with_new_glyph = [base_instances[0], base_instances[1], glyph(50.0, [20.0, 1.0, 16.0, 16.0])];
     assert!(
-        matches!(damage.plan(&with_new_glyph, size, clear, swap, GlyphAtlas::of(&text.atlas), true), Plan::Part { .. }),
+        matches!(damage.plan(&with_new_glyph, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false), Plan::Part { .. }),
         "adding a newly rasterized glyph without eviction must stay partial"
     );
     assert!(!text.atlas.take_fills().is_empty());
@@ -251,32 +251,32 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
 
     let mut d_before = Damage::default();
     let baseline = GlyphAtlas { resets: before_drain.resets, rasterized: before_drain.rasterized - 1, dirty_rows: false, pending_fills: false };
-    let _ = d_before.plan(&with_new_glyph, size, clear, swap, baseline, true);
+    let _ = d_before.plan(&with_new_glyph, size, clear, swap, baseline, true, false);
     assert!(
-        matches!(d_before.plan(&with_new_glyph, size, clear, swap, before_drain, true), Plan::All(_)),
+        matches!(d_before.plan(&with_new_glyph, size, clear, swap, before_drain, true, false), Plan::All(_)),
         "pending GPU fills with unchanged instances must redraw whole"
     );
 
     let mut d_after = Damage::default();
-    let _ = d_after.plan(&with_new_glyph, size, clear, swap, baseline, true);
+    let _ = d_after.plan(&with_new_glyph, size, clear, swap, baseline, true, false);
     assert!(
-        matches!(d_after.plan(&with_new_glyph, size, clear, swap, after_drain, true), Plan::All(_)),
+        matches!(d_after.plan(&with_new_glyph, size, clear, swap, after_drain, true, false), Plan::All(_)),
         "new glyph rasterization with unchanged instances must redraw whole even after fills drain"
     );
 
     // Re-queued fills without advancing `rasterized` (e.g. `rows_uploaded`) must draw whole
     // both when instances are unchanged and when another instance (like a caret) moves.
-    let _ = damage.plan(&with_new_glyph, size, clear, swap, GlyphAtlas::of(&text.atlas), true);
+    let _ = damage.plan(&with_new_glyph, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false);
     text.atlas.rows_uploaded(0, (0, crate::text::ATLAS_SIZE));
     assert!(text.atlas.dirty.is_none() && text.atlas.has_pending_fills());
     let refilled = GlyphAtlas::of(&text.atlas);
     assert!(
-        matches!(damage.plan(&with_new_glyph, size, clear, swap, refilled, true), Plan::All(_)),
+        matches!(damage.plan(&with_new_glyph, size, clear, swap, refilled, true, false), Plan::All(_)),
         "re-queued GPU fills with unchanged instances must redraw whole"
     );
     let caret_moved = [with_new_glyph[0], caret(40.0), with_new_glyph[2]];
     assert!(
-        matches!(damage.plan(&caret_moved, size, clear, swap, refilled, true), Plan::All(_)),
+        matches!(damage.plan(&caret_moved, size, clear, swap, refilled, true, false), Plan::All(_)),
         "re-queued GPU fills without new rasterizations must redraw whole even if a caret moved"
     );
     assert!(!text.atlas.take_fills().is_empty());
@@ -297,17 +297,17 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     for page in &mut text.atlas.pages { page.dirty = None; }
     let _ = text.atlas.take_fills();
     assert!(!text.atlas.pages.is_empty(), "expected secondary glyph atlas page");
-    let _ = damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true);
+    let _ = damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false);
 
     text.atlas.pages[0].dirty = Some((0, 16));
     assert!(
-        matches!(damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true), Plan::All(_)),
+        matches!(damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false), Plan::All(_)),
         "dirty secondary glyph page with unchanged instances must redraw whole"
     );
     text.atlas.pages[0].dirty = None;
 
     let (rasterized_before, resets_before) = (text.atlas.rasterized(), text.atlas.resets());
-    let _ = damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true);
+    let _ = damage.plan(&caret_moved, size, clear, swap, GlyphAtlas::of(&text.atlas), true, false);
     text.begin_frame();
     assert!(text.atlas.resets() > resets_before, "expected atlas page eviction");
     assert_eq!(text.atlas.rasterized(), rasterized_before);
@@ -315,14 +315,14 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     let after_reset = GlyphAtlas::of(&text.atlas);
 
     assert!(
-        matches!(damage.plan(&caret_moved, size, clear, swap, after_reset, true), Plan::All(_)),
+        matches!(damage.plan(&caret_moved, size, clear, swap, after_reset, true, false), Plan::All(_)),
         "atlas reset with unchanged instances must redraw whole even with dirty cleared"
     );
     let mut d_reset_partial = Damage::default();
     let before_reset = GlyphAtlas { resets: resets_before, rasterized: rasterized_before, dirty_rows: false, pending_fills: false };
-    let _ = d_reset_partial.plan(&caret_moved, size, clear, swap, before_reset, true);
+    let _ = d_reset_partial.plan(&caret_moved, size, clear, swap, before_reset, true, false);
     assert!(
-        matches!(d_reset_partial.plan(&with_new_glyph, size, clear, swap, after_reset, true), Plan::All(_)),
+        matches!(d_reset_partial.plan(&with_new_glyph, size, clear, swap, after_reset, true, false), Plan::All(_)),
         "atlas reset must redraw whole even when another instance also changed"
     );
 
@@ -333,7 +333,7 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     let clean = GlyphAtlas { resets: 3, rasterized: 10, dirty_rows: false, pending_fills: false };
     let icon_dirty = GlyphAtlas { dirty_rows: true, ..clean };
     let mut d_icon = Damage::default();
-    let _ = d_icon.plan(&icon_a, size, clear, swap, clean, true);
+    let _ = d_icon.plan(&icon_a, size, clear, swap, clean, true, false);
     assert!(d_icon.can_patch_loop(&icon_b, &[0], size, clear, swap, icon_dirty).is_ok());
     assert!(d_icon.can_patch_loop(&icon_a, &[0], size, clear, swap, icon_dirty).is_err());
     assert!(d_icon.can_patch_loop(&icon_a, &[], size, clear, swap, icon_dirty).is_err());
@@ -341,7 +341,201 @@ fn glyph_atlas_changes_force_full_redraw_without_breaking_partial_updates() {
     assert!(d_icon.can_patch_loop(&icon_b, &[0], size, clear, swap, GlyphAtlas { resets: 4, ..clean }).is_err());
     assert!(d_icon.can_patch_loop(&icon_b, &[0], size, clear, swap, GlyphAtlas { rasterized: 11, ..clean }).is_err());
     assert!(
-        matches!(d_icon.plan(&icon_b, size, clear, swap, icon_dirty, true), Plan::Part { .. }),
+        matches!(d_icon.plan(&icon_b, size, clear, swap, icon_dirty, true, false), Plan::Part { .. }),
         "animated icon UV flip with dirty rows must stay partial"
     );
+}
+
+/// A page: the root's fill, a bar over the top, and rows of rounded cards in a viewport below it,
+/// scrolled `dy` up.
+fn page(dy: f32, size: (u32, u32)) -> Vec<Instance> {
+    let plain = |rect: [f32; 4], fill: [f32; 4]| Instance { rect, fill, params: [0.0, KIND_RECT, 0.0, 1.0], clip: NO_CLIP, ..Instance::zeroed() };
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let mut list = vec![plain([0.0, 0.0, w, h], [0.1, 0.1, 0.1, 1.0]), plain([0.0, 0.0, w, 32.0], [0.2, 0.2, 0.25, 1.0])];
+    for row in 0..6 {
+        for col in 0..4 {
+            list.push(Instance {
+                rect: [8.0 + col as f32 * 62.0, 40.0 + row as f32 * 40.0 - dy, 54.0, 32.0],
+                radii: [6.0; 4],
+                fill: [0.2 + 0.1 * col as f32, 0.3 + 0.1 * row as f32, 0.5, 1.0],
+                params: [0.0, KIND_RECT, 0.0, 1.0],
+                clip: [0.0, 32.0, w, h],
+                ..Instance::zeroed()
+            });
+        }
+    }
+    list
+}
+
+#[test]
+fn a_scroll_copies_what_moved_and_redraws_what_came_in() {
+    let size = (256, 192);
+    let Some((shift, rects)) = scrolled(&page(0.0, size), &page(12.0, size), size) else { panic!("a whole-pixel scroll copies") };
+    // The viewport (0, 32)-(256, 192) moved 12 up: rows 44.. go to 32.., the last 12 rows come in.
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    assert!(rects.iter().any(|r| r[1] <= 180 && r[3] >= 192 && r[0] == 0 && r[2] >= 256), "the strip that came in redraws: {rects:?}");
+    // The root's fill lies under everything and shades the copy alike; the bar is outside it.
+    assert!(!rects.iter().any(|r| r[0] <= 128 && 128 < r[2] && r[1] <= 100 && 100 < r[3]), "the middle is copied, not redrawn: {rects:?}");
+
+    // Half a pixel: the copy can't move pixels that far.
+    assert!(scrolled(&page(0.0, size), &page(12.5, size), size).is_none());
+
+    // A card that fades redraws where it was and is, and the rest still copies.
+    let (mut old, mut new) = (page(0.0, size), page(12.0, size));
+    old[7].fade = [1, 0, 0, 0];
+    new[7].fade = [1, 0, 0, 0];
+    let (_, rects) = scrolled(&old, &new, size).expect("the rest still copies");
+    let b = bounds(&new[7], size).unwrap();
+    assert!(rects.iter().any(|r| r[0] <= b[0] && r[1] <= b[1] && r[2] >= b[2] && r[3] >= b[3]), "{rects:?} misses the faded card {b:?}");
+
+    // Something drawn over the viewport that stays put redraws where it is and where its copy lands.
+    let badge = Instance { rect: [100.0, 120.0, 20.0, 20.0], fill: [1.0, 0.0, 0.0, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip: NO_CLIP, ..Instance::zeroed() };
+    let (mut old, mut new) = (page(0.0, size), page(12.0, size));
+    old.push(badge);
+    new.push(badge);
+    let (_, rects) = scrolled(&old, &new, size).expect("the rest still copies");
+    let b = bounds(&badge, size).unwrap();
+    for (y0, y1) in [(b[1], b[3]), (b[1] - 12, b[3] - 12)] {
+        assert!(rects.iter().any(|r| r[0] <= b[0] && r[1] <= y0 && r[2] >= b[2] && r[3] >= y1), "{rects:?} misses the badge at {y0}..{y1}");
+    }
+}
+
+/// A scrolled frame drawn partially (the kept frame copied, then what came in redrawn) holds the
+/// same bytes as the frame drawn whole.
+#[test]
+fn a_scrolled_partial_frame_matches_the_whole_frame() {
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    let gpu = Gpu::headless();
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let size = (256, 192);
+    let mut text = crate::text::TextSystem::new(&[], ("Inter", "Inter"));
+    let clear = [0.1, 0.1, 0.1, 1.0];
+    let target = Offscreen::new(device, size.0, size.1);
+    let mut renderer = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut damage = Damage::default();
+    // Whole, then unchanged (which draws the kept frame), then scrolled 12 up.
+    for (n, list) in [page(0.0, size), page(0.0, size), page(12.0, size)].into_iter().enumerate() {
+        renderer.prepare(device, queue, &mut text.atlas, &list, size);
+        let plan = damage.plan(&list, size, clear, 0, GlyphAtlas::default(), true, true);
+        match (n, &plan) {
+            (0, Plan::All(_)) | (1, Plan::Part { shift: None, .. }) | (2, Plan::Part { shift: Some(_), .. }) => {}
+            _ => panic!("frame {n}: {plan:?}"),
+        }
+        if let Plan::Part { draw, shift, .. } = plan {
+            renderer.arm_damage(device, queue, &draw, clear, size, OFFSCREEN_FORMAT, shift.map(|s| (s.from, s.to)));
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, clear);
+        renderer.damage_drawn().ok();
+        target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+    }
+    let partial = target.read(device);
+    let whole_target = Offscreen::new(device, size.0, size.1);
+    let mut whole = Renderer::new(device, OFFSCREEN_FORMAT);
+    whole.prepare(device, queue, &mut text.atlas, &page(12.0, size), size);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    whole.draw(&mut encoder, &whole_target.view, clear);
+    whole_target.copy(&mut encoder);
+    queue.submit([encoder.finish()]);
+    assert!(partial == whole_target.read(device), "the scrolled partial frame differs from the whole one");
+}
+
+/// `page`, with each row in a clip of its own that the viewport's edge cuts, as a row of cards
+/// that scrolls sideways has.
+fn rows(dy: f32, size: (u32, u32)) -> Vec<Instance> {
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let mut list = page(dy, size);
+    for (n, card) in list.iter_mut().enumerate().skip(2) {
+        let top = 40.0 + ((n - 2) / 4) as f32 * 40.0 - dy;
+        card.clip = [0.0, (top - 4.0).max(32.0), w, (top + 36.0).min(h).max(32.0)];
+    }
+    list
+}
+
+#[test]
+fn a_row_the_viewport_cuts_is_copied_too() {
+    let size = (256, 192);
+    let (shift, rects) = scrolled(&rows(0.0, size), &rows(12.0, size), size).expect("a whole-pixel scroll copies");
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    // The first row's clip stops at the viewport's top, the last row's at its bottom: neither
+    // moved with its cards, and both let through the same copied pixels as before.
+    assert_eq!(rects, vec![[0, 180, 256, 192]], "only the strip that came in redraws");
+    // A clip that lets other pixels through than it did redraws its card.
+    let mut new = rows(12.0, size);
+    new[10].clip[2] = 100.0;
+    let (_, rects) = scrolled(&rows(0.0, size), &new, size).expect("the rest still copies");
+    let b = bounds(&rows(12.0, size)[10], size).unwrap();
+    assert!(rects.iter().any(|r| r[1] <= b[1] && r[3] >= b[3]), "{rects:?} misses the card whose clip changed");
+}
+
+#[test]
+fn a_scroll_past_a_row_that_came_into_the_list_still_copies() {
+    let size = (256, 192);
+    let old = rows(0.0, size);
+    // Twelve instances more in the middle of the list (a row mounted outside the viewport): the
+    // lists meet again further on than a few instances.
+    let extra = (0..12).map(|n| Instance { rect: [8.0 + n as f32 * 20.0, -400.0, 16.0, 16.0], fill: [0.5, 0.5, 0.5, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip: [0.0, 32.0, 256.0, 192.0], ..Instance::zeroed() });
+    let moved = rows(12.0, size);
+    let new: Vec<Instance> = moved[..10].iter().copied().chain(extra).chain(moved[10..].iter().copied()).collect();
+    let (shift, rects) = scrolled(&old, &new, size).expect("the rows still copy");
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    assert_eq!(rects, vec![[0, 180, 256, 192]], "only the strip that came in redraws");
+}
+
+#[test]
+fn far_apart_changes_stay_apart() {
+    // A strip at the bottom, a label at the top and scattered glyphs between: more than the
+    // rectangles there are, and none of them joins the strip to the label.
+    let mut each = vec![[0, 1040, 1920, 1080], [42, 67, 294, 119]];
+    each.extend((0..12).map(|n| [100 + n * 150, 300 + (n % 3) * 200, 112 + n * 150, 314 + (n % 3) * 200]));
+    let rects = gathered_apart(&mut each);
+    assert!(rects.len() <= SCROLL_RECTS);
+    assert!(rects.iter().map(|r| area(*r)).sum::<u32>() < 1920 * 1080 / 2, "{rects:?}");
+    for e in &each { assert!(rects.iter().any(|r| r[0] <= e[0] && r[1] <= e[1] && r[2] >= e[2] && r[3] >= e[3]), "{rects:?} misses {e:?}"); }
+}
+
+/// Frames scrolled back and forth, drawn as the hosts draw them (what moved copied through the
+/// drawable into the rolled kept frame, what came in redrawn, a frame that changed too much drawn
+/// whole into the kept frame), each hold the same bytes as that frame drawn whole.
+#[test]
+fn scrolled_frames_match_whole_frames() {
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    let gpu = Gpu::headless();
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let size = (256, 192);
+    let mut text = crate::text::TextSystem::new(&[], ("Inter", "Inter"));
+    let clear = [0.1, 0.1, 0.1, 1.0];
+    let target = Offscreen::new(device, size.0, size.1);
+    let whole_target = Offscreen::new(device, size.0, size.1);
+    let mut renderer = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut whole = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut damage = Damage::default();
+    let mut shifted = 0;
+    // Down in steps, further than the viewport is tall in all (the roll wraps), back up, a jump
+    // (drawn whole), and on from there.
+    for (n, dy) in [0.0, 0.0, 12.0, 30.0, 30.0, 61.0, 75.0, 40.0, 3.0, 0.0, 170.0, 150.0, 151.0].into_iter().enumerate() {
+        let list = rows(dy, size);
+        renderer.prepare(device, queue, &mut text.atlas, &list, size);
+        match damage.plan(&list, size, clear, 0, GlyphAtlas::default(), true, true) {
+            Plan::Part { draw, shift, .. } => {
+                shifted += usize::from(shift.is_some());
+                renderer.arm_damage(device, queue, &draw, clear, size, OFFSCREEN_FORMAT, shift.map(|s| (s.from, s.to)));
+                renderer.cull_armed(&list, size);
+            }
+            Plan::All(_) => renderer.arm_whole(device, queue, clear, size, OFFSCREEN_FORMAT),
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, clear);
+        assert_eq!(renderer.damage_drawn(), Ok(()), "frame {n}");
+        target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        whole.prepare(device, queue, &mut text.atlas, &list, size);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        whole.draw(&mut encoder, &whole_target.view, clear);
+        whole_target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        assert!(target.read(device) == whole_target.read(device), "frame {n} (scrolled {dy}) differs from the whole one");
+    }
+    assert!(shifted >= 5, "the scrolls copied: {shifted}");
 }

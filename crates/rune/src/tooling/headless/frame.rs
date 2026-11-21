@@ -257,8 +257,17 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         {
             let rt = self.app.rt();
             let in_place = s.alpha.is_none() && !images_changed;
-            if let crate::window::damage::Plan::Part { draw, .. } = s.damage.plan(&rt.instances, (s.wp, s.hp), rt.clear_color(), s.target_made, crate::window::damage::GlyphAtlas::of(&rt.text.atlas), in_place) {
-                s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format);
+            let plan = s.damage.plan(&rt.instances, (s.wp, s.hp), rt.clear_color(), s.target_made, crate::window::damage::GlyphAtlas::of(&rt.text.atlas), in_place, true);
+            match plan {
+                crate::window::damage::Plan::Part { draw, shift, same, .. } => {
+                    s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format, shift.map(|s| (s.from, s.to)));
+                    if same { s.renderer.arm_same(); } else { s.renderer.cull_armed(&rt.instances, (s.wp, s.hp)); }
+                }
+                // Whole, but into the kept frame, so the next frame may redraw part of it.
+                crate::window::damage::Plan::All(_) if s.alpha.is_none() && !crate::window::damage::whole_frames() => {
+                    s.renderer.arm_whole(&s.gpu.device, &s.gpu.queue, rt.clear_color(), (s.wp, s.hp), s.target_format);
+                }
+                crate::window::damage::Plan::All(_) => {}
             }
         }
         let in_range = self.k >= s.start_frame && self.k < s.start_frame + s.frames;
@@ -342,12 +351,20 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         let s = &mut *self.state;
         s.reports.drawn(self.encoded_stamp, None, self.frame_start, info.update_ms);
         let ms = self.frame_start.elapsed().as_secs_f64() * 1000.0;
+        if s.has_comp {
+            // Pace like a display link so a compositor's async readbacks (GPU timers) land between frames.
+            rune_gpu::health::poll(&s.gpu.device, wgpu::PollType::wait_indefinitely()).ok();
+            s.in_flight.clear();
+        }
         #[cfg(feature = "frame-profile")]
         {
             // Convert the frame's raw CPU mark before taking phase deltas so that once Windows'
             // cycle rate is known here, `take()` sees the cached rate for every phase too.
             let cpu_ms = frame_cpu_ms(self.fp_cpu0, crate::frame::profile::thread_cpu_since);
             let phases = crate::frame::profile::take();
+            // The frame's wall time until the GPU had drawn it, less `ms`: on a software rasteriser with no
+            // threads of its own (lavapipe, `LP_NUM_THREADS=0`), what drawing the frame's pixels cost.
+            let gpu_wait_ms = self.frame_start.elapsed().as_secs_f64() * 1000.0 - ms;
             let rt = self.app.rt_mut();
             s.profile.push(crate::frame::profile::Row {
                 phases,
@@ -360,16 +377,12 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 shaped: rt.stats.shaped,
                 animating: info.animating,
                 cpu_ms,
+                gpu_wait_ms,
             });
         }
         s.cpu_ms.push(ms);
         if self.k > 0 {
             if info.animating { s.anim_ms.push(ms) } else { s.rest_ms.push(ms) }
-        }
-        if s.has_comp {
-            // Pace like a display link so a compositor's async readbacks (GPU timers) land between frames.
-            rune_gpu::health::poll(&s.gpu.device, wgpu::PollType::wait_indefinitely()).ok();
-            s.in_flight.clear();
         }
         if let Some(tr) = s.trace.as_mut() {
             tr.frame_timed_core(self.app.rt_mut(), self.real_t * 1000.0, ms, FrameTiming::default());
