@@ -860,9 +860,9 @@ fn shown(scene: &rune_motion::Scene, id: NodeId) -> Option<Shown> {
 }
 
 /// What a node's own fields say: paint reads nothing for it that changes without a new epoch
-/// or a scene value.
+/// or a scene value. (A text field's editing state does: `dynamic_ok` reads it each paint.)
 fn static_ok(n: &Node) -> bool {
-    n.input.is_none() && !n.ime_cursor && n.scroll.is_none() && n.looping.is_none() && n.live.is_empty()
+    !n.ime_cursor && n.scroll.is_none() && n.looping.is_none() && n.live.is_empty()
         && n.vis.surface.is_none() && n.material.is_none() && !n.vis_flags.cache() && !n.vis_flags.raise()
         && n.vis.backdrop_blur <= 0.0 && n.vis.effect.is_none()
         && n.sticky.is_none() && n.above.is_none() && n.matched.is_none()
@@ -874,7 +874,12 @@ fn static_ok(n: &Node) -> bool {
 /// settling and folds.
 fn dynamic_ok(rt: &RuntimeCore, i: usize, sel: &[(usize, usize, usize)], marks: &[(usize, usize, usize)]) -> bool {
     let id = rt.tree.nodes[i].id;
-    !sel.iter().any(|r| r.0 == i) && !marks.iter().any(|r| r.0 == i)
+    // A text field at rest paints its placeholder and nothing else: no caret, selection,
+    // composition or spelling marks, and no scroll of its own. Focused, or holding text, it paints
+    // from editing state that changes under it, and its text laid out again each paint was the
+    // dearest node of a frame nothing typed in.
+    let field_rests = rt.tree.nodes[i].input.as_ref().is_none_or(|f| !f.edit.focused && f.edit.text.is_empty() && f.edit.preedit().is_none());
+    field_rests && !sel.iter().any(|r| r.0 == i) && !marks.iter().any(|r| r.0 == i)
         && !rt.motion.reveal_fading(id)
         && !rt.motion.has_loop(id)
         && (rt.paint.static_scales.is_empty() || !rt.paint.static_scales.contains_key(&id))
