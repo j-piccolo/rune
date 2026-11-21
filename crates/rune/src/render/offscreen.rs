@@ -132,3 +132,19 @@ pub fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -
     w.write_image_data(rgba).map_err(std::io::Error::other)?;
     Ok(())
 }
+
+/// Draws `rt`'s last frame into a new offscreen target `size` device pixels big and reads it
+/// back: tightly packed RGBA8, as the renderer's target format encodes it. For an app that
+/// renders its own views to images (a screenshot tool, a golden): run `rt.frame(..)` first.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn snapshot<S: 'static>(gpu: &super::Gpu, renderer: &mut super::Renderer, rt: &mut crate::Runtime<S>, size: (u32, u32)) -> Vec<u8> {
+    let target = Offscreen::with_format(&gpu.device, size.0.max(1), size.1.max(1), renderer.format());
+    let core = rt.core_mut();
+    renderer.attach_text(&mut core.text.atlas);
+    crate::frame::host_step::prepare_gpu_resources(renderer, gpu, core, size, false);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &target.view, core, size, [0.0; 4]);
+    target.copy(&mut encoder);
+    renderer.submit(&gpu.queue, encoder);
+    target.read(&gpu.device)
+}
