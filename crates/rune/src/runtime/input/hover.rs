@@ -13,6 +13,9 @@ pub(in crate::runtime) struct HoverHold {
     hold: Hold,
     /// Scratch for the hover tracks `update_interaction` would change.
     flips: Vec<Flip>,
+    /// Every element's hover track as `refresh_hover_tracks` found it deciding the hold, in tree
+    /// order, for the `update_interaction_tracked` that follows it at once.
+    tracks: Vec<Flip>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,14 +104,34 @@ impl RuntimeCore {
     /// Hover under the pointer at (x, y): what's hovered and what it's inside. Returns whether
     /// moving layout holds hover this pass, for the `update_interaction` that follows.
     pub(in crate::runtime) fn refresh_hover(&mut self, x: f32, y: f32) -> bool {
+        self.refresh_hover_tracks(x, y).0
+    }
+
+    /// `refresh_hover`, and whether deciding the hold looked at every element's hover track
+    /// (`hover_flip`): they are then kept for an `update_interaction_tracked` that follows before
+    /// anything they read changes (the pointer, the tree, what paint drew, a hover's target), so
+    /// a paint looks at each element once where the two passes looked twice.
+    pub(in crate::runtime) fn refresh_hover_tracks(&mut self, x: f32, y: f32) -> (bool, bool) {
         if self.pointer.hover_hold.released() && !self.layout_moving() { self.pointer.hover_hold.settled(); }
         let hovered = self.hover_target(x, y);
         let within = self.within_next();
-        let held = self.decide_hold(hovered, within.as_ref(), None);
+        let (held, tracked) = match self.hold_before_tracks(hovered, within.as_ref()) {
+            Some(held) => (held, false),
+            None => {
+                let mut tracks = std::mem::take(&mut self.pointer.hover_hold.tracks);
+                tracks.clear();
+                let top = self.pointer.pos.and_then(|(x, y)| self.top_hover_hit(x, y));
+                let (captured, alone, shared) = (self.pointer.captured_path(), self.hovered_alone_at(top), self.shared_hovered_at(top));
+                tracks.extend(self.tree.hovers.iter().filter_map(|&i| self.hover_flip(i as usize, top, captured, alone, &shared)));
+                let held = tracks.iter().any(|f| f.changed && !f.now && self.layout_carries(f.i));
+                self.pointer.hover_hold.tracks = tracks;
+                (held, true)
+            }
+        };
         self.pointer.hover_hold.set_held(held);
         if let Some((inside, _)) = within { self.apply_within(inside, held); }
         self.apply_hovered(hovered, held);
-        held
+        (held, tracked)
     }
 
     /// Queue `on_hover_change` for elements the pointer entered or left.
@@ -192,28 +215,36 @@ impl RuntimeCore {
     /// change: the pointer may hold, and layout carries an element whose `hovered`,
     /// `hover_within` or hover track would change. `flips` are the track changes when known.
     fn decide_hold(&self, hovered: Option<usize>, within: Option<&Within>, flips: Option<&[Flip]>) -> bool {
-        if !self.pointer.hover_may_hold() { return false; }
+        if let Some(held) = self.hold_before_tracks(hovered, within) { return held; }
         let carried = |i: usize| self.layout_carries(i);
-        let was = |p: &str| self.hover_live(p).is_some_and(carried);
-        if hovered.map(|i| self.tree.nodes[i].path.as_str()) != self.pointer.hovered.as_deref()
-            && (hovered.is_some_and(carried) || self.pointer.hovered.as_deref().is_some_and(was))
-        {
-            return true;
-        }
-        if let Some((inside, entering)) = within
-            && (entering.iter().any(|&i| carried(i)) || self.pointer.hover_within.iter().any(|p| !inside.contains(p) && was(p)))
-        {
-            return true;
-        }
         let held = |f: &Flip| f.changed && !f.now && carried(f.i);
         match flips {
             Some(flips) => flips.iter().any(held),
             None => {
                 let top = self.pointer.pos.and_then(|(x, y)| self.top_hover_hit(x, y));
                 let (captured, alone, shared) = (self.pointer.captured_path(), self.hovered_alone_at(top), self.shared_hovered_at(top));
-                (0..self.tree.nodes.len()).filter_map(|i| self.hover_flip(i, top, captured, alone, &shared)).any(|f| held(&f))
+                self.tree.hovers.iter().filter_map(|&i| self.hover_flip(i as usize, top, captured, alone, &shared)).any(|f| held(&f))
             }
         }
+    }
+
+    /// `decide_hold` as far as `hovered` and `hover_within` say: the hold, or None where the hover
+    /// tracks decide it.
+    fn hold_before_tracks(&self, hovered: Option<usize>, within: Option<&Within>) -> Option<bool> {
+        if !self.pointer.hover_may_hold() { return Some(false); }
+        let carried = |i: usize| self.layout_carries(i);
+        let was = |p: &str| self.hover_live(p).is_some_and(carried);
+        if hovered.map(|i| self.tree.nodes[i].path.as_str()) != self.pointer.hovered.as_deref()
+            && (hovered.is_some_and(carried) || self.pointer.hovered.as_deref().is_some_and(was))
+        {
+            return Some(true);
+        }
+        if let Some((inside, entering)) = within
+            && (entering.iter().any(|&i| carried(i)) || self.pointer.hover_within.iter().any(|p| !inside.contains(p) && was(p)))
+        {
+            return Some(true);
+        }
+        None
     }
 
     /// Node `n` leaves the tree: if it heard the pointer enter, its `on_hover_change` still
@@ -440,6 +471,12 @@ impl RuntimeCore {
     /// Retargets the hover, press and press-scale tracks. `held` is the hold `refresh_hover`
     /// just decided; without it (a commit's pass) this decides it.
     pub(in crate::runtime) fn update_interaction(&mut self, held: Option<bool>) -> bool {
+        self.update_interaction_tracked(held, false)
+    }
+
+    /// `update_interaction`. `tracked`: the `refresh_hover_tracks` just before it kept every
+    /// element's hover track, which are taken as they are.
+    pub(in crate::runtime) fn update_interaction_tracked(&mut self, held: Option<bool>, tracked: bool) -> bool {
         // Hit tests read last frame's drawn rects and clips by index. When a commit moved the
         // indices (a commit's focus pass runs before the frame is built again), they belong to
         // other elements until the build re-evaluates from fresh geometry.
@@ -449,16 +486,30 @@ impl RuntimeCore {
         let mut changed = false;
         let mut flips = std::mem::take(&mut self.pointer.hover_hold.flips);
         let top = self.pointer.pos.and_then(|(x, y)| self.top_hover_hit(x, y));
+        let tracks = tracked.then(|| std::mem::take(&mut self.pointer.hover_hold.tracks));
         let captured = self.pointer.captured_path();
-        let alone = self.hovered_alone_at(top);
-        let shared = self.shared_hovered_at(top);
-        for i in 0..self.tree.nodes.len() {
+        let (alone, shared) = if tracked { (None, Vec::new()) } else { (self.hovered_alone_at(top), self.shared_hovered_at(top)) };
+        let mut at = 0;
+        // Only the elements with a hover or press track (`TreeState::hovers`): the rest have
+        // nothing here to retarget.
+        debug_assert!(self.hovers_listed(), "a node's hover or press style changed without the tree changing");
+        let hovers = std::mem::take(&mut self.tree.hovers);
+        for &i in &hovers {
+            let i = i as usize;
             let n = &self.tree.nodes[i];
             let press_scale = n.handlers.get().and_then(|h| h.press_scale);
             let press_offset = n.handlers.get().and_then(|h| h.press_offset);
             if !n.vis.tracks_hover_paint() && !n.vis_flags.hover_group() && !n.vis.tracks_press() && press_scale.is_none() && press_offset.is_none() { continue; }
             if self.subtree_exiting(i) { continue; }
-            match self.hover_flip(i, top, captured, alone, &shared) {
+            let flip = match &tracks {
+                // In tree order, as this loop goes: the one found for this element, if one was.
+                Some(tracks) => {
+                    while tracks.get(at).is_some_and(|f| f.i < i) { at += 1; }
+                    tracks.get(at).filter(|f| f.i == i).copied()
+                }
+                None => self.hover_flip(i, top, captured, alone, &shared),
+            };
+            match flip {
                 Some(f) if f.changed => flips.push(f),
                 // Default hover animations inherit velocity and have no completion token.
                 // An unchanged target preserves its trajectory in the store already; avoid
@@ -512,6 +563,7 @@ impl RuntimeCore {
                 }
             }
         }
+        self.tree.hovers = hovers;
         let held = held.unwrap_or_else(|| {
             let within = self.within_next();
             let hovered = self.pointer.pos.filter(|_| self.pointer.hover_may_hold()).and_then(|(x, y)| self.hover_target(x, y));
@@ -533,6 +585,7 @@ impl RuntimeCore {
             changed = true;
         }
         self.pointer.hover_hold.flips = flips;
+        if let Some(tracks) = tracks { self.pointer.hover_hold.tracks = tracks; }
         self.pointer.hover_hold.set_held(held);
         changed
     }

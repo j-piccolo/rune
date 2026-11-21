@@ -615,6 +615,10 @@ pub(crate) struct TreeState {
     pub(in crate::runtime) has_dissolve: bool,
     /// Some element is `El::raise`d: paint order isn't tree order.
     pub(in crate::runtime) has_raise: bool,
+    /// The elements with a hover or press track (a hover fill, a hover group, a press tint or a
+    /// press scale), in tree order: all a frame's hover and press passes look at, where walking
+    /// every node for them cost each pass as much as painting a row.
+    pub(in crate::runtime) hovers: Vec<u32>,
     /// Some element sets `El::paint_order`: its siblings paint out of tree order.
     pub(in crate::runtime) has_paint_order: bool,
     /// Some element is `El::anchored` / `El::above`.
@@ -663,6 +667,7 @@ impl TreeState {
             has_sticky: false,
             has_dissolve: false,
             has_raise: false,
+            hovers: Vec::new(),
             has_paint_order: false,
             has_above: false,
             has_hover_alone: false,
