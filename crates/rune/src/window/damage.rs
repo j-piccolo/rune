@@ -270,6 +270,14 @@ pub(crate) fn whole_frames() -> bool {
     *WHOLE.get_or_init(|| std::env::var_os("RUNE_WHOLE_FRAMES").is_some_and(|v| v == "1"))
 }
 
+/// `RUNE_TARGET_KEEPS=1`: a headless run's target keeps its pixels between frames, and says so
+/// (`Renderer::arm_kept_target`), as a host whose buffers come back with a known frame in them
+/// would. Off, it draws as a window with a swap chain does, through the kept frame and a copy out.
+pub(crate) fn target_keeps() -> bool {
+    static KEEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEPS.get_or_init(|| std::env::var_os("RUNE_TARGET_KEEPS").is_some_and(|v| v == "1"))
+}
+
 type Counts = HashMap<u64, (i32, usize), BuildHasherDefault<Hashed>>;
 
 /// The map's keys are hashes already, mixed once more: FNV's multiply carries only upward, so its

@@ -274,14 +274,19 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             let rt = self.app.rt();
             let in_place = s.alpha.is_none() && !images_changed;
             let plan = s.damage.plan(&rt.instances, (s.wp, s.hp), rt.clear_color(), s.target_made, crate::window::damage::GlyphAtlas::of(&rt.text.atlas), in_place, true);
+            // The target is this run's own and only the renderer draws in it, unless an overlay
+            // draws over the frame: then it keeps the last frame (`RUNE_TARGET_KEEPS=1`).
+            let keeps = crate::window::damage::target_keeps() && s.overlay.is_none();
             match plan {
                 crate::window::damage::Plan::Part { draw, shift, same, .. } => {
                     s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format, shift.map(|s| (s.from, s.to)));
                     if same { s.renderer.arm_same(); } else { s.renderer.cull_armed(&rt.instances, (s.wp, s.hp)); }
+                    if keeps { s.renderer.arm_kept_target(); }
                 }
                 // Whole, but into the kept frame, so the next frame may redraw part of it.
                 crate::window::damage::Plan::All(_) if s.alpha.is_none() && !crate::window::damage::whole_frames() => {
                     s.renderer.arm_whole(&s.gpu.device, &s.gpu.queue, rt.clear_color(), (s.wp, s.hp), s.target_format);
+                    if keeps { s.renderer.arm_kept_target(); }
                 }
                 crate::window::damage::Plan::All(_) => {}
             }
