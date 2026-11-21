@@ -7,6 +7,15 @@ pub(crate) enum Phase { View, Commit, Layout, Text, Paint, Apply }
 #[cfg_attr(not(feature = "frame-profile"), allow(dead_code))]
 pub const PHASES: usize = 6;
 
+/// The stages of a headless frame after its update, each timed in this thread's CPU: readying GPU
+/// resources, planning what to redraw, encoding the draw, submitting it, and waiting for the GPU.
+/// The last two are the graphics API's and the driver's; the rest is this crate's and what it
+/// asks of them as it records.
+#[cfg_attr(not(feature = "frame-profile"), allow(dead_code))]
+pub(crate) const STAGES: usize = 5;
+#[cfg(feature = "frame-profile")]
+const STAGE_NAMES: [&str; STAGES] = ["prep_cpu", "plan_cpu", "draw_cpu", "submit_cpu", "poll_cpu"];
+
 /// CPU consumed by this thread, excluding time the scheduler runs other work. Debug builds
 /// time app callbacks with it for `perf_warn`, and interaction timing its input frames.
 /// On Windows it counts the thread's cycles (`QueryThreadCycleTime`), so short phases read
@@ -54,6 +63,8 @@ pub(crate) use enabled::{Scope, take};
 #[cfg(feature = "frame-profile")]
 pub(crate) struct Row {
     pub phases: [f64; 2 * PHASES],
+    /// CPU per stage after the update (`STAGES`).
+    pub stages: [f64; STAGES],
     pub update_ms: f64,
     pub encode_ms: f64,
     /// Script events delivered before this frame.
@@ -100,6 +111,7 @@ impl Log {
                 "commits": row.commits, "shaped": row.shaped, "animating": row.animating, "gpu_wait_ms": row.gpu_wait_ms,
             });
             if row.commits > 0 { line["why"] = crate::runtime::CommitWhy::names(row.why).into(); }
+            for (name, ms) in STAGE_NAMES.iter().zip(row.stages) { line[*name] = ms.into(); }
             writeln!(out, "{line}").expect("RUNE_FRAME_LOG write");
         }
         self.rows.push(row);
