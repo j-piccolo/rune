@@ -360,6 +360,7 @@ impl RuntimeCore {
             self.marks.extend_from_slice(&k.marks[range(r.inst)]);
         }
         let first = self.instances.len();
+        self.instances.reserve(range(r.inst).len());
         // Help and drop hits count from the hit list.
         let seq = self.hit.hits.len().wrapping_sub(r.hits[0] as usize);
         // Where sticky elements may stick: the viewport's bounds, handed down from the root's
@@ -374,13 +375,15 @@ impl RuntimeCore {
             // no clip above it to cut its hits by.
             if p.cut || (n.vis_flags.no_pixel_snap() && sh.exact != [true; 2]) || n.parent.is_none() { return None; }
             if sh.visible(k.drawn[o + j], k.vp) != k.seen[o + j] { return None; }
-            let (mut down, mut up) = (k.inh[o + j], k.prev_pinh[o + j]);
-            if !sh.passes(&down) || (j > 0 && !sh.passes(&up)) { return None; }
-            sh.carry(&mut down);
-            self.paint.inh_scratch[i + j] = down;
+            // What it inherited, and below the root what it was handed (the root's comes from above).
+            if !sh.passes(&k.inh[o + j]) || (j > 0 && !sh.passes(&k.prev_pinh[o + j])) { return None; }
+            let down = &mut self.paint.inh_scratch[i + j];
+            *down = k.inh[o + j];
+            sh.carry(down);
             if j > 0 {
-                sh.carry(&mut up);
-                k.pinh[i + j] = up;
+                let up = &mut k.pinh[i + j];
+                *up = k.prev_pinh[o + j];
+                sh.carry(up);
             }
             self.paint.drawn[i + j] = sh.drawn(k.drawn[o + j]);
             if let Some(up) = sticky {
