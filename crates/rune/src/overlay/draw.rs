@@ -62,7 +62,12 @@ impl FrameHost for OverlayFrame<'_> {
                 let size = (if w == 0 { self.core.at.size.0 } else { w as f32 }, if h == 0 { self.core.at.size.1 } else { h as f32 });
                 if size != self.core.at.size {
                     self.core.at.size = size;
-                    if let Some(live) = self.core.surface.live_mut() { live.scale = 0.0; }
+                    let blur = self.core.blur;
+                    if let Some(live) = self.core.surface.live_mut() {
+                        live.scale = 0.0;
+                        // A blur of the whole surface follows its size.
+                        if let Backing::Layer(layer) = &mut live.backing { layer.set_blur(blur, size); }
+                    }
                 }
             }
             if let Some(scale) = changes.scale {
@@ -451,14 +456,29 @@ impl OverlayCore {
         match input {
             Input::Move(x, y) => {
                 let zoom = app.rt().zoom();
+                self.layer_pointer = Some((x / zoom, y / zoom));
                 self.dirty |= app.observe_pointer(x / zoom, y / zoom);
                 return;
             }
-            Input::Leave => app.rt_mut().pointer_leave(),
-            Input::Button(down) => if let Some((x, y)) = app.rt().pointer() {
-                if down { app.pointer_down(x, y); } else { app.pointer_up(x, y); }
+            Input::Leave => {
+                self.layer_pointer = None;
+                app.rt_mut().pointer_leave();
+            }
+            Input::Button(down) => {
+                // The app's hook hears where every press lands before the view does.
+                app.button_hook(down);
+                if let Some((x, y)) = self.pointer_at(app) {
+                    if down { app.pointer_down(x, y); } else { app.pointer_up(x, y); }
+                }
+            }
+            Input::Other(button, down) => if let Some((x, y)) = self.pointer_at(app) {
+                if down { app.button_down(x, y, button); } else { app.button_up(x, y, button); }
             },
-            Input::Secondary(down) => if let Some((x, y)) = app.rt().pointer() { if down { app.rt_mut().secondary_down(x, y) } else { app.secondary_up(x, y) } },
+            Input::Wheel { delta, phase } => {
+                let scale = self.surface.live().map_or(1.0, |l| l.scale);
+                crate::input::host_events::wheel(app.rt_mut(), delta, phase, scale, self.mods);
+            }
+            Input::Secondary(down) => if let Some((x, y)) = self.pointer_at(app) { if down { app.rt_mut().secondary_down(x, y) } else { app.secondary_up(x, y) } },
             Input::Focus(focused) => {
                 app.window_focus(focused);
                 app.rt_mut().ignore_minimize("an overlay");
@@ -479,6 +499,17 @@ impl OverlayCore {
             }
         }
         self.dirty = true;
+    }
+
+    /// Where a press on the layer surface lands. The runtime forgets the pointer when its window
+    /// loses the keyboard, waiting for a move; a layer surface loses it to another of the app's
+    /// surfaces (a sheet it opened) while the pointer stays put over it, and the compositor
+    /// sends no move before the next press. That press is where the pointer last moved.
+    fn pointer_at(&mut self, app: &mut dyn OverlayApp) -> Option<(f32, f32)> {
+        if app.rt().pointer().is_none() && let Some((x, y)) = self.layer_pointer {
+            self.dirty |= app.observe_pointer(x, y);
+        }
+        app.rt().pointer()
     }
 
     /// Opens the pop-up menu a handler asked for over the overlay's panel. A hidden or occluded
