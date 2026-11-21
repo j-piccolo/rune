@@ -27,7 +27,10 @@ impl RuntimeCore {
         let (mut dissolve, mut cache, mut pix, mut drawn_ly, mut key_up, mut sticky, mut raise, mut any_loop) =
             (false, false, false, false, false, false, false, false);
         let (mut ordered, mut hover_alone, mut hover_share) = (false, false, false);
-        for n in &self.tree.nodes {
+        let mut hovers = std::mem::take(&mut self.tree.hovers);
+        hovers.clear();
+        for (i, n) in self.tree.nodes.iter().enumerate() {
+            if tracks_pointer(n) { hovers.push(i as u32); }
             dissolve |= n.vis_flags.blend() == crate::render::Blend::PlusLighter;
             cache |= n.vis_flags.cache();
             if let Some(c) = n.cold.get() {
@@ -49,10 +52,17 @@ impl RuntimeCore {
         self.tree.has_key_up = key_up;
         self.tree.has_sticky = self.holding() || sticky;
         self.tree.has_raise = raise;
+        self.tree.hovers = hovers;
         self.tree.has_paint_order = ordered;
         self.tree.has_hover_alone = hover_alone;
         self.tree.has_hover_share = hover_share;
         any_loop
+    }
+
+    /// Debug builds: `TreeState::hovers` is what the nodes say now. A node's hover and press
+    /// styles come from its element, so they change only as the tree does, which lists them again.
+    pub(in crate::runtime) fn hovers_listed(&self) -> bool {
+        self.tree.hovers.iter().map(|&i| i as usize).eq(self.tree.nodes.iter().enumerate().filter(|(_, n)| tracks_pointer(n)).map(|(i, _)| i))
     }
 
     pub(in crate::runtime) fn prune_detached_tables(&mut self, prune_paths: bool) -> bool {
@@ -108,4 +118,9 @@ impl RuntimeCore {
             self.frame.live.pruned(keep);
         }
     }
+}
+
+/// Whether `n` has a hover or press track for a frame's interaction pass to retarget.
+fn tracks_pointer(n: &Node) -> bool {
+    n.vis.hover().a > 0.0 || n.vis_flags.hover_group() || n.vis.tracks_press() || n.handlers.get().is_some_and(|h| h.press_scale.is_some())
 }
