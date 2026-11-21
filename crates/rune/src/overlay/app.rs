@@ -40,6 +40,9 @@ pub(super) trait OverlayApp {
     fn compositor_features(&self) -> wgpu::Features;
     fn compositor_animating(&self) -> bool;
     fn render_compositor(&mut self, args: OverlayRenderArgs<'_>) -> bool;
+    /// A primary press (true) or release on the surface, before the runtime hears it
+    /// (`ConfiguredOverlay::on_button`).
+    fn button_hook(&mut self, down: bool);
 }
 
 impl dyn OverlayApp + '_ {
@@ -155,6 +158,7 @@ pub(super) struct TypedOverlayApp<T: 'static> {
     pub(super) compositor: Option<Box<dyn Compositor<T>>>,
     pub(super) setup: Option<fn(&mut T, Waker)>,
     pub(super) shared: Arc<Shared<T>>,
+    pub(super) on_button: Option<fn(&mut T, bool)>,
 }
 
 impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
@@ -212,6 +216,10 @@ impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
         c.render(&mut f);
         c.animating()
     }
+
+    fn button_hook(&mut self, down: bool) {
+        if let Some(hook) = self.on_button { hook(&mut self.rt.state, down); }
+    }
 }
 
 /// Non-generic overlay host stored in `App::overlays` and `Windows::hosts`.
@@ -227,11 +235,12 @@ fn build_parts<S, T: 'static>(
 ) -> (OverlayCore, TypedOverlayApp<T>, OverlayHandle<T>) {
     let ConfiguredOverlay {
         spec, options, on_key, on_created, poll, compositor, setup, runtime, macos_level,
-        animate_reveal, release_after,
+        animate_reveal, release_after, fonts, on_button,
     } = configured;
     let shared_core = Arc::new(SharedCore::default());
     let shared = Arc::new(Shared { core: shared_core.clone(), updates: Default::default() });
-    let text = TextSystem::for_window(app.fonts, app.families);
+    let (fonts, families) = fonts.unwrap_or((app.fonts, app.families));
+    let text = TextSystem::for_window(fonts, families);
     let mut rt = Runtime::with_text(state, spec.view, spec.size, Env::default(), text);
     rt.configure(runtime);
     rt.on_key = on_key;
@@ -254,7 +263,7 @@ fn build_parts<S, T: 'static>(
         animate_reveal,
         release_after,
     );
-    let typed = TypedOverlayApp { rt, compositor, setup, shared: shared.clone() };
+    let typed = TypedOverlayApp { rt, compositor, setup, shared: shared.clone(), on_button };
     (core, typed, OverlayHandle { shared })
 }
 
@@ -338,6 +347,7 @@ impl<T: 'static> OverlayApp for BorrowOverlayApp<'_, T> {
         c.render(&mut f);
         c.animating()
     }
+    fn button_hook(&mut self, _down: bool) {}
 }
 
 #[cfg(test)]
@@ -359,7 +369,7 @@ macro_rules! with_app {
 impl<T: 'static> Overlay<T> {
     pub(super) fn new<S>(configured: impl Into<ConfiguredOverlay<T>>, state: T, app: &AppSpec<S>) -> (Self, OverlayHandle<T>) {
         let (core, typed, handle) = build_parts(configured.into(), state, app);
-        let TypedOverlayApp { rt, compositor, setup, shared } = typed;
+        let TypedOverlayApp { rt, compositor, setup, shared, .. } = typed;
         (Overlay { core, rt, compositor, setup, shared }, handle)
     }
 

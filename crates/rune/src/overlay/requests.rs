@@ -35,6 +35,12 @@ pub(super) struct Requests {
     pub macos_level: Option<isize>,
     pub exclude_from_capture: Option<bool>,
     pub xwayland_input: Option<bool>,
+    /// `OverlayHandle::set_shell`: a new placement for its shell surface.
+    pub shell: Option<crate::wayland::ShellSurface>,
+    /// `OverlayHandle::set_blur`: the compositor blur behind it, or none.
+    pub blur: Option<Option<crate::wayland::BlurRegion>>,
+    /// `OverlayHandle::close`: it goes for good.
+    pub close: bool,
     /// The `setup` waker fired.
     pub woken: bool,
 }

@@ -116,6 +116,9 @@ pub(crate) enum WakeEvent {
     /// Windows: the GPU a CPU-drawn window was waiting for is made, or failed (`cpu_frame`).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     GpuReady(usize),
+    /// The Wayland shell's connection has something, or an overlay opened at run time waits to
+    /// join the loop (`crate::wayland`); for `Windows`, not one host.
+    Services,
 }
 
 /// What `Windows` needs of a host, whatever its state type: an app window or an overlay.
@@ -181,6 +184,9 @@ impl Windows {
     /// launch's windows.
     fn open_requested(&mut self, event_loop: &ActiveEventLoop) {
         if self.factory.is_some() { return; }
+        // Overlays `crate::wayland::open` made while the app ran.
+        let overlays = crate::overlay::take_opened();
+        if !overlays.is_empty() { self.connect_overlays(overlays, event_loop); }
         loop {
             let specs = crate::windows::flatten(crate::windows::take_opened());
             if specs.is_empty() { return; }
@@ -285,6 +291,10 @@ pub(crate) fn start<S: 'static>(mut spec: WindowSpec<S>, handle: Option<WindowHa
 impl ApplicationHandler<WakeEvent> for Windows {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         let _handling = crate::quit::handling();
+        // What the compositor sent the shell's own objects (outputs, a lock), and the
+        // callbacks that follow them, before any host turns.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if self.factory.is_none() { crate::platform::wayland_shell::turn(); }
         for host in self.hosts.iter_mut().flatten() { host.new_events(event_loop, cause); }
         // Before resumed there are no hosts to clean up.
         if self.factory.is_none() { self.cleanup(event_loop); }
@@ -293,6 +303,19 @@ impl ApplicationHandler<WakeEvent> for Windows {
         let _handling = crate::quit::handling();
         let Some(factory) = self.factory.take() else { return };
         crate::marks::mark("loop.resumed");
+        // An overlay opened while the app runs asks the loop for the turn that connects it.
+        {
+            let proxy = self.proxy.clone();
+            crate::overlay::set_loop_wake(Arc::new(move || { proxy.send_event(WakeEvent::Services).ok(); }));
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if is_wayland(event_loop) {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            if let Ok(handle) = event_loop.display_handle() && let RawDisplayHandle::Wayland(display) = handle.as_raw() {
+                let proxy = self.proxy.clone();
+                crate::platform::wayland_shell::install(display.display, Arc::new(move || { proxy.send_event(WakeEvent::Services).ok(); }));
+            }
+        }
         let primary = event_loop.primary_monitor();
         let displays: Vec<_> = event_loop.available_monitors().map(|m| Display {
             id: Some(crate::DisplayId::from_monitor(m.clone(), is_wayland(event_loop))),
@@ -344,6 +367,11 @@ impl ApplicationHandler<WakeEvent> for Windows {
                 return;
             }
             WakeEvent::Turn => { #[cfg(not(target_arch = "wasm32"))] self.turn(event_loop); return; }
+            // `new_events` already turned the shell's connection; what it opened joins now.
+            WakeEvent::Services => {
+                self.cleanup(event_loop);
+                return;
+            }
         };
         if let Some(Some(host)) = self.hosts.get_mut(slot) {
             host.user_event(event_loop, event);
@@ -368,6 +396,11 @@ impl ApplicationHandler<WakeEvent> for Windows {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let _handling = crate::quit::handling();
+        // What winit read off the socket during this turn for the shell's own queue (outputs, a
+        // lock's events) is heard now: the socket is drained, so the shell's watcher would not
+        // wake the loop for it, and it would wait for whatever woke the loop next (seconds).
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if self.factory.is_none() { crate::platform::wayland_shell::turn(); }
         // Windows, Linux: a later launch handed to this loop (`single_instance`) is served once
         // the app goes on with a window shown. One that came as the app ended (its last window
         // already closing, the quit not started) isn't: the process starts the app again for it.
@@ -408,8 +441,11 @@ impl ApplicationHandler<WakeEvent> for Windows {
         for host in self.hosts.iter_mut().flatten() { host.cancel_menus(); }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(last) = crate::quit::fast_exit_hook() { crate::quit::end_fast(last); }
-        // Surfaces go while winit's display connection is still open (layer surfaces live on it).
+        // Surfaces go while winit's display connection is still open (layer surfaces live on it),
+        // and the shell's connection after them.
         self.hosts.clear();
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        crate::platform::wayland_shell::shutdown();
         crate::marks::mark("windows.dropped");
         crate::clipboard::shutdown();
         if crate::quit::send(crate::quit::Event::Exited).contains(&crate::quit::Effect::Relaunch) {

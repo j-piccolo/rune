@@ -41,6 +41,7 @@ pub mod taskbar;
 pub mod text;
 pub mod tooling;
 pub mod tray;
+pub mod wayland;
 
 pub(crate) use input::cursor;
 pub(crate) use quit::relaunch;
