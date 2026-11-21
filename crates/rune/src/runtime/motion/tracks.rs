@@ -185,7 +185,7 @@ impl MotionState {
 
     #[inline]
     pub(in crate::runtime) fn has_loop(&self, id: NodeId) -> bool {
-        self.loops.contains_key(&id)
+        !self.loops.is_empty() && self.loops.contains_key(&id)
     }
 
     #[inline]
