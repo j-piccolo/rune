@@ -24,4 +24,7 @@ tar -xzf "$tmp/crate.tar.gz" -C "$tmp"
 rm -rf vendor/tiny-skia-path
 mv "$tmp/tiny-skia-path-$version" vendor/tiny-skia-path
 git apply --directory=vendor/tiny-skia-path vendor/tiny-skia-path.patch
-echo "vendor/tiny-skia-path: tiny-skia-path $version + vendor/tiny-skia-path.patch"
+# Its own version, apart from the published one resvg uses beside it: `cargo vendor`, and Nix's
+# vendoring of an app that builds Rune from git, take one package per name and version.
+sed -i "0,/^version = \"$version\"/s//version = \"$version-rune\"/" vendor/tiny-skia-path/Cargo.toml
+echo "vendor/tiny-skia-path: tiny-skia-path $version + vendor/tiny-skia-path.patch, as $version-rune"

@@ -4186,7 +4186,7 @@ dependencies = [
  "serde_json",
  "skrifa",
  "swash",
- "tiny-skia-path 0.11.4",
+ "tiny-skia-path 0.11.4-rune",
  "unicode-segmentation",
  "wasm-bindgen",
  "windows",
@@ -4908,12 +4908,12 @@ dependencies = [
  "cfg-if",
  "log",
  "png 0.17.16",
- "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tiny-skia-path 0.11.4",
 ]
 
 [[package]]
 name = "tiny-skia-path"
-version = "0.11.4"
+version = "0.11.4-rune"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -5142,7 +5142,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tiny-skia-path 0.11.4",
  "xmlwriter",
 ]
 
