@@ -217,7 +217,8 @@ impl El {
     }
     /// The control a [`El::modal`] focuses when it opens, as HTML's `autofocus` attribute in a
     /// dialog: a Cancel button, say. Without one the modal focuses its first text field, else
-    /// its first Tab stop, or itself under [`Cx::web_focus`](crate::Cx::web_focus).
+    /// its first Tab stop, or itself under [`Cx::web_focus`](crate::Cx::web_focus). Outside a
+    /// modal it takes focus as it mounts, if nothing has focus then.
     pub fn autofocus(mut self) -> Self {
         self.cold_mut().focus.autofocus = true;
         self
