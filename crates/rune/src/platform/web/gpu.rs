@@ -308,7 +308,7 @@ pub(super) fn encode_gpu_frame(
         let rt = app.rt_mut();
         side.renderer.set_fade_stops(rt.fade_stops());
         side.renderer.prepare_ui(&side.gpu.device, &side.gpu.queue, &mut rt.text.atlas, &rt.instances, prepared.size);
-        side.renderer.draw_armed(&mut prepared.encoder, &prepared.frame.texture);
+        side.renderer.draw_armed(&mut prepared.encoder, &prepared.frame.texture, None);
         false
     } else if app.has_compositor() {
         let target = prepared.frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(side.renderer.format()), ..Default::default() });

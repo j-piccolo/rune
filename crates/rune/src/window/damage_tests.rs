@@ -177,3 +177,197 @@ fn a_scroll_draws_whole_without_hashing_the_lists() {
     let only_mounted: Vec<Instance> = (0..840).map(|n| row(n, 0.0)).collect();
     assert!(matches!(changed(&old, &only_mounted, size, &mut s), Area::Rects(ref rs) if !rs.is_empty()));
 }
+
+/// A page: the root's fill, a bar over the top, and rows of rounded cards in a viewport below it,
+/// scrolled `dy` up.
+fn page(dy: f32, size: (u32, u32)) -> Vec<Instance> {
+    let plain = |rect: [f32; 4], fill: [f32; 4]| Instance { rect, fill, params: [0.0, KIND_RECT, 0.0, 1.0], clip: NO_CLIP, ..Instance::zeroed() };
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let mut list = vec![plain([0.0, 0.0, w, h], [0.1, 0.1, 0.1, 1.0]), plain([0.0, 0.0, w, 32.0], [0.2, 0.2, 0.25, 1.0])];
+    for row in 0..6 {
+        for col in 0..4 {
+            list.push(Instance {
+                rect: [8.0 + col as f32 * 62.0, 40.0 + row as f32 * 40.0 - dy, 54.0, 32.0],
+                radii: [6.0; 4],
+                fill: [0.2 + 0.1 * col as f32, 0.3 + 0.1 * row as f32, 0.5, 1.0],
+                params: [0.0, KIND_RECT, 0.0, 1.0],
+                clip: [0.0, 32.0, w, h],
+                ..Instance::zeroed()
+            });
+        }
+    }
+    list
+}
+
+#[test]
+fn a_scroll_copies_what_moved_and_redraws_what_came_in() {
+    let size = (256, 192);
+    let Some((shift, rects)) = scrolled(&page(0.0, size), &page(12.0, size), size) else { panic!("a whole-pixel scroll copies") };
+    // The viewport (0, 32)-(256, 192) moved 12 up: rows 44.. go to 32.., the last 12 rows come in.
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    assert!(rects.iter().any(|r| r[1] <= 180 && r[3] >= 192 && r[0] == 0 && r[2] >= 256), "the strip that came in redraws: {rects:?}");
+    // The root's fill lies under everything and shades the copy alike; the bar is outside it.
+    assert!(!rects.iter().any(|r| r[0] <= 128 && 128 < r[2] && r[1] <= 100 && 100 < r[3]), "the middle is copied, not redrawn: {rects:?}");
+
+    // Half a pixel: the copy can't move pixels that far.
+    assert!(scrolled(&page(0.0, size), &page(12.5, size), size).is_none());
+
+    // A card that fades redraws where it was and is, and the rest still copies.
+    let (mut old, mut new) = (page(0.0, size), page(12.0, size));
+    old[7].fade = [1, 0, 0, 0];
+    new[7].fade = [1, 0, 0, 0];
+    let (_, rects) = scrolled(&old, &new, size).expect("the rest still copies");
+    let b = bounds(&new[7], size).unwrap();
+    assert!(rects.iter().any(|r| r[0] <= b[0] && r[1] <= b[1] && r[2] >= b[2] && r[3] >= b[3]), "{rects:?} misses the faded card {b:?}");
+
+    // Something drawn over the viewport that stays put redraws where it is and where its copy lands.
+    let badge = Instance { rect: [100.0, 120.0, 20.0, 20.0], fill: [1.0, 0.0, 0.0, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip: NO_CLIP, ..Instance::zeroed() };
+    let (mut old, mut new) = (page(0.0, size), page(12.0, size));
+    old.push(badge);
+    new.push(badge);
+    let (_, rects) = scrolled(&old, &new, size).expect("the rest still copies");
+    let b = bounds(&badge, size).unwrap();
+    for (y0, y1) in [(b[1], b[3]), (b[1] - 12, b[3] - 12)] {
+        assert!(rects.iter().any(|r| r[0] <= b[0] && r[1] <= y0 && r[2] >= b[2] && r[3] >= y1), "{rects:?} misses the badge at {y0}..{y1}");
+    }
+}
+
+/// A scrolled frame drawn partially (the kept frame copied, then what came in redrawn) holds the
+/// same bytes as the frame drawn whole.
+#[test]
+fn a_scrolled_partial_frame_matches_the_whole_frame() {
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    let gpu = Gpu::headless();
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let size = (256, 192);
+    let mut text = crate::text::TextSystem::new(&[], ("Inter", "Inter"));
+    let clear = [0.1, 0.1, 0.1, 1.0];
+    let target = Offscreen::new(device, size.0, size.1);
+    let mut renderer = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut damage = Damage::default();
+    // Whole, then unchanged (which draws the kept frame), then scrolled 12 up.
+    for (n, list) in [page(0.0, size), page(0.0, size), page(12.0, size)].into_iter().enumerate() {
+        renderer.prepare(device, queue, &mut text.atlas, &list, size);
+        let plan = damage.plan(&list, size, clear, 0, true, true);
+        match (n, &plan) {
+            (0, Plan::All(_)) | (1, Plan::Part { shift: None, .. }) | (2, Plan::Part { shift: Some(_), .. }) => {}
+            _ => panic!("frame {n}: {plan:?}"),
+        }
+        if let Plan::Part { draw, shift, .. } = plan {
+            renderer.arm_damage(device, queue, &draw, clear, size, OFFSCREEN_FORMAT, shift.map(|s| (s.from, s.to)));
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, clear);
+        renderer.damage_drawn().ok();
+        target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+    }
+    let partial = target.read(device);
+    let whole_target = Offscreen::new(device, size.0, size.1);
+    let mut whole = Renderer::new(device, OFFSCREEN_FORMAT);
+    whole.prepare(device, queue, &mut text.atlas, &page(12.0, size), size);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    whole.draw(&mut encoder, &whole_target.view, clear);
+    whole_target.copy(&mut encoder);
+    queue.submit([encoder.finish()]);
+    assert!(partial == whole_target.read(device), "the scrolled partial frame differs from the whole one");
+}
+
+/// `page`, with each row in a clip of its own that the viewport's edge cuts, as a row of cards
+/// that scrolls sideways has.
+fn rows(dy: f32, size: (u32, u32)) -> Vec<Instance> {
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let mut list = page(dy, size);
+    for (n, card) in list.iter_mut().enumerate().skip(2) {
+        let top = 40.0 + ((n - 2) / 4) as f32 * 40.0 - dy;
+        card.clip = [0.0, (top - 4.0).max(32.0), w, (top + 36.0).min(h).max(32.0)];
+    }
+    list
+}
+
+#[test]
+fn a_row_the_viewport_cuts_is_copied_too() {
+    let size = (256, 192);
+    let (shift, rects) = scrolled(&rows(0.0, size), &rows(12.0, size), size).expect("a whole-pixel scroll copies");
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    // The first row's clip stops at the viewport's top, the last row's at its bottom: neither
+    // moved with its cards, and both let through the same copied pixels as before.
+    assert_eq!(rects, vec![[0, 180, 256, 192]], "only the strip that came in redraws");
+    // A clip that lets other pixels through than it did redraws its card.
+    let mut new = rows(12.0, size);
+    new[10].clip[2] = 100.0;
+    let (_, rects) = scrolled(&rows(0.0, size), &new, size).expect("the rest still copies");
+    let b = bounds(&rows(12.0, size)[10], size).unwrap();
+    assert!(rects.iter().any(|r| r[1] <= b[1] && r[3] >= b[3]), "{rects:?} misses the card whose clip changed");
+}
+
+#[test]
+fn a_scroll_past_a_row_that_came_into_the_list_still_copies() {
+    let size = (256, 192);
+    let old = rows(0.0, size);
+    // Twelve instances more in the middle of the list (a row mounted outside the viewport): the
+    // lists meet again further on than a few instances.
+    let extra = (0..12).map(|n| Instance { rect: [8.0 + n as f32 * 20.0, -400.0, 16.0, 16.0], fill: [0.5, 0.5, 0.5, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip: [0.0, 32.0, 256.0, 192.0], ..Instance::zeroed() });
+    let moved = rows(12.0, size);
+    let new: Vec<Instance> = moved[..10].iter().copied().chain(extra).chain(moved[10..].iter().copied()).collect();
+    let (shift, rects) = scrolled(&old, &new, size).expect("the rows still copy");
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    assert_eq!(rects, vec![[0, 180, 256, 192]], "only the strip that came in redraws");
+}
+
+#[test]
+fn far_apart_changes_stay_apart() {
+    // A strip at the bottom, a label at the top and scattered glyphs between: more than the
+    // rectangles there are, and none of them joins the strip to the label.
+    let mut each = vec![[0, 1040, 1920, 1080], [42, 67, 294, 119]];
+    each.extend((0..12).map(|n| [100 + n * 150, 300 + (n % 3) * 200, 112 + n * 150, 314 + (n % 3) * 200]));
+    let rects = gathered_apart(&mut each);
+    assert!(rects.len() <= SCROLL_RECTS);
+    assert!(rects.iter().map(|r| area(*r)).sum::<u32>() < 1920 * 1080 / 2, "{rects:?}");
+    for e in &each { assert!(rects.iter().any(|r| r[0] <= e[0] && r[1] <= e[1] && r[2] >= e[2] && r[3] >= e[3]), "{rects:?} misses {e:?}"); }
+}
+
+/// Frames scrolled back and forth, drawn as the hosts draw them (what moved copied through the
+/// drawable into the rolled kept frame, what came in redrawn, a frame that changed too much drawn
+/// whole into the kept frame), each hold the same bytes as that frame drawn whole.
+#[test]
+fn scrolled_frames_match_whole_frames() {
+    use crate::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+    let gpu = Gpu::headless();
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let size = (256, 192);
+    let mut text = crate::text::TextSystem::new(&[], ("Inter", "Inter"));
+    let clear = [0.1, 0.1, 0.1, 1.0];
+    let target = Offscreen::new(device, size.0, size.1);
+    let whole_target = Offscreen::new(device, size.0, size.1);
+    let mut renderer = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut whole = Renderer::new(device, OFFSCREEN_FORMAT);
+    let mut damage = Damage::default();
+    let mut shifted = 0;
+    // Down in steps, further than the viewport is tall in all (the roll wraps), back up, a jump
+    // (drawn whole), and on from there.
+    for (n, dy) in [0.0, 0.0, 12.0, 30.0, 30.0, 61.0, 75.0, 40.0, 3.0, 0.0, 170.0, 150.0, 151.0].into_iter().enumerate() {
+        let list = rows(dy, size);
+        renderer.prepare(device, queue, &mut text.atlas, &list, size);
+        match damage.plan(&list, size, clear, 0, true, true) {
+            Plan::Part { draw, shift, .. } => {
+                shifted += usize::from(shift.is_some());
+                renderer.arm_damage(device, queue, &draw, clear, size, OFFSCREEN_FORMAT, shift.map(|s| (s.from, s.to)));
+                renderer.cull_armed(&list, size);
+            }
+            Plan::All(_) => renderer.arm_whole(device, queue, clear, size, OFFSCREEN_FORMAT),
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, clear);
+        assert_eq!(renderer.damage_drawn(), Ok(()), "frame {n}");
+        target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        whole.prepare(device, queue, &mut text.atlas, &list, size);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        whole.draw(&mut encoder, &whole_target.view, clear);
+        whole_target.copy(&mut encoder);
+        queue.submit([encoder.finish()]);
+        assert!(target.read(device) == whole_target.read(device), "frame {n} (scrolled {dy}) differs from the whole one");
+    }
+    assert!(shifted >= 5, "the scrolls copied: {shifted}");
+}
