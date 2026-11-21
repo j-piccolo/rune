@@ -190,6 +190,17 @@ impl El {
         self.style.set_grow(g);
         self
     }
+    /// Take a `g` share of the free space along the parent's main axis on top of the element's
+    /// own size, and give some back when there isn't room (CSS `flex: g 1 auto`). Unlike
+    /// [`El::grow`] its content sizes it first, so in an auto-height column it is as tall as
+    /// its content, and in a capped one it shrinks to fit (down to its minimum: `.min_h(0.0)`
+    /// lets a scroll viewport inside take the rest).
+    #[inline]
+    pub fn grow_auto(mut self, g: f32) -> Self {
+        self.style.set_flex_grow(g);
+        self.style.set_flex_shrink(1.0);
+        self
+    }
     #[inline]
     pub fn padding(mut self, p: f32) -> Self {
         self.set_padding(p);
