@@ -37,6 +37,7 @@ pub(super) fn on() -> bool {
 pub(super) struct Check {
     device: wgpu::Device,
     size: (u32, u32),
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     format: wgpu::TextureFormat,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -50,6 +51,7 @@ pub(super) struct Check {
 }
 
 impl Check {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn new(device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat, view_format: wgpu::TextureFormat) -> Check {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("loop pixel check"),
@@ -133,6 +135,7 @@ impl Drop for Check {
 impl Renderer {
     /// `arm_loop`'s part: compares the last loop-only frame's pictures, and has a scratch target
     /// for this frame's.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(super) fn pixel_check_arm(&self, device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat) {
         let mut d = self.damage.lock().unwrap();
         if let Some(c) = d.pixel.as_mut() { c.resolve(); }

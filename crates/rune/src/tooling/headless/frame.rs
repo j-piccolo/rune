@@ -79,6 +79,12 @@ pub(super) struct HeadlessLoop<'a> {
     pub(super) snap_crop: &'a Cell<Option<[u32; 4]>>,
     pub(super) cpu_boot: &'a RefCell<Option<crate::render::cpu_boot::tool::Tool>>,
     pub(super) loop_check: loop_check::Tally,
+    /// What the last frames changed, so the next redraws only that, as a window's does (`damage`).
+    #[cfg(not(target_os = "macos"))]
+    pub(super) damage: crate::window::damage::Damage,
+    /// Bumped when the target is made again: its first frame draws whole.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) target_made: u64,
     pub(super) cpu_ms: Vec<f64>,
     pub(super) anim_ms: Vec<f64>,
     pub(super) rest_ms: Vec<f64>,
@@ -93,6 +99,8 @@ impl HeadlessLoop<'_> {
         self.target_format = if rt_srgb { OFFSCREEN_FORMAT.remove_srgb_suffix() } else { OFFSCREEN_FORMAT };
         crate::window::rebuild_renderer_core(&self.gpu.device, &mut self.renderer, self.target_format, rt);
         self.target = Offscreen::with_format(&self.gpu.device, self.wp, self.hp, self.target_format);
+        #[cfg(not(target_os = "macos"))]
+        { self.target_made += 1; }
         if self.alpha.is_some() {
             self.alpha = Some(crate::render::surface_alpha::AlphaSurface::new(&self.gpu.device, self.target_format, (self.wp, self.hp)));
         }
@@ -239,8 +247,20 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
     #[inline]
     fn prepare_render(&mut self, _drawable: (), _info: &mut StepInfo) -> RenderPrep<PreparedHeadlessFrame> {
         let s = &mut *self.state;
+        // An image's pixels changed where its instances didn't: the whole frame draws (`damage`).
+        #[cfg(not(target_os = "macos"))]
+        let images_changed = self.app.rt().images.pages.iter().any(|p| p.dirty.is_some());
         prepare_gpu_resources(&mut s.renderer, s.gpu, self.app.rt_mut(), (s.wp, s.hp), false);
         let encoder = s.gpu.device.create_command_encoder(&Default::default());
+        // Only what changed is redrawn, as a window redraws it (`window::damage`).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let rt = self.app.rt();
+            let in_place = s.alpha.is_none() && !images_changed;
+            if let crate::window::damage::Plan::Part { draw, .. } = s.damage.plan(&rt.instances, (s.wp, s.hp), rt.clear_color(), s.target_made, crate::window::damage::GlyphAtlas::of(&rt.text.atlas), in_place) {
+                s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format);
+            }
+        }
         let in_range = self.k >= s.start_frame && self.k < s.start_frame + s.frames;
         let shot = Shot {
             k: self.k,
@@ -278,6 +298,9 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             draw_ui(&mut s.renderer, s.gpu, &mut prepared.encoder, view, rt, (s.wp, s.hp), clear);
             false
         };
+        // Every frame, so a frame drawn whole leaves the renderer's kept frame behind.
+        #[cfg(not(target_os = "macos"))]
+        s.renderer.damage_drawn().ok();
         if let Some((ov, ui)) = s.overlay.as_mut() {
             let ort = ov.frame(self.real_t, info.dt, self.app.rt().backdrop_dark().unwrap_or(s.dark));
             if !ort.instances.is_empty() {

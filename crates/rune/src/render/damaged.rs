@@ -38,6 +38,7 @@ pub(super) struct DamageState {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     cycle: Option<((u64, (u32, u32)), Result<Cull, &'static str>)>,
     /// The paint and target size `arm_loop` last found the units of, and them.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     loop_units: Option<((u64, (u32, u32)), Result<std::sync::Arc<Units>, &'static str>)>,
     /// Whether a run of the armed rectangles holds a layer's scope.
     layers_reached: bool,
@@ -124,6 +125,7 @@ impl Renderer {
     /// that reach it (what the rest drew there stays as drawn). Returns those rectangles (x0, y0,
     /// x1, y1) to present, or why this frame draws whole.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn arm_loop(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, paint: u64, instances: &[Instance], patched: &[u32], clear: [f32; 4], size: (u32, u32), format: wgpu::TextureFormat) -> Result<Vec<[i32; 4]>, &'static str> {
         // The clearing quad blends: only an opaque clear stands for `LoadOp::Clear`.
         if clear[3] != 1.0 { return Err("clear"); }

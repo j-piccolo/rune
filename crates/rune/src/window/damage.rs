@@ -1,13 +1,16 @@
-//! Windows: what part of a window a frame redraws and presents. The renderer redraws only what
-//! changed into the frame it keeps (`render::damaged`), and the window presents only that
-//! (`Present1` dirty rectangles), which is all DWM composes again.
+//! What part of a window a frame redraws. The renderer redraws only what changed into the frame
+//! it keeps (`render::damaged`) and copies that out whole; on Windows the window also presents
+//! only what changed (`Present1` dirty rectangles), which is all DWM composes again. A frame's GPU
+//! time is mostly the pixels it shades, so a focus ring that moves, or a hover that fades, shades
+//! a few rectangles instead of the window.
 //!
 //! What changed is the instances that differ from the last frame's. The lists' common start and
 //! end are skipped; in what's left, an instance whose bytes are in both lists didn't change (its
 //! place is in its bytes), so a typed glyph that pushes the rest of the list along changes only
 //! itself and the caret. The bounds of the instances only one list has are the change, gathered
 //! into at most `RECTS` rectangles. If the instances both lists have were drawn in another order,
-//! everything changed.
+//! everything changed. Lists of one length are compared in place instead, which needs no hashing:
+//! the instances that differ there, old and new, bound every pixel that changed.
 //!
 //! The whole window is drawn when anything else could have moved pixels (`Renderer::
 //! redraws_in_place`), when the size or clear colour changed, after a new swap chain, and when
@@ -31,15 +34,15 @@ pub(super) const RECTS: usize = crate::render::MAX_RECTS;
 /// The glyph atlas state `Damage` needs to tell whether an unchanged instance may sample
 /// different texels than in the last frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::window) struct GlyphAtlas {
-    pub(in crate::window) resets: u64,
-    pub(in crate::window) rasterized: u64,
-    pub(in crate::window) dirty_rows: bool,
-    pub(in crate::window) pending_fills: bool,
+pub(crate) struct GlyphAtlas {
+    pub(crate) resets: u64,
+    pub(crate) rasterized: u64,
+    pub(crate) dirty_rows: bool,
+    pub(crate) pending_fills: bool,
 }
 
 impl GlyphAtlas {
-    pub(in crate::window) fn of(atlas: &crate::text::Atlas) -> Self {
+    pub(crate) fn of(atlas: &crate::text::Atlas) -> Self {
         Self {
             resets: atlas.resets(),
             rasterized: atlas.rasterized(),
@@ -59,7 +62,7 @@ struct Shape {
 
 /// The last frames' changes.
 #[derive(Default)]
-pub(in crate::window) struct Damage {
+pub(crate) struct Damage {
     /// The last frame's instances, and its size, clear colour, swap chain (the surface's
     /// configuration, `configure::generation`), and glyph atlas reset count.
     last: Vec<Instance>,
@@ -69,7 +72,7 @@ pub(in crate::window) struct Damage {
     scratch: Scratch,
     /// The last change seen, however much was drawn (frame-profile).
     #[cfg_attr(not(feature = "frame-profile"), allow(dead_code))]
-    pub(in crate::window) seen: Option<[u32; 4]>,
+    pub(crate) seen: Option<[u32; 4]>,
 }
 
 /// Rectangles `[x0, y0, x1, y1]` in the window's pixels.
@@ -85,7 +88,7 @@ pub(super) enum Area {
 
 /// What a frame draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::window) enum Plan {
+pub(crate) enum Plan {
     /// Everything, and why.
     All(&'static str),
     /// Redraw `draw` (`[x, y, width, height]` each), present `present` (`[x0, y0, x1, y1]` each).
@@ -98,7 +101,8 @@ impl Damage {
     /// no eviction, new rasterization or pending GPU fill since the last frame, and if CPU glyph
     /// rows are dirty (an animated icon's in-place slot write), at least one patched instance's
     /// bytes differ from the last frame's.
-    pub(in crate::window) fn can_patch_loop(
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn can_patch_loop(
         &self,
         instances: &[Instance],
         patched: &[u32],
@@ -133,7 +137,7 @@ impl Damage {
 
     /// The frame about to draw `instances` into a `size` target cleared to `clear`, on swap chain
     /// `swap`, with glyph atlas state `atlas`; `in_place` when nothing but its instances draws there.
-    pub(in crate::window) fn plan(
+    pub(crate) fn plan(
         &mut self,
         instances: &[Instance],
         size: (u32, u32),
@@ -190,18 +194,21 @@ impl Damage {
     }
 
     /// A new swap chain: the next frame draws whole.
-    pub(in crate::window) fn reset(&mut self) { self.shape = None; }
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn reset(&mut self) { self.shape = None; }
 
     /// The last frame drew into swap chain `swap` at this size and clear colour: a frame may draw
     /// and present only part of it. False after `reset` or a configure (a new swap chain), so its
     /// first frame, loop-only or not, goes through `plan` and draws whole.
-    pub(in crate::window) fn current(&self, size: (u32, u32), clear: [f32; 4], swap: u64) -> bool {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn current(&self, size: (u32, u32), clear: [f32; 4], swap: u64) -> bool {
         self.shape.is_some_and(|s| s.size == size && s.clear == clear && s.swap == swap)
     }
 
     /// A loop-only frame changed only `patched` (ascending) and drew them where they were and
     /// are (`Renderer::arm_loop`): the next frame compares with them.
-    pub(in crate::window) fn patched(&mut self, instances: &[Instance], patched: &[u32]) {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn patched(&mut self, instances: &[Instance], patched: &[u32]) {
         if self.last.len() != instances.len() { self.shape = None; return; }
         for &i in patched { self.last[i as usize] = instances[i as usize]; }
     }
@@ -234,9 +241,26 @@ impl Hasher for Hashed {
     }
 }
 
-/// FNV-1a over an instance's 32 words: a few ns, against SipHash's ~100.
+/// Whether two instances are the same bytes: their double words compared inline, without a
+/// branch. A `memcmp` call for each of a frame's instances cost as much as the rest of its plan.
+#[inline(always)]
+fn same(a: &Instance, b: &Instance) -> bool {
+    let (a, b): ([u64; INSTANCE_WORDS / 2], [u64; INSTANCE_WORDS / 2]) = (bytemuck::cast(*a), bytemuck::cast(*b));
+    a.iter().zip(&b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// An instance's 16 double words, xor-multiplied in four lanes that the CPU runs side by side
+/// (FNV's one chain of 32 multiplies cost a frame as much again), then folded. Each step is a
+/// bijection of its lane, so instances that differ in one word never hash alike.
 fn hash(i: &Instance) -> u64 {
-    bytemuck::cast_ref::<Instance, [u32; INSTANCE_WORDS]>(i).iter().fold(0xcbf2_9ce4_8422_2325u64, |h, w| (h ^ u64::from(*w)).wrapping_mul(0x0100_0000_01b3))
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let words: [u64; INSTANCE_WORDS / 2] = bytemuck::cast(*i);
+    let mut lanes = [0xcbf2_9ce4_8422_2325u64; 4];
+    for (n, w) in words.iter().enumerate() {
+        let lane = &mut lanes[n % 4];
+        *lane = (*lane ^ w).wrapping_mul(K);
+    }
+    lanes[0] ^ lanes[1].rotate_left(16) ^ lanes[2].rotate_left(32) ^ lanes[3].rotate_left(48)
 }
 
 /// What differs between `old` and `new`.
@@ -250,10 +274,42 @@ pub(super) struct Scratch {
 }
 
 fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch) -> Area {
-    fn bytes(i: &Instance) -> &[u8] { bytemuck::bytes_of(i) }
-    let start = old.iter().zip(new).take_while(|(a, b)| bytes(a) == bytes(b)).count();
-    let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| bytes(a) == bytes(b)).count();
+    let start = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
+    let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| same(a, b)).count();
     let (old, new) = (&old[start..old.len() - end], &new[start..new.len() - end]);
+    // The same length: what differs in place is the change. A pixel whose instances, or their
+    // order, changed lies in the bounds of one that differs there (old or new), so redrawing
+    // those is exact, and it hashes nothing. A scroll, which moves thousands, draws whole.
+    if old.len() == new.len() {
+        // Counted first: a scroll gives up after `MANY` without bounding any of them.
+        let mut differ = 0;
+        for (a, b) in old.iter().zip(new) {
+            if !same(a, b) {
+                differ += 1;
+                if differ > MANY { return Area::Many; }
+            }
+        }
+        s.each.clear();
+        for (a, b) in old.iter().zip(new).filter(|(a, b)| !same(a, b)) {
+            s.each.extend(bounds(a, size));
+            s.each.extend(bounds(b, size));
+        }
+        return gathered(&mut s.each);
+    }
+    // A scroll that mounted or let go of rows changes the length too: if most of a sample of
+    // the new instances aren't anywhere near their place in the old list, it moved everything,
+    // and the frame draws whole without hashing the lists. Inserted text keeps its neighbours
+    // within the length's change of where they were.
+    if new.len() > 2 * MANY {
+        let reach = old.len().abs_diff(new.len()) + 2;
+        let samples = 32;
+        let away = (0..samples).map(|n| n * new.len() / samples).filter(|&at| {
+            let lo = at.saturating_sub(reach);
+            let hi = (at + reach + 1).min(old.len());
+            !old[lo.min(hi)..hi].iter().any(|o| same(o, &new[at]))
+        }).count();
+        if away * 2 > samples { return Area::Many; }
+    }
     // Per distinct instance: how many more the old list has than the new, and one of them.
     s.counts.clear();
     s.old.clear();
@@ -288,9 +344,15 @@ fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch
     if s.each.len() > 256 && let Some(all) = s.each.iter().copied().reduce(join) && area(all) as f32 > MOST * (size.0 * size.1) as f32 {
         return Area::Rects(vec![all]);
     }
-    s.each.sort_unstable_by_key(|r| (r[1], r[0]));
+    gathered(&mut s.each)
+}
+
+/// `each`, in reading order so neighbours gather before rectangles run out, as at most `RECTS`
+/// rectangles.
+fn gathered(each: &mut [[u32; 4]]) -> Area {
+    each.sort_unstable_by_key(|r| (r[1], r[0]));
     let mut rects = Vec::new();
-    for r in s.each.iter().copied() { add(&mut rects, r); }
+    for r in each.iter().copied() { add(&mut rects, r); }
     Area::Rects(rects)
 }
 /// Adds `r` to `rects`: into one it touches, or as its own until there are `RECTS`, then into
