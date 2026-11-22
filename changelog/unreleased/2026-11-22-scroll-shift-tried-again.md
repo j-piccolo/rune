@@ -1,0 +1,1 @@
+- The redraw planner no longer mistakes a scroll for a sideways move when rows come into the list or leave it mid-scroll. A card or glyph like the next one over could win the vote for the frame's shift, which then redrew nearly the whole viewport, and the frame drew whole. It now tries each shift most probes agree on, near and far, and keeps the one that leaves least to redraw.
