@@ -50,6 +50,15 @@ pub enum FontSmoothing {
     /// `Windfoil` does (GPU-filled masks, outlines while its scale moves, the CPU's fill where the
     /// renderer has no outline shader).
     WindfoilChromium,
+    /// `WindfoilChromium` of every face's design outline: a face's TrueType hints are not run,
+    /// whatever its `gasp` asks (a CJK face at small sizes keeps its own, as in every mode drawn
+    /// from outlines). A glyph then has one outline at every size, where a hinted
+    /// face's has one for each size it is drawn at, made by running the font's program for that
+    /// glyph, 20 to 40 us each: a screen of text in a size or weight not drawn before costs
+    /// several milliseconds in the frame that first shows it, and Inter's static faces, hinted
+    /// by ttfautohint, are such faces. Heights and horizontal stems fall where the design puts
+    /// them, not on the pixel grid, which at 1x is a little softer in small text.
+    WindfoilDesign,
     /// Slug's coverage (Lengyel): the winding along a horizontal and a vertical ray through each
     /// pixel, each spread over the pixel's width, averaged; of the design outline, through Skia's
     /// text gamma. Drawn by the same shader and store as Windfoil, so it needs the renderer's
@@ -160,6 +169,7 @@ impl FontSmoothing {
         Some(match self {
             FontSmoothing::Windfoil => Look { macos_weight: true, coverage: Coverage::Box, hint: OutlineHint::CoreGraphics, whole_pens: false },
             FontSmoothing::WindfoilChromium => chromium(Coverage::Box, OutlineHint::DirectWrite, false),
+            FontSmoothing::WindfoilDesign => chromium(Coverage::Box, OutlineHint::None, false),
             FontSmoothing::Slug => chromium(Coverage::Slug, OutlineHint::None, false),
             FontSmoothing::HintedGpu => chromium(Coverage::Box, OutlineHint::Auto, false),
             FontSmoothing::Hinted => chromium(Coverage::Box, OutlineHint::Auto, true),
@@ -177,6 +187,7 @@ impl FontSmoothing {
             FontSmoothing::HintedGpu => 3,
             FontSmoothing::Hinted => 4,
             FontSmoothing::WindfoilRgb => 5,
+            FontSmoothing::WindfoilDesign => 6,
             FontSmoothing::On | FontSmoothing::Off | FontSmoothing::DirectWrite | FontSmoothing::ClearType => return None,
         };
         Some(crate::atlas::glyph_emit::WINDFOIL_KEY | n)
