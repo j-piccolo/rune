@@ -54,9 +54,66 @@ fn fs(i: Out) -> DualOut {
 /// The kinds the frame pass has a pipeline of its own for (`KIND_RECT`, `KIND_SHADOW`, `KIND_GLYPH`):
 /// what most of a frame's fragments draw.
 pub(crate) const PINNED: [u32; 3] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32()];
+/// The kinds pinned where the pipelines compile from WGSL: `PINNED`'s, in its order, then the gradient kinds,
+/// which have no shipped bytecode. `Renderer::pinned` is in this order, as long as it has pipelines for.
+pub(crate) const PINNED_FROM_WGSL: [u32; 5] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32(), Kind::Radial.as_u32(), Kind::Gradient.as_u32()];
 
 /// shader.wgsl's marker for the kind a fragment draws: -1, every kind.
 const PINNED_OFF: &str = shader_consts::PINNED_KIND_OFF_DECL;
+
+/// `base_vs`'s line that picks a quad's corner: the banded variant narrows the quad ahead of it.
+const CORNER: &str = "    let p = select(lo, hi, corner > vec2<f32>(0.5));";
+
+/// What the banded variant adds to `base_vs`. A linear gradient's stop segment (kind 11) covers its
+/// whole element, and its fragments are zero wherever another segment draws: past an open stop
+/// edge, and past a closed end whose colour is clear. A gradient of five stops over a hero so
+/// shades the hero four times to colour it once. The part that
+/// isn't zero is a band across the gradient, and here the quad rasterizes only the band's extent
+/// along the axis the gradient mostly runs along, with a pixel of slack for the rounding between
+/// this edge and the fragment's own comparison. The fragment stage is the
+/// same code on the same flat inputs at the same pixel centres, so every pixel still shaded gets
+/// the value the whole quad gave it, and a pixel no longer shaded got zero, which blends to
+/// nothing.
+const BAND: &str = r#"    if (kind > 10.5 && kind < 11.5 && i.uv.z == 0.0 && any(i.uv.xy != vec2<f32>(0.0))) {
+        let lower_open = i.params.x >= 1.5;
+        let upper_open = i.params.w >= 1.5;
+        let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
+        let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
+        let below = lower_open || all(i.fill == vec4<f32>(0.0));
+        let above = upper_open || all(i.border == vec4<f32>(0.0));
+        // The axis the gradient mostly runs along, and how far a stop's edge moves along it from
+        // one side of the quad to the other (nothing for a gradient straight along the axis; an
+        // angle of 90 degrees is a few parts in a hundred million off it in f32).
+        let down = abs(i.uv.y) >= abs(i.uv.x);
+        let slope = select(i.uv.x, i.uv.y, down);
+        let across = select(i.uv.y, i.uv.x, down);
+        let reach = abs(across / slope) * select(hi.y - lo.y, hi.x - lo.x, down) * 0.5 + 1.0;
+        let middle = select(i.rect.x + i.rect.z * 0.5, i.rect.y + i.rect.w * 0.5, down);
+        let at0 = middle + (t0 - 0.5) / slope;
+        let at1 = middle + (t1 - 0.5) / slope;
+        var near = select(lo.x, lo.y, down);
+        var far = select(hi.x, hi.y, down);
+        if (slope > 0.0) {
+            if (below) { near = max(near, at0 - reach); }
+            if (above) { far = min(far, at1 + reach); }
+        } else {
+            if (below) { far = min(far, at0 + reach); }
+            if (above) { near = max(near, at1 - reach); }
+        }
+        far = max(far, near);
+        if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
+    }
+"#;
+
+/// Windfoil's WGSL for a pipeline compiled from source, with gradient stop segments banded in the
+/// vertex stage (`BAND`). The shipped Metal and DX12 bytecode is compiled from shader.wgsl as it
+/// is, and draws the same pixels with whole quads. `RUNE_GRADIENT_BANDS=0` compiles it unbanded.
+pub(super) fn banded_wgsl() -> std::borrow::Cow<'static, str> {
+    let windfoil = windfoil_wgsl();
+    let off = std::env::var_os("RUNE_GRADIENT_BANDS").is_some_and(|v| v == "0");
+    if off || windfoil.matches(CORNER).count() != 1 { return windfoil.into(); }
+    windfoil.replacen(CORNER, &format!("{BAND}{CORNER}"), 1).into()
+}
 
 /// Windfoil's WGSL with its fragment entry pinned to `kind` (shader.wgsl `fragment_kind`): the
 /// compiler drops every other kind's code. The vertex stage is unchanged.
@@ -345,7 +402,7 @@ impl Renderer {
         if let Some((shader, pipeline)) = windfoil_metallib::load(device, make_pipeline) {
             return Ok(Built { bind_layout, layout, shader: dxbc::Shaders::one(shader), pipeline, source: Source::Precompiled });
         }
-        let (shader, pipeline) = compile(device, windfoil_wgsl(), make_pipeline)?;
+        let (shader, pipeline) = compile(device, &banded_wgsl(), make_pipeline)?;
         Ok(Built { bind_layout, layout, shader, pipeline, source: Source::Compiled })
     }
 
@@ -475,6 +532,29 @@ impl Renderer {
                     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL) };
                     sent.send(make_pinned(&device, &layout, format)).ok();
                 });
+            if spawned.is_ok() {
+                self.pinned_building = Some((format, done));
+                return;
+            }
+        }
+        // Where the uber shader is compiled from WGSL as the renderer starts (Vulkan, GL), its pinned
+        // pipelines can be too, on a thread: naga and the driver take milliseconds for each, where FXC
+        // takes tens of seconds. Asked for with `RUNE_PINNED_WGSL=1`, not the default: the smaller
+        // shaders shade a pixel for less (a tenth off the GPU's time on scrolling pages here), and the
+        // draw per run of a kind costs the CPU about as much in this machine's driver. Which way that
+        // goes on a small GPU with a small CPU is for a measurement there to say.
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+        if matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs"
+            && std::env::var_os("RUNE_PINNED_WGSL").is_some_and(|v| v == "1") {
+            let (sent, done) = std::sync::mpsc::channel();
+            let (device, layout, format) = (device.clone(), self.layout.clone(), self.format);
+            let spawned = std::thread::Builder::new().name("rune-pinned-pipelines".into()).spawn(move || {
+                let pinned: Vec<_> = PINNED_FROM_WGSL.iter().map(|&kind| {
+                    let wgsl = pinned_wgsl(kind)?;
+                    compile(&device, &wgsl, |shader| Renderer::pipeline(&device, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p)
+                }).collect();
+                sent.send(if pinned.iter().any(Option::is_some) { pinned } else { Vec::new() }).ok();
+            });
             if spawned.is_ok() {
                 self.pinned_building = Some((format, done));
                 return;
