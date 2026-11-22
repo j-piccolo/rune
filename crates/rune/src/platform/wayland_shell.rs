@@ -108,8 +108,13 @@ impl Lock {
     pub(crate) fn unlock(&self) {
         let Some(object) = self.object.borrow_mut().take() else { return };
         object.unlock_and_destroy();
-        // Flushed now: a locker that exits right after must not leave it unsent.
-        SHELL.with_borrow(|shell| if let Some(services) = &shell.services { services.conn.flush().ok(); });
+        // Read by the compositor before this returns, not only sent: a client that hangs up loses
+        // what the compositor has yet to read (libwayland-server destroys it on the hang-up), and
+        // a locker exiting right after left the session locked on its red screen. The roundtrip
+        // waits for no frame: the compositor answers it as it reads it.
+        SHELL.with_borrow_mut(|shell| if let Some(services) = &mut shell.services {
+            services.queue.roundtrip(&mut services.state).ok();
+        });
         SHELL.with_borrow_mut(|shell| shell.locks.retain(|lock| lock.id != self.id));
     }
 }
