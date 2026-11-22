@@ -243,8 +243,11 @@ impl<T: 'static> ConfiguredOverlay<T> {
         self.fonts = Some((fonts, families));
         self
     }
-    /// Called with every primary press (true) and release (false) on the overlay, before
-    /// anything in its view hears it: a shell's click-away watches where presses land.
+    /// Called with every primary press (true) and release (false) on the overlay: a shell's
+    /// click-away watches where clicks land. A press comes before anything in the view hears
+    /// it. A release comes once the view has run what its click queued (the press's handlers
+    /// among them), so the hook can tell whether anything in the view took the click; a press
+    /// that comes while a release still waits for that comes after it.
     pub fn on_button(mut self, f: fn(&mut T, bool)) -> Self { self.on_button = Some(f); self }
 }
 
