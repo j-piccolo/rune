@@ -25,6 +25,9 @@ pub(in crate::runtime) enum Action {
     /// `El::on_visible`: the element came on screen or left it.
     Visible(String, bool),
     Press(String, crate::PointerButton, bool), // true for a touch tap
+    /// `ConfiguredOverlay::on_button` hearing a primary release (false), or a press queued
+    /// behind one (`RuntimeCore::button_hook`).
+    Button(bool),
     DoublePress(String),
     /// `El::on_middle_press`.
     MiddlePress(String),
@@ -578,6 +581,11 @@ impl RuntimeCore {
                 true
             }
             Action::A11y(path, act) => self.run_a11y(app, path, act, &mut one),
+            // The hook asks for no commit, as it never did when it ran ahead of the view.
+            Action::Button(down) => {
+                app.on_button(down);
+                false
+            }
         };
         let live_only = std::mem::take(&mut one.live_only);
         if live_only && live_label.is_some() {
@@ -613,6 +621,21 @@ impl RuntimeCore {
     }
     pub(crate) fn queue_a11y_link_secondary(&mut self, path: String, link: usize, ev: PointerEvent) {
         self.frame.queue.push(Action::LinkSecondary(path, link, ev));
+    }
+
+    /// The app's `ConfiguredOverlay::on_button` hears a primary press (`down`) or release; the
+    /// host calls this before the view hears a press and after it heard a release. A press
+    /// reaches the hook at once. A release is queued behind what its click queued for the view,
+    /// the press's handlers among them, so the hook can tell whether anything took the click. A
+    /// press that comes while a release is still queued is queued behind it, so the hook hears
+    /// each click whole and in order.
+    pub(crate) fn button_hook(&mut self, app: &mut dyn AppDriver, down: bool) {
+        if !app.has_on_button() { return; }
+        if down && !self.frame.queue.iter().any(|a| matches!(a, Action::Button(_))) {
+            app.on_button(true);
+        } else {
+            self.frame.queue.push(Action::Button(down));
+        }
     }
 }
 

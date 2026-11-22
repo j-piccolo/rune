@@ -517,11 +517,13 @@ impl OverlayCore {
                 app.rt_mut().pointer_leave();
             }
             Input::Button(down) => {
-                // The app's hook hears where every press lands before the view does.
-                app.button_hook(down);
+                // The app's hook hears where a press lands before the view does, and a release
+                // once the view has run what its click queued: whether anything in it took it.
+                if down { app.button_hook(true); }
                 if let Some((x, y)) = self.pointer_at(app) {
                     if down { app.pointer_down(x, y); } else { app.pointer_up(x, y); }
                 }
+                if !down { app.button_hook(false); }
             }
             Input::Secondary(down) => if let Some((x, y)) = self.pointer_at(app) { if down { app.rt_mut().secondary_down(x, y) } else { app.secondary_up(x, y) } },
             Input::ExtraButton(button, down) => if let Some((x, y)) = self.pointer_at(app) {
