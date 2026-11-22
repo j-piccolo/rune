@@ -185,6 +185,7 @@ impl Renderer {
         if fills.is_empty() {
             return;
         }
+        self.layers.texels += 1;
         // A prepare whose fills no draw recorded: they go now, before their instances are
         // written over.
         self.submit_fills();
