@@ -147,8 +147,8 @@ impl SessionLock {
         LockState::Unsupported
     }
 
-    /// Unlocks the session and ends the lock. The request is flushed to the compositor before
-    /// this returns, so the process may exit at once.
+    /// Unlocks the session and ends the lock. The compositor has read the request before this
+    /// returns, so the process may exit at once.
     pub fn unlock(&self) {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         self.inner.unlock();
