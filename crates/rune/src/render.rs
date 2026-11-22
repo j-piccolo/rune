@@ -549,8 +549,8 @@ impl Renderer {
             for run in kind_runs(&self.kinds, span) {
                 let kind = self.kinds[run.start as usize];
                 let pipeline = kind
-                    .and_then(|k| variant::PINNED.iter().position(|&p| p == k.as_u32()))
-                    .and_then(|at| pinned[at].as_ref())
+                    .and_then(|k| variant::PINNED_FROM_WGSL.iter().position(|&p| p == k.as_u32()))
+                    .and_then(|at| pinned.get(at)?.as_ref())
                     .unwrap_or(&self.pipeline);
                 if !std::ptr::eq(pipeline, bound) { pass.set_pipeline(pipeline); bound = pipeline; }
                 pass.draw(0..4, run);
