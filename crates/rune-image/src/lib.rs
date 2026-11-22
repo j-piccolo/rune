@@ -101,6 +101,12 @@ impl Image {
     pub(crate) fn decoded(&self) -> Option<Result<&Decoded, &ImageError>> {
         self.0.decoded.get().map(|r| r.as_ref().map(Arc::as_ref))
     }
+    /// A handle that doesn't keep the image: [`WeakImage::upgrade`] has it back for as long as
+    /// anything else does (an element drawing it, another handle). For an app's own cache of what
+    /// it fetched, which can then let go of decoded pixels nothing shows and still find the ones
+    /// that are, without hashing their bytes again.
+    pub fn downgrade(&self) -> WeakImage { WeakImage(Arc::downgrade(&self.0)) }
+
     // The handle is ready before its pixels wake any window, so a woken frame sees its size.
     fn finish(&self, decoded: Result<Decoded, ImageError>) {
         let decoded = decoded.map(Arc::new);
@@ -110,8 +116,18 @@ impl Image {
     }
 }
 
+/// An [`Image`] that doesn't keep its pixels alive. See [`Image::downgrade`].
+#[derive(Clone, Default)]
+pub struct WeakImage(Weak<State>);
+impl WeakImage {
+    /// The image, while anything else still holds it.
+    pub fn upgrade(&self) -> Option<Image> { self.0.upgrade().map(Image::new) }
+}
+
 enum Input {
     Encoded(Arc<[u8]>),
+    /// `ImageCache::load_within`: encoded bytes, shrunk to a box (pixels) as `SurfaceFit` places them.
+    EncodedWithin(Arc<[u8]>, [u32; 2], SurfaceFit),
     Rgba(u32, u32, Arc<[u8]>),
     Icon(#[cfg_attr(target_arch = "wasm32", allow(dead_code))] std::path::PathBuf, #[cfg_attr(target_arch = "wasm32", allow(dead_code))] u32),
     Svg(Arc<[u8]>, u32),
@@ -130,6 +146,7 @@ impl Input {
     fn decode(self) -> Result<Decoded, ImageError> {
         match self {
             Input::Encoded(bytes) => decode(&bytes),
+            Input::EncodedWithin(bytes, size, fit) => decode_within(&bytes, Some((size, fit))),
             Input::Rgba(w, h, bytes) => mip_chain(w, h, &bytes),
             Input::Svg(bytes, px) => svg_rgba(&bytes, px).and_then(|(w, h, bytes)| mip_chain(w, h, &bytes)),
             #[cfg(not(target_arch = "wasm32"))]
@@ -263,6 +280,24 @@ impl ImageCache {
         hash.update(&bytes);
         let id = *hash.finalize().as_bytes();
         self.request(id, Input::Encoded(bytes))
+    }
+
+    /// [`ImageCache::load`], shrunk on the worker to what a box of `size` device pixels shows of
+    /// it: with [`SurfaceFit::Fill`] to the smallest size that still covers the box, with
+    /// [`SurfaceFit::Fit`] to the largest that fits inside it, keeping its aspect ratio. Never
+    /// enlarged. The shrink averages by area in linear light, as the mips do. For pictures
+    /// fetched at whatever size a server has (a 2000 px poster for a 170 pt card): their decoded
+    /// pixels, and the atlas space they take, are what's drawn rather than what was sent. An
+    /// animation keeps its size. Handles are shared by content, box and fit.
+    pub fn load_within(&self, bytes: impl Into<Arc<[u8]>>, size: [u32; 2], fit: SurfaceFit) -> Image {
+        let bytes = bytes.into();
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"rune-encoded-within\0");
+        hash.update(&size[0].to_le_bytes());
+        hash.update(&size[1].to_le_bytes());
+        hash.update(&[fit as u8]);
+        hash.update(&bytes);
+        self.request(*hash.finalize().as_bytes(), Input::EncodedWithin(bytes, size, fit))
     }
 
     /// SVG or SVGZ bytes rasterized to fit `size_pt` points square at `scale` device pixels per
@@ -630,14 +665,34 @@ pub fn svg_rgba_cover(_: &[u8], _: u32) -> Result<Vec<u8>, ImageError> {
     Err(ImageError("SVG images need rune's `svg` feature".into()))
 }
 
-fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
+fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> { decode_within(bytes, None) }
+
+/// The size a `w`×`h` image shrinks to for a box of `size` (see [`ImageCache::load_within`]):
+/// itself when that's no smaller.
+fn shrunk_size(w: u32, h: u32, size: [u32; 2], fit: SurfaceFit) -> (u32, u32) {
+    let (sx, sy) = (f64::from(size[0]) / f64::from(w), f64::from(size[1]) / f64::from(h));
+    let scale = match fit { SurfaceFit::Fit => sx.min(sy), SurfaceFit::Fill => sx.max(sy) };
+    if scale >= 1.0 { return (w, h); }
+    let (mut nw, mut nh) = ((f64::from(w) * scale).round().max(1.0) as u32, (f64::from(h) * scale).round().max(1.0) as u32);
+    // Filling, the side that sets the scale meets the box exactly, whatever the rounding.
+    if fit == SurfaceFit::Fill { (nw, nh) = (nw.max(size[0].min(w)), nh.max(size[1].min(h))); }
+    (nw, nh)
+}
+
+/// [`decode`], shrunk to `within` (a box in pixels and how the image goes in it) when it's
+/// bigger than that shows. An animation keeps its size.
+fn decode_within(bytes: &[u8], within: Option<([u32; 2], SurfaceFit)>) -> Result<Decoded, ImageError> {
+    let chain = |w: u32, h: u32, rgba: &[u8]| match within.map(|(size, fit)| shrunk_size(w, h, size, fit)) {
+        Some((nw, nh)) if (nw, nh) != (w, h) => mip_chain(nw, nh, &mips::resample(w, h, rgba, nw, nh)),
+        _ => mip_chain(w, h, rgba),
+    };
     if is_svg(bytes) {
         let (w, h, rgba) = svg_rgba(bytes, 0)?;
-        return mip_chain(w, h, &rgba);
+        return chain(w, h, &rgba);
     }
     if avif::is_avif(bytes) {
         let (w, h, rgba) = avif::rgba(bytes)?;
-        return mip_chain(w, h, &rgba);
+        return chain(w, h, &rgba);
     }
     let bytes = if bytes.starts_with(b"icns") { icns_png(bytes)? } else { bytes };
     if let Some(animation) = animated::decode(bytes) { return animation; }
@@ -659,7 +714,7 @@ fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
     let mut image = image::DynamicImage::from_decoder(decoder).map_err(error)?;
     image.apply_orientation(orientation);
     let image = image.into_rgba8();
-    mip_chain(image.width(), image.height(), image.as_raw())
+    chain(image.width(), image.height(), image.as_raw())
 }
 
 /// A PNG decoded to 8-bit RGBA by the PNG decoder alone. `image::load_from_memory_with_format`

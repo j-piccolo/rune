@@ -163,6 +163,7 @@ pub use image::Image;
 pub use image::ImageCache;
 pub use image::ImageError;
 pub use image::ImageId;
+pub use image::WeakImage;
 pub use input::canvas_input::GesturePhase;
 pub use input::canvas_input::MagnifyEvent;
 pub use input::canvas_input::PointerButton;

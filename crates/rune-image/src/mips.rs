@@ -113,6 +113,53 @@ fn downsample_rows(w: u32, h: u32, src: &[u8], rows: std::ops::Range<u32>, out: 
 }
 pub(super) fn byte(v: f32) -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 }
 
+/// `w`×`h` straight-alpha sRGB RGBA8 `src` shrunk to `nw`×`nh` by area, as the mips are: each
+/// target pixel averages the source pixels it covers, in linear light with colour weighted by
+/// alpha. Straight-alpha sRGB RGBA8 again, for [`mip_chain`]. A row pass, then a column pass.
+pub(super) fn resample(w: u32, h: u32, src: &[u8], nw: u32, nh: u32) -> Vec<u8> {
+    let srgb = &*SRGB;
+    let src = src.as_chunks::<4>().0;
+    // Each target column or row: the source span it covers, as [start, end) in source pixels.
+    let span = |i: u32, from: u32, to: u32| (i as f32 * from as f32 / to as f32, (i + 1) as f32 * from as f32 / to as f32);
+    let mut rows = vec![[0.0f32; 4]; nw as usize * h as usize];
+    for y in 0..h {
+        for x in 0..nw {
+            let (x0, x1) = span(x, w, nw);
+            let mut sum = [0.0; 4];
+            for sx in x0.floor() as u32..(x1.ceil() as u32).min(w) {
+                let weight = ((sx + 1) as f32).min(x1) - (sx as f32).max(x0);
+                let p = &src[(y * w + sx) as usize];
+                let a = p[3] as f32 / 255.0;
+                let linear = [srgb.decode[p[0] as usize] * a, srgb.decode[p[1] as usize] * a, srgb.decode[p[2] as usize] * a, a];
+                for c in 0..4 { sum[c] += linear[c] * weight; }
+            }
+            rows[(y * nw + x) as usize] = sum.map(|v| v / (x1 - x0));
+        }
+    }
+    let mut out = Vec::with_capacity(nw as usize * nh as usize * 4);
+    for y in 0..nh {
+        let (y0, y1) = span(y, h, nh);
+        for x in 0..nw {
+            let mut sum = [0.0; 4];
+            for sy in y0.floor() as u32..(y1.ceil() as u32).min(h) {
+                let weight = ((sy + 1) as f32).min(y1) - (sy as f32).max(y0);
+                let p = rows[(sy * nw + x) as usize];
+                for c in 0..4 { sum[c] += p[c] * weight; }
+            }
+            let [r, g, b, a] = sum.map(|v| v / (y1 - y0));
+            let alpha = byte(a);
+            if alpha == 0 {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            // Back to straight colour: the encoder caps a channel at its alpha, which is 255 here.
+            let straight = |v: f32| srgb.encode(v / a, 255);
+            out.extend_from_slice(&[straight(r), straight(g), straight(b), alpha]);
+        }
+    }
+    out
+}
+
 /// sRGB transfer tables, so mip generation runs no `powf` per pixel.
 struct Srgb {
     /// Linear light of each sRGB byte.
