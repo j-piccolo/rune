@@ -160,11 +160,13 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
     start with the Windfoil shader everywhere but macOS, where the Classic shader keeps drawing
     until text asks for outlines; where it can't be built, the CPU fills the same masks
     (`crates/rune-text/src/outline/cover.rs`) and moving text draws from them.
-  - `WindfoilChromium`, the default everywhere but macOS and a Mac's browser, then `Slug`,
+  - `WindfoilChromium`, the default everywhere but macOS and a Mac's browser, then `WindfoilDesign`, `Slug`,
     `HintedGpu` and `Hinted`: the other ways to draw from the outline store. Each takes Chromium's weight (no dilation, Skia's text gamma):
-    Windfoil's box coverage of the design outline, Slug's two-ray winding (`outline_slug` in
-    `outline.wgsl`), the outline after skrifa's light autohint, and that autohinted outline on
-    whole-pixel pens, which is Chromium's text on Linux. `FontSmoothing::ALL` lists every mode and
+    Windfoil's box coverage of the design outline (off macOS, of a hinted face's outline after its
+    TrueType hints ran vertically), that coverage of the design outline whatever hints the face
+    carries (one outline a glyph at every size, and no font program run in a frame), Slug's
+    two-ray winding (`outline_slug` in `outline.wgsl`), the outline after skrifa's light autohint,
+    and that autohinted outline on whole-pixel pens, which is Chromium's text on Linux. `FontSmoothing::ALL` lists every mode and
     `FontSmoothing::support` says whether this machine draws one as named (`crates/rune-text/src/raster/support.rs`).
   - `WindfoilRgb` and `ClearType` (Windows): subpixel text. Masks hold three coverages a pixel
     (Windfoil's box about each subpixel, or DirectWrite's `CLEARTYPE_3x1`), and the window draws
