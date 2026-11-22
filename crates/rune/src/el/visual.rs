@@ -28,6 +28,8 @@ pub struct VisualCold {
     /// Points into the dash pattern where it starts (`El::border_dash_phase`).
     pub border_dash_phase: f32,
     pub shadows: Vec<Shadow>,
+    /// Something opaque is drawn over this element's whole box (`El::shadow_under`).
+    pub(crate) shadows_under: bool,
     pub blur_motion: Option<Box<Anim>>,
     /// Soft clip of children to this rect: fade widths left, top, right, bottom. A negative
     /// width ramps linearly (`El::clip_fade_linear`).
@@ -136,6 +138,7 @@ impl Empty for VisualCold {
         border_dash: None,
         border_dash_phase: 0.0,
         shadows: Vec::new(),
+        shadows_under: false,
         blur_motion: None,
         clip: None,
         clip_radius: None,

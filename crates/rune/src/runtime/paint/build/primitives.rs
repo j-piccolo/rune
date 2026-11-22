@@ -88,7 +88,15 @@ impl RuntimeCore {
         // (`El::dim`), or filled with a translucent colour, it leaves that middle clear, as
         // CSS clips box-shadow to outside the box: a 6% white button shows the surface
         // under it, not its own shadows.
-        let opaque = solid && o >= 1.0 && n.vis.gradient.is_none() && n.vis.radial.is_none() && n.vis.surface.is_none();
+        // So does a box with no fill under a gradient whose every stop is opaque: its segments
+        // cover the box between them, the first and last running on past their stops, and where
+        // their colours are opaque the gradient is.
+        let gradient_solid = casts && fill_a <= 0.0 && n.vis.gradient.is_none() && n.vis.radial.as_ref().is_some_and(|rg| {
+            rg.stops.len() >= 2 && rg.stops.iter().enumerate().all(|(k, stop)| (if k < P_RADIAL.len() { self.color(n.id, P_RADIAL[k], stop.1) } else { stop.1 }).a >= 1.0)
+        });
+        let opaque = (o >= 1.0 && n.vis.surface.is_none() && ((solid && n.vis.gradient.is_none() && n.vis.radial.is_none()) || gradient_solid))
+            // Or it says something opaque covers its box (`El::shadow_under`), whatever its own opacity.
+            || (casts && n.vis.shadows_under);
         let see_through = casts && fill_a > 0.0 && fill_a < 1.0;
         let dim_hole = ((solid && o < 1.0) || see_through).then(|| crate::system_material::clamp_radius(radii, w, h) * if n.vis_flags.continuous_corners() { -1.0 } else { 1.0 });
         let cast = shadow_paint::Caster {
