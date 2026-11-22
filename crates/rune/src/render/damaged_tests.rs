@@ -68,3 +68,18 @@ fn a_rect_across_the_seam_is_kept_in_pieces() {
     pieces.sort_unstable();
     assert_eq!(pieces, vec![([10, 5, 30, 5], [10, 5]), ([10, 10, 30, 30], [10, 30]), ([10, 40, 30, 15], [10, 10])]);
 }
+
+#[test]
+fn an_aged_target_takes_only_what_the_frames_since_redrew() {
+    use std::collections::VecDeque;
+    let history: VecDeque<Option<Vec<[u32; 4]>>> = [Some(vec![[0, 0, 4, 4]]), None, Some(vec![[8, 8, 2, 2]]), Some(vec![])].into();
+    let now = [[1, 1, 1, 1]];
+    assert_eq!(aged(&history, 0, &now), None, "nothing is known of the target");
+    assert_eq!(aged(&history, 1, &now), Some(vec![[1, 1, 1, 1]]), "the last frame: only this one's");
+    assert_eq!(aged(&history, 2, &now), Some(vec![[1, 1, 1, 1]]), "the frame between changed nothing");
+    assert_eq!(aged(&history, 3, &now), Some(vec![[1, 1, 1, 1], [8, 8, 2, 2]]));
+    assert_eq!(aged(&history, 4, &now), None, "a frame since drew some other way");
+    assert_eq!(aged(&history, 6, &now), None, "older than what is remembered");
+    let many: VecDeque<Option<Vec<[u32; 4]>>> = [Some((0..9).map(|k| [k * 10, 0, 5, 5]).collect())].into();
+    assert_eq!(aged(&many, 2, &[]), Some(vec![[0, 0, 85, 5]]), "many rectangles are their bounds");
+}
