@@ -138,7 +138,12 @@ impl AnyHost for OverlayHost {
         self.core.sync(&mut *self.app, event_loop);
     }
 
-    fn vanish(&mut self) { self.core.hide(&mut *self.app); }
+    fn vanish(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.core.ending = crate::quit::fast_exit_hook().is_some(); }
+        self.core.hide(&mut *self.app);
+        self.core.ending = false;
+    }
 
     #[cfg(target_os = "macos")]
     fn stop_pacing(&mut self) {
@@ -386,7 +391,12 @@ impl AnyHost for OverlayHost {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) -> bool {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // The app is quitting: its windows leave the screen as the loop ends (`Windows::exiting`)
+        // and draw nothing more. A frame now presents to a surface the compositor may already
+        // have stopped showing (a lock surface once the lock is released), and its present, with
+        // vsync, waits for a frame callback that never comes: the quit hung there.
+        if event_loop.exiting() { return false; }
         let core = &mut self.core;
         let app = &mut *self.app;
         #[cfg(target_os = "macos")]
@@ -402,12 +412,12 @@ impl AnyHost for OverlayHost {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if let Some(live) = core.surface.live() && let Some(x11) = &core.x11 && let Some((point, desktop)) = x11.take_pointer(live.scale) {
             core.observe_pointer(app, point.0, point.1);
-            core.follow_pointer(app, _event_loop, desktop);
+            core.follow_pointer(app, event_loop, desktop);
         }
         #[cfg(target_os = "windows")]
         if core.surface.live().is_some() && let Some(point) = core.native.as_ref().and_then(|p| p.take_pointer()) && app.rt().pointer() != Some(point) {
             core.observe_pointer(app, point.0, point.1);
-            if let Some(point) = crate::platform::win32::pointer_position() { core.follow_pointer(app, _event_loop, point); }
+            if let Some(point) = crate::platform::win32::pointer_position() { core.follow_pointer(app, event_loop, point); }
         }
         // Covering or sleeping displays can come without an event the overlay sees.
         #[cfg(target_os = "macos")]
@@ -421,8 +431,8 @@ impl AnyHost for OverlayHost {
                 core.observe_pointer(app, x, y);
                 if core.position_owner.is_managed() && core.options.follow_pointer && core.options.display == DisplayTarget::UnderPointer {
                     let size = core.at.size;
-                    core.resolve_size(_event_loop);
-                    if size != core.at.size { core.resized(app, _event_loop); }
+                    core.resolve_size(event_loop);
+                    if size != core.at.size { core.resized(app, event_loop); }
                     else if let Some(panel) = &core.panel { panel.place(core.at, &core.options); }
                     core.sync_live_origin(app.rt_mut());
                 }

@@ -336,7 +336,17 @@ impl OverlayCore {
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             Backing::Layer(_) | Backing::Xwayland(_) => {
-                self.surface.take_live();
+                let live = self.surface.take_live();
+                // Quitting into a fast exit, the swap chain is never drawn into again and the
+                // process ends in moments: it is left to that. Destroying it waits for the
+                // compositor to finish with its last frame (Mesa's Wayland WSI roundtrips until
+                // it has), which for a surface it no longer draws (a lock surface once the lock
+                // is released) took a second and more. The surface still leaves the screen now:
+                // its Wayland objects go.
+                if self.ending && let Some(Live { surface, backing, .. }) = live {
+                    std::mem::forget(surface);
+                    drop(backing);
+                }
                 self.drop_hidden_images(app);
             }
         }
