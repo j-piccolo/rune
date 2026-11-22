@@ -430,6 +430,9 @@ fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shi
     // Near its place first (a scroll alone leaves the list as long as it was), then further (rows
     // came into the list or left it): a wide look at every probe costs a frame thousands of
     // comparisons.
+    // Every shift most probes agree on, the best supported first, with how far ahead the old middle
+    // runs there. A card or a glyph like it elsewhere can win the near look when rows came into the
+    // list or left it (what was near each probe is then another row's), so more than one is tried.
     let voted = |reach: usize| {
         let window = |j: usize| j.saturating_sub(reach)..(j + reach + 1).min(om.len());
         let mut votes: Vec<([f32; 2], usize)> = Vec::new();
@@ -442,15 +445,40 @@ fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shi
                 match votes.iter_mut().find(|(v, _)| *v == d) { Some(e) => e.1 += 1, None => votes.push((d, 1)) }
             }
         }
-        let (d, support) = votes.into_iter().max_by_key(|(_, n)| *n)?;
-        if support * 2 <= probes.len() { return None; }
-        let ahead = probes.iter().find_map(|&j| {
-            window(j).filter(|&i| moved(&om[i], &nm[j]) == Some(d)).min_by_key(|&i| i.abs_diff(j)).map(|i| i as isize - j as isize)
-        })?;
-        Some((d, ahead))
+        votes.retain(|(_, support)| support * 2 > probes.len());
+        votes.sort_by_key(|(_, support)| std::cmp::Reverse(*support));
+        votes.truncate(2);
+        votes.into_iter().filter_map(|(d, _)| {
+            let ahead = probes.iter().find_map(|&j| {
+                window(j).filter(|&i| moved(&om[i], &nm[j]) == Some(d)).min_by_key(|&i| i.abs_diff(j)).map(|i| i as isize - j as isize)
+            })?;
+            Some((d, ahead))
+        }).collect::<Vec<_>>()
     };
-    let (d, mut ahead) = voted(24).or_else(|| voted(256))?;
+    // The first shift that leaves under half the window to redraw, or of those tried the one that
+    // leaves least: a wrong one copies pixels that are right only where its few pairs lie, and
+    // redraws nearly all the rest, where a fast scroll's own strip is seldom half the window. Each
+    // further try is a walk of both lists, so a frame that scrolled as it seems pays for one.
+    let little = (size.0 * size.1) / 2;
+    let mut best: Option<(u32, (Shift, Vec<[u32; 4]>))> = None;
+    let mut tried: Vec<[f32; 2]> = Vec::new();
+    for reach in [24, 256] {
+        for (d, ahead) in voted(reach) {
+            if tried.contains(&d) { continue; }
+            tried.push(d);
+            let Some(plan) = scrolled_by(old, new, start, end, size, d, ahead) else { continue };
+            let redrawn = plan.1.iter().map(|r| area(*r)).sum::<u32>();
+            if redrawn <= little { return Some(plan); }
+            if best.as_ref().is_none_or(|(least, _)| redrawn < *least) { best = Some((redrawn, plan)); }
+        }
+    }
+    best.map(|(_, plan)| plan)
+}
+
+/// `scrolled` for one shift `d`, with the old middle running `ahead` of the new at the probes.
+fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, size: (u32, u32), d: [f32; 2], mut ahead: isize) -> Option<(Shift, Vec<[u32; 4]>)> {
     if d[0].fract() != 0.0 || d[1].fract() != 0.0 || !on_grid(d[0]) || !on_grid(d[1]) { return None; }
+    let (om, nm) = (&old[start..old.len() - end], &new[start..new.len() - end]);
     // Moved first: it tells most pairs apart by their size and kind alone.
     let fits = |o: &Instance, n: &Instance| moved(o, n) == Some(d) || bytemuck::bytes_of(o) == bytemuck::bytes_of(n);
     let mut paired = vec![false; om.len()];
