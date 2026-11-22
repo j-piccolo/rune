@@ -43,9 +43,6 @@ pub(super) trait OverlayApp {
     fn compositor_animating(&self) -> bool;
     fn render_compositor(&mut self, args: OverlayRenderArgs<'_>) -> bool;
     fn release_compositor_gpu(&mut self);
-    /// A primary press (true) or release on the surface, before the runtime hears it
-    /// (`ConfiguredOverlay::on_button`).
-    fn button_hook(&mut self, down: bool);
 }
 
 impl dyn OverlayApp + '_ {
@@ -106,6 +103,12 @@ impl dyn OverlayApp + '_ {
         self.driver(|rt, app| rt.pointer_down(app, x, y));
     }
 
+    /// A primary press (true) or release on the surface for `ConfiguredOverlay::on_button`:
+    /// a press before the view hears it, a release after (`RuntimeCore::button_hook`).
+    pub(super) fn button_hook(&mut self, down: bool) {
+        self.driver(|rt, app| rt.button_hook(app, down));
+    }
+
     pub(super) fn pointer_up(&mut self, x: f32, y: f32) {
         self.driver(|rt, app| rt.pointer_up(app, x, y));
     }
@@ -161,7 +164,6 @@ pub(super) struct TypedOverlayApp<T: 'static> {
     pub(super) setup: Option<fn(&mut T, Waker)>,
     pub(super) on_availability: Option<fn(&mut T, super::Availability, &mut Tx)>,
     pub(super) shared: Arc<Shared<T>>,
-    pub(super) on_button: Option<fn(&mut T, bool)>,
 }
 
 impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
@@ -236,10 +238,6 @@ impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
             c.release_gpu();
         }
     }
-
-    fn button_hook(&mut self, down: bool) {
-        if let Some(hook) = self.on_button { hook(&mut self.rt.state, down); }
-    }
 }
 
 /// Non-generic overlay host stored in `App::overlays` and `Windows::hosts`.
@@ -268,6 +266,7 @@ fn build_parts<S, T: 'static>(
     let mut rt = Runtime::with_text(state, spec.view, spec.size, Env::default(), text);
     rt.configure(runtime);
     rt.track_marks = compositor.is_some();
+    rt.hooks.on_button = on_button;
     rt.on_key = on_key;
     // App and overlay may use different state types. Downcast the function pointer
     // once, without a per-frame adapter or changing App::overlay's generic API.
@@ -288,7 +287,7 @@ fn build_parts<S, T: 'static>(
         animate_reveal,
         release_after,
     );
-    let typed = TypedOverlayApp { rt, compositor, setup, on_availability, shared: shared.clone(), on_button };
+    let typed = TypedOverlayApp { rt, compositor, setup, on_availability, shared: shared.clone() };
     (core, typed, OverlayHandle { shared }, inherits_font_smoothing)
 }
 
@@ -405,7 +404,6 @@ impl<T: 'static> OverlayApp for BorrowOverlayApp<'_, T> {
             c.release_gpu();
         }
     }
-    fn button_hook(&mut self, _down: bool) {}
 }
 
 #[cfg(test)]

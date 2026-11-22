@@ -111,10 +111,10 @@ impl RuntimeCore {
         self.physical_input(crate::PhysicalInput::FocusLost);
     }
 
-    /// Keyboard input, a focus change, a file drag step or a file dialog answer is queued for the
-    /// next frame.
+    /// Keyboard input, a focus change, a file drag step, a file dialog answer or a button for the
+    /// app's hook (`button_hook`) is queued for the next frame.
     pub(crate) fn keys_queued(&self) -> bool {
-        self.frame.queue.iter().any(|a| matches!(a, Action::Physical(..) | Action::Key { .. } | Action::KeyUp(_) | Action::WindowFocus(_) | Action::Files(_) | Action::FileDialog(..)))
+        self.frame.queue.iter().any(|a| matches!(a, Action::Physical(..) | Action::Key { .. } | Action::KeyUp(_) | Action::WindowFocus(_) | Action::Files(_) | Action::FileDialog(..) | Action::Button(_)))
     }
 
     /// Host time on the logical clock.
