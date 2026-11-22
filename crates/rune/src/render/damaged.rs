@@ -35,6 +35,12 @@ pub(crate) const MAX_ARMED: usize = 8;
 /// Rectangles the kept frame may be behind a target that keeps its pixels in, before they are one.
 const LAG_RECTS: usize = 4;
 
+/// Frames whose redrawn rectangles are remembered for a target that comes back older (`arm_aged_target`):
+/// a swap chain of this many buffers and one more is served.
+const HISTORY: usize = 4;
+/// Rectangles such a target is brought up to date in, before they are their bounds.
+const AGED_RECTS: usize = 8;
+
 /// What the armed rectangles came to.
 pub(super) type Drawn = Result<(), &'static str>;
 
@@ -176,6 +182,15 @@ pub(super) struct DamageState {
     /// Where the kept frame, current otherwise, is behind such a target: what frames redrew on
     /// the target alone (`[x, y, width, height]` each).
     lag: Vec<[u32; 4]>,
+    /// The armed frame's target holds, whole, the frame this renderer drew this many frames ago
+    /// (`arm_aged_target`); 0: it holds nothing known.
+    target_age: u32,
+    /// What each of the last frames redrew in the kept frame, newest last (`[x, y, width, height]`
+    /// each; none where nothing changed). `None`: a frame that changed the picture some other way
+    /// (drawn whole, a scroll, drawn through the drawable, not armed).
+    history: std::collections::VecDeque<Option<Vec<[u32; 4]>>>,
+    /// This frame's entry for `history`, when it redrew rectangles of a current kept frame.
+    redrew: Option<Vec<[u32; 4]>>,
     /// Fills a rectangle with one opaque colour, for the format it was made for (`solid_pipeline`).
     solid: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     drawn: Option<Drawn>,
@@ -234,6 +249,7 @@ impl Renderer {
         d.behind = false;
         d.same = false;
         d.target_kept = false;
+        d.target_age = 0;
         d.clear = clear;
         d.shift = shift;
         d.drawn = Some(Err("drawn by the compositor"));
@@ -349,6 +365,16 @@ impl Renderer {
         self.damage.lock().unwrap().target_kept = true;
     }
 
+    /// After `arm_damage` or `arm_whole`: the texture the next `draw` draws into holds, whole, the
+    /// frame this renderer drew into a target `age` frames ago (1: the last frame), and nothing
+    /// drawn since: a swap chain's buffer of a known age. The kept frame is then copied out only
+    /// where the frames since redrew it, not all of it. For a host that knows its buffers' ages
+    /// (`EGL_EXT_buffer_age`; a swap chain whose images keep their pixels); 0 says nothing is known.
+    #[cfg_attr(any(target_os = "macos", target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn arm_aged_target(&self, age: u32) {
+        self.damage.lock().unwrap().target_age = age;
+    }
+
     /// The armed frame redraws its rectangles over a current kept frame, and no layer is among
     /// what it draws there: `prepare` leaves the layers as the last frame planned and drew them.
     pub(super) fn cycle_leaves_layers(&self) -> bool {
@@ -366,7 +392,11 @@ impl Renderer {
         d.behind = false;
         d.same = false;
         d.target_kept = false;
+        d.target_age = 0;
         d.looped = false;
+        let redrew = d.redrew.take();
+        if d.history.len() == HISTORY { d.history.pop_front(); }
+        d.history.push_back(redrew);
         if let Some(c) = d.pixel.as_mut() { c.frame_ended(); }
         let drawn = d.drawn.take().unwrap_or(Err("not armed"));
         if drawn.is_err() && let Some(r) = d.retained.as_mut() { r.current = false; }
@@ -518,6 +548,7 @@ impl Renderer {
             d.lag.clear();
         }
         let partial = kept.current;
+        let age = std::mem::take(&mut d.target_age) as usize;
         // Through the drawable: a scroll, and every frame after it while the kept frame is rolled.
         let through = kept.current && (shift.is_some() || d.roll.is_some());
         let through_view = view.filter(|_| dst.usage().contains(wgpu::TextureUsages::COPY_SRC));
@@ -543,7 +574,13 @@ impl Renderer {
                     }
                     d.roll = roll;
                 }
-                Roll::pieces(d.roll, [0, 0, size[0], size[1]], &mut pieces);
+                // A target that holds an older frame is behind the kept frame only where the frames
+                // since redrew it (this frame's rectangles are drawn on it below); a scroll moved
+                // the viewport's every pixel, and its frame takes the whole kept frame.
+                match aged(&d.history, age, &[]).filter(|_| shift.is_none()) {
+                    Some(past) => for rect in past { Roll::pieces(d.roll, rect, &mut pieces); },
+                    None => Roll::pieces(d.roll, [0, 0, size[0], size[1]], &mut pieces),
+                }
                 for (s, k) in pieces.drain(..) { copy(encoder, &kept.texture, k, dst, [s[0], s[1]], [s[2], s[3]]); }
             }
             // Nothing changed: no pass at all, where one would load and store a target to draw nothing.
@@ -552,6 +589,7 @@ impl Renderer {
                 // What was redrawn, back where the kept frame holds it.
                 for &rect in rects.iter().filter(|_| !unchanged) { Roll::pieces(d.roll, rect, &mut pieces); }
                 for (s, k) in pieces.drain(..) { copy(encoder, dst, [s[0], s[1]], &kept.texture, k, [s[2], s[3]]); }
+                d.redrew = shift.is_none().then(|| if unchanged { Vec::new() } else { rects.clone() });
                 d.drawn = Some(Ok(()));
                 return true;
             }
@@ -563,7 +601,16 @@ impl Renderer {
         }
         // `RUNE_LOOP_CHECK=2`: this loop-only frame's picture, and the whole frame's beside it.
         if looped && partial && let Some(c) = d.pixel.as_mut() { self.pixel_check_encode(encoder, c, &kept.texture, clear, &rects); }
-        copy(encoder, &kept.texture, [0, 0], dst, [0, 0], size);
+        // What this frame redrew in a kept frame that was current, for the frames after it.
+        let redrew = partial.then(|| if unchanged { Vec::new() } else { rects.clone() });
+        // A target that holds an older frame of this renderer's differs from the kept frame only
+        // where the frames since redrew it, this one among them: those rectangles are copied out,
+        // where a target that holds nothing known takes the whole kept frame.
+        match redrew.as_ref().and_then(|now| aged(&d.history, age, now)) {
+            Some(all) => for [x, y, w, h] in all { copy(encoder, &kept.texture, [x, y], dst, [x, y], [w, h]); },
+            None => copy(encoder, &kept.texture, [0, 0], dst, [0, 0], size),
+        }
+        d.redrew = redrew;
         d.drawn = Some(Ok(()));
         true
     }
@@ -620,6 +667,23 @@ impl Renderer {
             }
         }
     }
+}
+
+/// Where a target that holds the frame of `age` frames ago differs from the kept frame: what the
+/// frames since redrew (`history`, newest last) and `now`, this frame's. `None` when one of them
+/// changed the picture in a way its rectangles don't say, or the age isn't known (0) or remembered.
+fn aged(history: &std::collections::VecDeque<Option<Vec<[u32; 4]>>>, age: usize, now: &[[u32; 4]]) -> Option<Vec<[u32; 4]>> {
+    if age == 0 || age - 1 > history.len() { return None; }
+    let mut all = now.to_vec();
+    for past in history.iter().rev().take(age - 1) { all.extend_from_slice(past.as_ref()?); }
+    if all.len() > AGED_RECTS {
+        let bounds = all.drain(..).reduce(|a, b| {
+            let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
+            [x, y, (a[0] + a[2]).max(b[0] + b[2]) - x, (a[1] + a[3]).max(b[1] + b[3]) - y]
+        });
+        all.extend(bounds);
+    }
+    Some(all)
 }
 
 /// A loop-only frame's rectangles, the runs drawn in each, and whether a layer is among them.
