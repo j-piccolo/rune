@@ -44,9 +44,10 @@ pub(crate) fn note_outlines(support: Outlines) {
 
 impl FontSmoothing {
     /// Every mode, in the order a setting lists them.
-    pub const ALL: [FontSmoothing; 10] = [
+    pub const ALL: [FontSmoothing; 11] = [
         FontSmoothing::Windfoil,
         FontSmoothing::WindfoilChromium,
+        FontSmoothing::WindfoilDesign,
         FontSmoothing::Slug,
         FontSmoothing::WindfoilRgb,
         FontSmoothing::HintedGpu,
