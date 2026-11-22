@@ -1,0 +1,1 @@
+- Wayland: `SessionLock::unlock` returns once the compositor has read the unlock (a roundtrip), not once it is sent. A locker exiting at once could hang up before the compositor read it, which left the session locked.
