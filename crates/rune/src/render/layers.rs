@@ -68,6 +68,10 @@ pub(super) struct Layers {
     bindings: u64,
     cache_budget: u64,
     frame_stamp: u64,
+    /// Bumped whenever texels a layer's instances may sample are written (glyph atlas rows and
+    /// fills, outline records, image pages): a target that holds a layer's picture holds it for
+    /// one such generation (`Holds`).
+    pub(super) texels: u64,
     /// Test-only: the most bytes of live targets and their blur scratches a frame has held at once.
     #[cfg(test)]
     peak: u64,
@@ -155,6 +159,7 @@ impl Default for Layers {
             bindings: 0,
             cache_budget: DEFAULT_CACHE_BUDGET,
             frame_stamp: 0,
+            texels: 0,
             #[cfg(test)]
             peak: 0,
             #[cfg(test)]
@@ -182,9 +187,41 @@ pub(super) struct Target {
     content_size: [f32; 2],
     /// The `Layers::bindings` generation the base bind group was made against.
     binding: u64,
+    /// What the texture holds, when the last pass into it drew a plain layer (`Holds`).
+    holds: std::sync::Mutex<Option<Holds>>,
+    /// What it will hold once this frame's pass has drawn into it.
+    pending: std::sync::Mutex<Option<Holds>>,
+    /// This frame's layer is what the texture holds already: no pass draws it again, and the
+    /// frame only composites it (a fade changes a layer's opacity every frame, and nothing in it).
+    unchanged: std::sync::atomic::AtomicBool,
     /// Test-only: the outline texture's height the base bind group was made against.
     #[cfg(test)]
     outline_rows: u32,
+}
+
+/// The picture a layer's target holds: the instances drawn into it, where its origin was, and
+/// the generations of everything else they draw from. A layer that asks for the same again is
+/// composited from the texture as it stands.
+struct Holds {
+    rect: [f32; 4],
+    viewport: (u32, u32),
+    texels: u64,
+    images: u64,
+    binding: u64,
+    instances: Vec<Instance>,
+}
+
+impl Holds {
+    fn is(&self, rect: [f32; 4], viewport: (u32, u32), texels: u64, images: u64, binding: u64, instances: &[Instance]) -> bool {
+        self.rect == rect && self.viewport == viewport && self.texels == texels && self.images == images && self.binding == binding
+            && bytemuck::cast_slice::<Instance, u8>(&self.instances) == bytemuck::cast_slice::<Instance, u8>(instances)
+    }
+}
+
+/// `RUNE_LAYER_KEEP=0`: every layer is drawn into its target again each frame, as before.
+fn keeps_layers() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("RUNE_LAYER_KEEP").is_some_and(|v| v == "0"))
 }
 
 impl Describe for Target {
@@ -478,7 +515,7 @@ impl Renderer {
             let pools = Pools { slots: &layers.targets, retained: &layers.retained, spare: &layers.spare };
             layers.planner.decide(&layers.plan, &pools, layers.cache_budget, isolate, max_dim);
             self.commit(device);
-            self.paint_layers(device, &staging);
+            self.paint_layers(device, &staging, instances);
         }
         // A frame whose layers fell gives back what a burst grew the plan's scratch to; a frame
         // that keeps its layers, or stays empty, leaves it alone.
@@ -565,14 +602,20 @@ impl Renderer {
             identity: self.layers.allocations, composite_parent: None,
             quad: Self::instance_buffer(device, 1), base, composite, images: Vec::new(), glyphs: Vec::new(), image_generation: u64::MAX, blur: None,
             cache: None, last_used: 0, content_size: [0.0; 2], binding: self.layers.bindings,
+            holds: Default::default(), pending: Default::default(), unchanged: Default::default(),
             #[cfg(test)]
             outline_rows: self.uber.outlines().map_or(0, wgpu::Texture::height) }
     }
 
     /// Draws what each layer's disposition says: its target's descriptor, its blur, and the quad
     /// that composites it.
-    fn paint_layers(&mut self, device: &wgpu::Device, staging: &rune_staging::Staging) {
+    fn paint_layers(&mut self, device: &wgpu::Device, staging: &rune_staging::Staging, instances: &[Instance]) {
         let stamp = self.layers.frame_stamp;
+        // Only instances draw into a layer this frame: no effect's pass, GPU spring, backdrop or
+        // native surface changes what lands there without changing them.
+        let quiet = keeps_layers() && self.effects.is_empty() && self.springs.is_none() && !self.has_backdrop_blur()
+            && self.surfaces.as_ref().is_none_or(|s| s.draws_nothing());
+        let (viewport, texels, images) = (self.layers.viewport, self.layers.texels, self.layers.image_generation);
         for index in 0..self.layers.plan.len() {
             let l = self.layers.plan[index];
             match self.layers.planner.dispositions[index] {
@@ -597,6 +640,18 @@ impl Renderer {
                     t.cache = cache;
                     t.last_used = stamp;
                     t.content_size = [rect[2], rect[3]];
+                    // A plain layer (no blur, no turn, no layer or effect inside it) that draws what
+                    // its target holds already isn't drawn again: the frame composites the texture.
+                    let content = instances.get(l.begin as usize + 1..l.end as usize).unwrap_or(&[]);
+                    let plain = quiet && cache.is_none() && l.blur == 0.0 && !l.free && l.turn.is_none() && !content.is_empty()
+                        && !content.iter().any(|i| i.kind().is_none_or(|k| matches!(k, Kind::Layer | Kind::LayerEnd | Kind::Effect | Kind::BackdropBlur)));
+                    let holds = t.holds.get_mut().unwrap_or_else(|e| e.into_inner());
+                    let same = plain && holds.as_ref().is_some_and(|h| h.is(rect, viewport, texels, images, t.binding, content));
+                    *t.unchanged.get_mut() = same;
+                    if !same {
+                        *holds = None;
+                        *t.pending.get_mut().unwrap_or_else(|e| e.into_inner()) = plain.then(|| Holds { rect, viewport, texels, images, binding: t.binding, instances: content.to_vec() });
+                    }
                     // A scratch the layer no longer wants was dropped by `Move::Unblur`, before any
                     // later layer's texture existed.
                     if l.blur > 0.0 {
@@ -695,7 +750,7 @@ impl Renderer {
         target.map_or(Blend::SourceOver, |p| self.layers.plan[p].blend)
     }
 
-    pub(super) fn images_changed(&mut self) { self.layers.image_generation += 1; }
+    pub(super) fn images_changed(&mut self) { self.layers.image_generation += 1; self.layers.texels += 1; }
 
     /// Makes every live target's bind groups again (a new atlas or outline texture), and starts a
     /// generation: the slots and retained caches bind it here, a parked target binds it when a
@@ -790,6 +845,7 @@ impl Renderer {
             let disposition = self.layers.planner.dispositions.get(index).copied().unwrap_or(Disposition::Skip);
             if !matches!(disposition, Disposition::Render { .. }) { continue; }
             let Some(target) = &self.layers.targets[index] else { continue };
+            if target.unchanged.load(std::sync::atomic::Ordering::Relaxed) { continue; }
             let rect = disposition.rect();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("isolated group"),
@@ -810,6 +866,10 @@ impl Renderer {
             drop(active);
             if let Some(blur) = &target.blur {
                 self.layers.blur.as_ref().unwrap().encode(encoder, blur, &target.view);
+            }
+            // The texture now holds what `paint_layers` said this pass draws.
+            if let Some(drawn) = target.pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                *target.holds.lock().unwrap_or_else(|e| e.into_inner()) = Some(drawn);
             }
         }
     }

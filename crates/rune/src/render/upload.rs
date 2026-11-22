@@ -158,6 +158,7 @@ impl Renderer {
             }
             let Some(rows) = page.dirty.take() else { continue };
             Self::write_rows(&staging, &self.images[index].as_ref().unwrap().0, &page.data, rows);
+            self.layers.texels += 1;
         }
         if changed { self.images_changed(); }
         self.refresh_layer_bindings(device);
@@ -256,6 +257,7 @@ impl Renderer {
         if let Some(rows) = atlas.dirty.take() {
             atlas.rows_uploaded(0, rows);
             Self::write_rows(&staging, &self.atlas, &atlas.data, rows);
+            self.layers.texels += 1;
         }
         let mut atlas_changed = self.atlas_pages.len() > atlas.pages.len();
         self.atlas_pages.truncate(atlas.pages.len());
@@ -270,6 +272,7 @@ impl Renderer {
             if let Some(rows) = atlas.pages[index].dirty.take() {
                 atlas.rows_uploaded(index + 1, rows);
                 Self::write_rows(&staging, &self.atlas_pages[index].0, &atlas.pages[index].data, rows);
+                self.layers.texels += 1;
             }
         }
         if atlas_changed { self.images_changed(); }
