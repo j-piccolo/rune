@@ -87,6 +87,101 @@ pub(crate) struct Row {
 pub(crate) struct Log {
     rows: Vec<Row>,
     out: Option<std::io::BufWriter<std::fs::File>>,
+    /// The CPU's counts at the last frame's end, for a log that is written (`counters`).
+    #[cfg(target_os = "linux")]
+    counted: Option<(counters::Counters, [u64; 4])>,
+}
+
+/// The CPU's own counts of this process's work in user space: cycles and instructions, of the
+/// thread that draws and of every thread. A time says how long a frame took on a machine doing
+/// other things at whatever clock it had; a cycle count ticks only while the thread runs and
+/// counts the same at any clock, and an instruction count is the same every run. Kernel time is
+/// not in them (a process may not count it here unprivileged), so they leave out what a driver
+/// does in the kernel.
+#[cfg(all(feature = "frame-profile", target_os = "linux"))]
+#[allow(unsafe_code)]
+mod counters {
+    use std::os::fd::RawFd;
+
+    /// `perf_event_attr`, its first 64 bytes (`PERF_ATTR_SIZE_VER0`).
+    #[repr(C)]
+    #[derive(Default)]
+    struct Attr { kind: u32, size: u32, config: u64, period: u64, sample_type: u64, read_format: u64, flags: u64, wakeup: u32, bp_type: u32, config1: u64 }
+
+    const INHERIT: u64 = 1 << 1;
+    const EXCLUDE_KERNEL: u64 = 1 << 5;
+    const EXCLUDE_HV: u64 = 1 << 6;
+
+    /// Cycles and instructions of the drawing thread, and of the other threads (each with the
+    /// threads it starts later), a pair for each kind of core the process may run on.
+    pub(super) struct Counters { main: Vec<[RawFd; 2]>, others: Vec<[RawFd; 2]> }
+
+    fn open(kind: u32, config: u64, tid: i32, inherit: bool) -> Option<RawFd> {
+        let attr = Attr { kind, size: 64, config, flags: EXCLUDE_KERNEL | EXCLUDE_HV | if inherit { INHERIT } else { 0 }, ..Default::default() };
+        // SAFETY: the kernel reads `size` bytes of `attr`, which lives through the call.
+        let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const Attr, tid, -1i32, -1i32, 0u64) };
+        (fd >= 0).then_some(fd as RawFd)
+    }
+
+    fn read(fd: RawFd) -> u64 {
+        let mut value = 0u64;
+        // SAFETY: a counter's read is its 8-byte count, into 8 bytes this frame owns.
+        let got = unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) };
+        if got == 8 { value } else { 0 }
+    }
+
+    /// Each CPU's counter unit that names both events: its type, and the events' numbers. Cores of
+    /// two kinds (Apple's, Arm's big and little) have a unit each; where none names them, the
+    /// kernel's generic cycles and instructions.
+    fn units() -> Vec<(u32, u64, u64)> {
+        let mut units = Vec::new();
+        for entry in std::fs::read_dir("/sys/bus/event_source/devices").into_iter().flatten().flatten() {
+            let path = entry.path();
+            let event = |name: &str| std::fs::read_to_string(path.join("events").join(name)).ok()
+                .and_then(|s| u64::from_str_radix(s.trim().strip_prefix("event=0x")?, 16).ok());
+            let kind = std::fs::read_to_string(path.join("type")).ok().and_then(|s| s.trim().parse().ok());
+            if let (Some(kind), Some(cycles), Some(instructions)) = (kind, event("cycles"), event("instructions")) { units.push((kind, cycles, instructions)); }
+        }
+        if units.is_empty() { units.push((0, 0, 1)); }
+        units
+    }
+
+    impl Counters {
+        /// Counters on the calling thread (the one that draws) and on every other thread there is.
+        /// None where the kernel gives none (no counters, or not to this process).
+        pub(super) fn new() -> Option<Self> {
+            // SAFETY: gettid takes nothing and returns this thread's id.
+            let me = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            let units = units();
+            let pair = |tid: i32, inherit: bool| -> Vec<[RawFd; 2]> {
+                units.iter().filter_map(|&(kind, cycles, instructions)| Some([open(kind, cycles, tid, inherit)?, open(kind, instructions, tid, inherit)?])).collect()
+            };
+            let main = pair(me, false);
+            if main.is_empty() { return None; }
+            let mut others = Vec::new();
+            for entry in std::fs::read_dir("/proc/self/task").into_iter().flatten().flatten() {
+                let Some(tid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+                if tid != me { others.extend(pair(tid, true)); }
+            }
+            Some(Self { main, others })
+        }
+
+        /// `[cycles, instructions]` of the drawing thread, then of every thread, since they were made.
+        pub(super) fn read(&self) -> [u64; 4] {
+            let sum = |fds: &[[RawFd; 2]], at: usize| fds.iter().map(|pair| read(pair[at])).sum::<u64>();
+            let (cycles, instructions) = (sum(&self.main, 0), sum(&self.main, 1));
+            [cycles, instructions, cycles + sum(&self.others, 0), instructions + sum(&self.others, 1)]
+        }
+    }
+
+    impl Drop for Counters {
+        fn drop(&mut self) {
+            for fd in self.main.iter().chain(&self.others).flatten() {
+                // SAFETY: each is a counter this value opened and nothing else holds.
+                unsafe { libc::close(*fd) };
+            }
+        }
+    }
 }
 
 #[cfg(feature = "frame-profile")]
@@ -97,7 +192,10 @@ impl Log {
             let file = std::fs::File::create(&path).unwrap_or_else(|e| panic!("RUNE_FRAME_LOG {}: {e}", path.to_string_lossy()));
             std::io::BufWriter::new(file)
         });
-        Self { rows: Vec::with_capacity(frames), out }
+        // Counted only for a log that is written: the counters are a few dozen files to read a frame.
+        #[cfg(target_os = "linux")]
+        let counted = out.as_ref().and_then(|_| counters::Counters::new()).map(|c| { let now = c.read(); (c, now) });
+        Self { rows: Vec::with_capacity(frames), out, #[cfg(target_os = "linux")] counted }
     }
 
     pub(crate) fn push(&mut self, row: Row) {
@@ -112,6 +210,14 @@ impl Log {
             });
             if row.commits > 0 { line["why"] = crate::runtime::CommitWhy::names(row.why).into(); }
             for (name, ms) in STAGE_NAMES.iter().zip(row.stages) { line[*name] = ms.into(); }
+            // Since the last frame ended, in user space: the drawing thread's cycles and instructions,
+            // then every thread's (a software rasteriser's among them).
+            #[cfg(target_os = "linux")]
+            if let Some((counters, last)) = self.counted.as_mut() {
+                let now = counters.read();
+                for (at, name) in ["cyc", "ins", "cyc_all", "ins_all"].into_iter().enumerate() { line[name] = now[at].wrapping_sub(last[at]).into(); }
+                *last = now;
+            }
             writeln!(out, "{line}").expect("RUNE_FRAME_LOG write");
         }
         self.rows.push(row);
