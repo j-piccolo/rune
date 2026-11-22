@@ -218,9 +218,14 @@ impl RuntimeCore {
         // A host settle (an uncover, a restore, a shown window) lands the tree the frame began
         // with, before this frame's input runs. The input's own commit below then animates, so
         // a dialog the first press closes still plays its exit.
+        // Such a commit, and one a key routes through, lands something besides layout feedback
+        // (an update, a handler, the host's settle): it reopens feedback, as this frame's own
+        // commit would have, so `on_layout` hears what it laid out (`count_layout_echo`).
+        let mut landed = false;
         if self.commit.is_settling() && queue.has_input_action() {
             self.settle_before_input(app, &mut tx, &mut why);
             ran = false;
+            landed = true;
         }
         // Something besides a checked live-only event wants this frame's commit, so a change
         // it makes isn't the live-only handler's.
@@ -253,6 +258,7 @@ impl RuntimeCore {
                     tx.open_urls = links;
                 }
                 if ran || self.commit.dirty {
+                    landed = true;
                     self.motion.capture_flights(&self.tree.nodes, &mut self.paint, &mut self.text, self.env.scale, self.viewport, self.t, &mut tx);
                     if self.commit.is_settling() { tx.settle(); }
                     self.settled |= tx.commit.lands();
@@ -344,7 +350,7 @@ impl RuntimeCore {
         let shifted = !(self.commit.dirty || self.commit.relayout || settling) && self.virtual_window_changed();
         let besides = self.commit.dirty || self.commit.relayout || settling || shifted;
         let other = ran || besides;
-        self.count_layout_echo(ran_layout || read_moved, other);
+        self.count_layout_echo(ran_layout || read_moved, other || landed);
         if other || ran_layout || read_moved {
             if self.commit.relayout && !ran && !self.commit.dirty {
                 if self.commit.is_viewport_stepped() { tx.window_step = true } else { tx.relayout = true }

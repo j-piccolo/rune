@@ -18,6 +18,7 @@ mod keep_carried;
 mod keep_shift;
 mod keep_window;
 mod input_clipboard;
+mod layout_feedback;
 mod layout_hover;
 mod layout_reads;
 mod layout_rows;
