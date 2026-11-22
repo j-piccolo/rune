@@ -134,6 +134,16 @@ impl El {
         }
         self
     }
+    /// Says that something opaque is drawn over this element's whole box after it: a picture
+    /// laid over an element that is there only to cast the shadow, which fades on its own. Its
+    /// outer shadows then draw as bands around the box and skip the middle the picture hides,
+    /// as they do under an element's own opaque fill: a card's blurred shadow is otherwise
+    /// shaded under every pixel of the card. A promise, not a check: with nothing over the box,
+    /// its middle shows no shadow.
+    pub fn shadow_under(mut self) -> Self {
+        self.vis.cold_mut().shadows_under = true;
+        self
+    }
     /// An outer drop shadow offset by `(0, y)` with CSS `blur` radius (`blur = 2σ`; pass
     /// `2.0 * r` to match `CALayer.shadowRadius`). Springs like [`Self::box_shadow`].
     pub fn shadow(mut self, y: f32, blur: f32, color: Color) -> Self {
