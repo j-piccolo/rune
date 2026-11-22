@@ -197,9 +197,22 @@ impl Damage {
                     Some((shift, rects)) => Area::Scroll(shift, rects),
                     None => changed(&self.last, instances, size, &mut self.scratch),
                 };
-                // What would draw whole may be a scroll: then most of it is copied, not shaded.
-                let whole = match &now { Area::Rects(r) => most(r), Area::Scroll(..) => false, _ => true };
-                if scroll && whole && !moved_mostly(&self.last, instances) && let Some((shift, rects)) = scrolled(&self.last, instances, size) {
+                // What would draw whole may be a scroll: then most of it is copied, not shaded. So may
+                // what redraws a good part of the window: a rail scrolled sideways moves one viewport's
+                // instances, each of which differs, and their bounds are the rail. The scroll is taken
+                // where it leaves less to redraw.
+                let sum = |r: &[[u32; 4]]| r.iter().map(|r| area(*r)).sum::<u32>();
+                let much = match &now { Area::Rects(r) => Some(sum(r)).filter(|a| *a > size.0 * size.1 / 16), Area::Scroll(..) => None, _ => Some(u32::MAX) };
+                // A scroll moves many instances. A fade or a hover changes a few, or changes many where
+                // they lie (their colours), however much of the window they cover, and isn't asked:
+                // looking for a shift that isn't there walks both lists for nothing.
+                let many = !self.scratch.differ_all
+                    || (self.scratch.differ.len() >= 8 && self.scratch.differ.iter().take(16).any(|&i| self.last[i as usize].rect != instances[i as usize].rect));
+                // A frame that would draw whole looks as far as a scroll does; one that redraws part
+                // looks near, where a rail's cards are, since most such frames are no scroll at all.
+                let reach = if much == Some(u32::MAX) || much.is_some_and(|a| a as f32 > MOST * (size.0 * size.1) as f32) { 256 } else { 24 };
+                if scroll && many && let Some(redrawn) = much && !moved_mostly(&self.last, instances)
+                    && let Some((shift, rects)) = scrolled_within(&self.last, instances, size, reach) && sum(&rects) < redrawn {
                     now = Area::Scroll(shift, rects);
                 }
                 self.seen = match &now { Area::Rects(r) | Area::Scroll(_, r) => r.iter().copied().reduce(join), Area::All | Area::Many => None };
@@ -528,6 +541,12 @@ fn moved_mostly(old: &[Instance], new: &[Instance]) -> bool {
 /// by the shift (`moved`) or lies under all of them and shades it uniformly (`uniform_below`).
 /// The rest redraws: what came into the viewport, what changed, and what moved otherwise.
 fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shift, Vec<[u32; 4]>)> {
+    scrolled_within(old, new, size, 256)
+}
+
+/// `scrolled`, looking no further than `reach` instances from a probe's place for the old one it
+/// was: far for a frame that is a scroll or draws whole otherwise, near for one that only might be.
+fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: usize) -> Option<(Shift, Vec<[u32; 4]>)> {
     let start = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
     let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| same(a, b)).count();
     let (om, nm) = (&old[start..old.len() - end], &new[start..new.len() - end]);
@@ -571,7 +590,11 @@ fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shi
     let little = (size.0 * size.1) / 2;
     let mut best: Option<(u32, (Shift, Vec<[u32; 4]>))> = None;
     let mut tried: Vec<[f32; 2]> = Vec::new();
-    for reach in [24, 256] {
+    // Rows that came into the list or left it put what a probe was beside far from it, where the
+    // near look finds only look-alikes: then the far look goes first, and its shift is tried
+    // before theirs.
+    let looks = if old.len().abs_diff(new.len()) > 24 { [256, 24] } else { [24, 256] };
+    for reach in looks.into_iter().filter(|r| *r <= reach) {
         for (d, ahead) in voted(reach) {
             if tried.contains(&d) { continue; }
             tried.push(d);
@@ -597,6 +620,9 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
     // looking further (`FAR`) for where the lists meet again, a few times a frame at most.
     const FAR: usize = 512;
     let (mut came, mut searches, mut lost) = (0usize, 8, false);
+    // The last old instance paired: pairs keep the lists' order, so what is drawn over what is
+    // the same before and after, and a pair is only ever looked for after it.
+    let mut last: Option<usize> = None;
     for (j, n) in nm.iter().enumerate() {
         // One of a run that came in: the old one due waits for the new one after them.
         if came > 0 {
@@ -605,7 +631,7 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
             un_new.push(j);
             continue;
         }
-        let old_at = |k: isize| usize::try_from(j as isize + ahead + k).ok().filter(|&o| o < om.len());
+        let old_at = |k: isize| usize::try_from(j as isize + ahead + k).ok().filter(|&o| o < om.len() && last.is_none_or(|l| o > l));
         // Paired where it's due, or a few further on when old ones went.
         let mut found = (0..=8).find_map(|k| old_at(k).filter(|&o| fits(&om[o], n)).map(|o| (k, o)));
         // Or it came in (the old one due here pairs a later new one), or it changed.
@@ -617,6 +643,11 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
             after = old_at(0).and_then(|o| (9..=FAR).find(|&m| nm.get(j + m).is_some_and(|later| fits(&om[o], later))));
             // The nearer meeting: the fewer instances given up as gone or new.
             if let (Some((k, _)), Some(m)) = (found, after) { if (k as usize) <= m { after = None; } else { found = None; } }
+            // Or the old one is behind: `ahead` was read at a probe further on, past where rows came
+            // into the list or left it, and before them the lists run as they did at their start.
+            if found.is_none() && after.is_none() {
+                found = (1..=FAR as isize).find_map(|k| old_at(-k).filter(|&o| fits(&om[o], n)).map(|o| (-k, o)));
+            }
         }
         let Some((k, o)) = found else {
             if let Some(m) = after {
@@ -628,6 +659,7 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
         };
         lost = false;
         ahead += k;
+        last = Some(o);
         paired[o] = true;
         if om[o].rect == n.rect { stayed.push(start + j); continue; }
         if !moves_exactly(&om[o], n) { paired[o] = false; un_new.push(j); continue; }
