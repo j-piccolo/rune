@@ -627,3 +627,41 @@ fn frames_on_a_target_that_keeps_its_pixels_match_whole_frames() {
     }
     assert!(shifted >= 5 && part >= 8 && same >= 1, "scrolls copied {shifted}, frames redrew in part {part}, changed nothing {same}");
 }
+
+#[test]
+fn a_scroll_past_a_row_that_left_the_list_copies_what_lies_before_it() {
+    let size = (256, 192);
+    // Twelve instances the old list has in its middle and the new one doesn't (a row let go of
+    // outside the viewport). The probes that vote lie past them, where the old list runs twelve
+    // ahead; before them the lists run side by side, and what is there pairs by looking behind.
+    let gone = (0..12).map(|n| Instance { rect: [8.0 + n as f32 * 20.0, -400.0, 16.0, 16.0], fill: [0.5, 0.5, 0.5, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip: [0.0, 32.0, 256.0, 192.0], ..Instance::zeroed() });
+    let still = rows(0.0, size);
+    let old: Vec<Instance> = still[..10].iter().copied().chain(gone).chain(still[10..].iter().copied()).collect();
+    let (shift, rects) = scrolled(&old, &rows(12.0, size), size).expect("the rows still copy");
+    assert_eq!(shift, Shift { from: [0, 44, 256, 148], to: [0, 32] });
+    assert_eq!(rects, vec![[0, 180, 256, 192]], "only the strip that came in redraws");
+}
+
+#[test]
+fn a_rail_scrolled_sideways_is_copied_though_the_rest_of_the_window_stands() {
+    let size = (256, 192);
+    let clear = [0.0, 0.0, 0.0, 1.0];
+    let plain = |rect: [f32; 4], clip: [f32; 4], shade: f32| Instance { rect, fill: [shade, shade, shade, 1.0], params: [0.0, KIND_RECT, 0.0, 1.0], clip, ..Instance::zeroed() };
+    // Forty marks that stand, then a rail of forty cards in a clip of its own, moved 16 px left.
+    let list = |dx: f32| -> Vec<Instance> {
+        (0..40).map(|n| plain([4.0 + (n % 20) as f32 * 12.0, 4.0 + (n / 20) as f32 * 160.0, 8.0, 8.0], [0.0, 0.0, 256.0, 192.0], 0.2 + n as f32 * 0.01))
+            .chain((0..40).map(|n| plain([n as f32 * 16.0 - dx, 70.0, 12.0, 40.0], [0.0, 60.0, 256.0, 120.0], 0.3 + n as f32 * 0.01)))
+            .collect()
+    };
+    let mut damage = Damage::default();
+    damage.plan(&list(0.0), size, clear, 0, GlyphAtlas::default(), true, true);
+    let Plan::Part { draw, shift, .. } = damage.plan(&list(16.0), size, clear, 0, GlyphAtlas::default(), true, true) else { panic!("a rail's scroll redraws part of the window") };
+    assert_eq!(shift, Some(Shift { from: [16, 60, 240, 60], to: [0, 60] }), "the rail's pixels move");
+    let redrawn: u32 = draw.iter().map(|r| r[2] * r[3]).sum();
+    assert!(redrawn <= 16 * 60, "{draw:?} redraws more than the strip that came in");
+    // Presented in dirty rectangles (no scroll asked for), every card that moved redraws.
+    let mut damage = Damage::default();
+    damage.plan(&list(0.0), size, clear, 0, GlyphAtlas::default(), true, false);
+    let Plan::Part { shift, .. } = damage.plan(&list(16.0), size, clear, 0, GlyphAtlas::default(), true, false) else { panic!("part of the window") };
+    assert_eq!(shift, None);
+}
