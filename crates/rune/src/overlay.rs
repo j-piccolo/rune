@@ -468,6 +468,10 @@ pub(in crate::overlay) struct OverlayCore {
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
     x11: Option<crate::platform::x11::overlay::InputWindow>,
     surface: surface::Surface,
+    /// The app is quitting into a fast exit (`AnyHost::vanish`): the hide that follows leaves
+    /// the swap chain to the process's end (`hide_window`).
+    #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+    ending: bool,
     /// `ConfiguredOverlay::release_gpu_when_hidden` or `release_gpu_after`.
     release: Release,
     cursor: Option<crate::cursor::os::OsCursor>,
@@ -533,6 +537,7 @@ impl OverlayCore {
         rt.set_os_drag(crate::drag_out::SUPPORTED);
         rt.host.surface_stats = Some(meter.shared());
         OverlayCore {
+            ending: false,
             on_created,
             pending_input: None,
             layer_pointer: None,
