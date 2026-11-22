@@ -67,3 +67,27 @@ fn a_big_border_ring_draws_as_bands_and_a_filled_box_never_asks() {
     let total: f32 = bands.iter().map(|&b| area(b)).sum();
     assert!((total - (area([9.0, 9.0, 811.0, 511.0]) - area(hole))).abs() < 1.0);
 }
+
+/// The outer shadows a view paints, at scale 1.
+fn painted_shadows(view: fn(&(), &mut crate::Cx<()>) -> crate::El) -> Vec<Instance> {
+    let mut rt = crate::Runtime::new((), view, (600.0, 400.0), crate::Env::new(true, 1.0));
+    rt.frame(0.0);
+    rt.instances.iter().copied().filter(|i| i.params[1] == KIND_SHADOW).collect()
+}
+
+#[test]
+fn a_box_whose_middle_is_hidden_bands_its_shadow() {
+    use crate::{Color, el};
+    fn frame(card: crate::El) -> crate::El { el().w_full().h_full().child(card.size(300.0, 200.0).radius(6.0).shadow(14.0, 34.0, Color::BLACK.alpha(0.7))) }
+    let banded = |shadows: &[Instance]| shadows.len() == 4 && shadows.iter().all(|i| i.uv[2] < 0.0);
+    // Nothing fills the box and nothing is said to cover it: its middle shows the shadow.
+    let bare = painted_shadows(|_, _| frame(el()));
+    assert_eq!(bare.len(), 1, "one whole quad");
+    // An opaque gradient fills it as a solid fill does.
+    assert!(banded(&painted_shadows(|_, _| frame(el().linear_gradient(2.4, [(0.0, Color::WHITE), (1.0, Color::BLACK)])))));
+    // One see-through stop, and the shadow shows through the box.
+    assert_eq!(painted_shadows(|_, _| frame(el().linear_gradient(2.4, [(0.0, Color::WHITE), (1.0, Color::BLACK.alpha(0.5))]))).len(), 1);
+    // A box that says it is covered, faded or not: a shadow element under a picture.
+    assert!(banded(&painted_shadows(|_, _| frame(el().shadow_under()))));
+    assert!(banded(&painted_shadows(|_, _| frame(el().shadow_under().opacity(0.5)))));
+}
