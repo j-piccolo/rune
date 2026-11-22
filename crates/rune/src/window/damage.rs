@@ -179,6 +179,16 @@ pub(crate) fn target_keeps() -> bool {
     *KEEPS.get_or_init(|| std::env::var_os("RUNE_TARGET_KEEPS").is_some_and(|v| v == "1"))
 }
 
+/// `RUNE_TARGET_AGE=<n>`: a headless run draws into `n` targets in turn, as a window draws into
+/// its swap chain's buffers, and tells the renderer each one holds the frame of `n` frames ago
+/// (`Renderer::arm_aged_target`), as a host that knows its buffers' ages would. Unset: one target,
+/// treated as holding nothing known, which is what wgpu says of a drawable.
+#[cfg_attr(not(feature = "tooling"), allow(dead_code))]
+pub(crate) fn target_age() -> u32 {
+    static AGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *AGE.get_or_init(|| rune_core::env::var("RUNE_TARGET_AGE").and_then(|v| v.parse().ok()).filter(|n| (1..=5).contains(n)).unwrap_or(0))
+}
+
 type Counts = HashMap<u64, (i32, usize), BuildHasherDefault<Hashed>>;
 
 /// The map's keys are hashes already, mixed once more: FNV's multiply carries only upward, so its
