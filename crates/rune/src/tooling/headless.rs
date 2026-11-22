@@ -338,6 +338,10 @@ fn run_headless(prep: HeadlessPrep, config: HeadlessConfig, app: &mut dyn Headle
         damage: Default::default(),
         #[cfg(not(target_os = "macos"))]
         target_made: 0,
+        #[cfg(not(target_os = "macos"))]
+        spares: Default::default(),
+        #[cfg(not(target_os = "macos"))]
+        turns: 0,
         cpu_ms: Vec::new(),
         anim_ms: Vec::new(),
         rest_ms: Vec::new(),

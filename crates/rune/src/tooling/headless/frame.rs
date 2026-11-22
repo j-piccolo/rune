@@ -85,11 +85,44 @@ pub(super) struct HeadlessLoop<'a> {
     /// Bumped when the target is made again: its first frame draws whole.
     #[cfg(not(target_os = "macos"))]
     pub(super) target_made: u64,
+    /// `RUNE_TARGET_AGE`: the other targets this run draws into in turn (the one drawn longest ago
+    /// first), and how many frames each target in turn has taken since they were made.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) spares: std::collections::VecDeque<Offscreen>,
+    #[cfg(not(target_os = "macos"))]
+    pub(super) turns: u32,
     pub(super) cpu_ms: Vec<f64>,
     pub(super) anim_ms: Vec<f64>,
     pub(super) rest_ms: Vec<f64>,
     #[cfg(feature = "frame-profile")]
     pub(super) profile: crate::frame::profile::Log,
+}
+
+/// `RUNE_DRAW_DUMP=<dir>` (frame-profile): every frame's instance list (`instances.bin`, 128 bytes each)
+/// and what the redraw planner made of it (`frames.jsonl`, with each list's offset), for tools that
+/// count what a frame asks of a GPU from the draw list itself, on any machine.
+#[cfg(all(feature = "frame-profile", not(target_os = "macos")))]
+fn dump_draw_list(k: usize, plan: &crate::window::damage::Plan, instances: &[crate::render::Instance], size: (u32, u32), clear: [f32; 4], keeps: bool, into_kept: bool) {
+    use std::sync::{Mutex, OnceLock};
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static OUT: Mutex<Option<(std::fs::File, std::fs::File, u64)>> = Mutex::new(None);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("RUNE_DRAW_DUMP").map(Into::into)) else { return };
+    let mut out = OUT.lock().unwrap();
+    if out.is_none() {
+        std::fs::create_dir_all(dir).ok();
+        let (Ok(meta), Ok(bin)) = (std::fs::File::create(dir.join("frames.jsonl")), std::fs::File::create(dir.join("instances.bin"))) else { return };
+        *out = Some((meta, bin, 0));
+    }
+    let Some((meta, bin, at)) = out.as_mut() else { return };
+    let bytes: &[u8] = bytemuck::cast_slice(instances);
+    bin.write_all(bytes).ok();
+    let (kind, why, draw, shift, same) = match plan {
+        crate::window::damage::Plan::All(why) => ("all", *why, Vec::new(), None, false),
+        crate::window::damage::Plan::Part { draw, shift, same, .. } => ("part", "", draw.clone(), shift.map(|s| (s.from, s.to)), *same),
+    };
+    writeln!(meta, "{}", json!({ "k": k, "at": *at, "n": instances.len(), "size": [size.0, size.1], "clear": clear, "plan": kind, "why": why,
+        "draw": draw, "shift": shift, "same": same, "keeps": keeps, "into_kept": into_kept, "age": crate::window::damage::target_age() })).ok();
+    *at += bytes.len() as u64;
 }
 
 impl HeadlessLoop<'_> {
@@ -100,7 +133,7 @@ impl HeadlessLoop<'_> {
         crate::window::rebuild_renderer_core(&self.gpu.device, &mut self.renderer, self.target_format, rt);
         self.target = Offscreen::with_format(&self.gpu.device, self.wp, self.hp, self.target_format);
         #[cfg(not(target_os = "macos"))]
-        { self.target_made += 1; }
+        { self.target_made += 1; self.spares.clear(); self.turns = 0; }
         if self.alpha.is_some() {
             self.alpha = Some(crate::render::surface_alpha::AlphaSurface::new(&self.gpu.device, self.target_format, (self.wp, self.hp)));
         }
@@ -266,6 +299,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         let cpu = crate::frame::profile::thread_cpu_ms();
         prepare_gpu_resources(&mut s.renderer, s.gpu, self.app.rt_mut(), (s.wp, s.hp), false);
         let encoder = s.gpu.device.create_command_encoder(&Default::default());
+        // `RUNE_TARGET_AGE=n`: this frame's target is the one drawn `n` frames ago, as a swap chain's is.
+        #[cfg(not(target_os = "macos"))]
+        let buffers = crate::window::damage::target_age();
+        #[cfg(not(target_os = "macos"))]
+        if buffers > 1 {
+            while s.spares.len() + 1 < buffers as usize { s.spares.push_back(Offscreen::with_format(&s.gpu.device, s.wp, s.hp, s.target_format)); }
+            let next = s.spares.pop_front().unwrap();
+            s.spares.push_back(std::mem::replace(&mut s.target, next));
+        }
         #[cfg(feature = "frame-profile")]
         let cpu = staged(&mut self.fp_stages, 0, cpu);
         // Only what changed is redrawn, as a window redraws it (`window::damage`).
@@ -277,16 +319,21 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             // The target is this run's own and only the renderer draws in it, unless an overlay
             // draws over the frame: then it keeps the last frame (`RUNE_TARGET_KEEPS=1`).
             let keeps = crate::window::damage::target_keeps() && s.overlay.is_none();
+            // Every target has taken a frame of this renderer's, and nothing else draws on them.
+            let age = if buffers > 0 && s.turns >= buffers && s.overlay.is_none() { buffers } else { 0 };
+            s.turns = s.turns.saturating_add(1);
+            #[cfg(feature = "frame-profile")]
+            dump_draw_list(self.k, &plan, &rt.instances, (s.wp, s.hp), rt.clear_color(), keeps, s.alpha.is_none() && !crate::window::damage::whole_frames());
             match plan {
                 crate::window::damage::Plan::Part { draw, shift, same, .. } => {
                     s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format, shift.map(|s| (s.from, s.to)));
                     if same { s.renderer.arm_same(); } else { s.renderer.cull_armed(&rt.instances, (s.wp, s.hp)); }
-                    if keeps { s.renderer.arm_kept_target(); }
+                    if keeps { s.renderer.arm_kept_target(); } else { s.renderer.arm_aged_target(age); }
                 }
                 // Whole, but into the kept frame, so the next frame may redraw part of it.
                 crate::window::damage::Plan::All(_) if s.alpha.is_none() && !crate::window::damage::whole_frames() => {
                     s.renderer.arm_whole(&s.gpu.device, &s.gpu.queue, rt.clear_color(), (s.wp, s.hp), s.target_format);
-                    if keeps { s.renderer.arm_kept_target(); }
+                    if keeps { s.renderer.arm_kept_target(); } else { s.renderer.arm_aged_target(age); }
                 }
                 crate::window::damage::Plan::All(_) => {}
             }
