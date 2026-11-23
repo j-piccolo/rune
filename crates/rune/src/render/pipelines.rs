@@ -91,6 +91,9 @@ impl Renderer {
             pinned_building: None,
             kinds: Vec::new(),
             split: Vec::new(),
+            big: Vec::new(),
+            #[cfg(feature = "frame-profile")]
+            pass_mark: None,
             solid: None,
             solid_building: None,
             lcd_frame: false,

@@ -439,6 +439,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 cpu_ms: self.fp_cpu0.map(|start| crate::frame::profile::cpu_ms().unwrap() - start),
                 gpu_wait_ms,
                 gpu_time_ms: None,
+                gpu_layers_ms: None,
                 gpu_mhz: None,
             });
         }

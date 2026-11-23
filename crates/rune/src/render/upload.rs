@@ -411,6 +411,8 @@ impl Renderer {
         self.kinds.extend(instances.iter().map(Instance::kind));
         self.split.clear();
         self.split.extend(instances.iter().map(super::splits));
+        self.big.clear();
+        self.big.extend(instances.iter().map(|i| i.rect[2] * i.rect[3] >= super::BIG));
         let (mut start, mut bind) = (0, BatchBind::Image(0));
         let mut has_layers = false;
         self.effects.clear();

@@ -980,20 +980,31 @@ impl Renderer {
             Warming::Unasked => {
                 if !WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) { return; }
                 let made = Warmed::default();
-                let (to, device, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
+                let (to, made_on, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
                 let thread = std::thread::Builder::new().name("rune-warm-layers".into()).spawn(move || {
                     // What `build_feature` makes for isolation: the uber pipeline for layer
                     // targets, and the composite for the window's format and theirs.
                     let mut pipelines = Vec::new();
-                    let verdict = breaker::checked(&device, || {
+                    let verdict = breaker::checked(&made_on, || {
                         for (format, entry) in [(FORMAT, entry), (format, "vs"), (FORMAT, "vs")] {
-                            pipelines.push((format, entry, Renderer::pipeline(&device, &layout, &shader, format, entry, Blend::SourceOver)));
+                            pipelines.push((format, entry, Renderer::pipeline(&made_on, &layout, &shader, format, entry, Blend::SourceOver)));
                         }
                     });
                     let taken = matches!(verdict, breaker::Verdict::Now(None));
                     *to.lock().unwrap_or_else(|e| e.into_inner()) = Some((pipelines, taken));
                 });
-                self.layers.warming = if thread.is_ok() { Warming::Making(made) } else { Warming::Done };
+                self.layers.warming = match thread {
+                    // Frame-profile builds wait for them, as for the pinned pipelines, and take them now.
+                    #[cfg(feature = "frame-profile")]
+                    Ok(thread) => {
+                        thread.join().ok();
+                        self.layers.warming = Warming::Making(made);
+                        return self.warm_isolation(device);
+                    }
+                    #[cfg(not(feature = "frame-profile"))]
+                    Ok(_) => Warming::Making(made),
+                    Err(_) => Warming::Done,
+                };
             }
             Warming::Making(made) => {
                 let Some((pipelines, taken)) = made.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };

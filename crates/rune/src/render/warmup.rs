@@ -32,8 +32,11 @@ pub(super) struct WarmRenderer {
     pub(super) pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     pub(super) kinds: Vec<Option<Kind>>,
     pub(super) split: Vec<bool>,
-    pub(super) solid: Option<(wgpu::TextureFormat, Option<wgpu::RenderPipeline>)>,
-    pub(super) solid_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Option<wgpu::RenderPipeline>>)>,
+    pub(super) big: Vec<bool>,
+    #[cfg(feature = "frame-profile")]
+    pub(super) pass_mark: Option<(wgpu::QuerySet, u32)>,
+    pub(super) solid: Option<(wgpu::TextureFormat, Vec<Option<wgpu::RenderPipeline>>)>,
+    pub(super) solid_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     pub(super) lcd_frame: bool,
     pub(super) frame_wake: Option<std::sync::Arc<crate::live::Wake>>,
     pub(super) stand_in: wgpu::Texture,
@@ -90,6 +93,9 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            big,
+            #[cfg(feature = "frame-profile")]
+            pass_mark,
             solid,
             solid_building,
             lcd_frame,
@@ -139,6 +145,9 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            big,
+            #[cfg(feature = "frame-profile")]
+            pass_mark,
             solid,
             solid_building,
             lcd_frame,
@@ -198,6 +207,9 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            big,
+            #[cfg(feature = "frame-profile")]
+            pass_mark,
             solid,
             solid_building,
             lcd_frame,
@@ -246,6 +258,9 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            big,
+            #[cfg(feature = "frame-profile")]
+            pass_mark,
             solid,
             solid_building,
             lcd_frame,

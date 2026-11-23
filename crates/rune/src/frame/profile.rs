@@ -81,6 +81,8 @@ pub(crate) struct Row {
     /// The GPU's own time for the frame, from timestamps around its commands, and its clock (MHz) as
     /// it drew, where the run could read them (`tooling::FrameLog`).
     pub gpu_time_ms: Option<f64>,
+    /// Of that, the frame's layer passes, before its own.
+    pub gpu_layers_ms: Option<f64>,
     pub gpu_mhz: Option<u32>,
 }
 
@@ -219,6 +221,7 @@ impl Log {
             });
             if row.commits > 0 { line["why"] = crate::runtime::CommitWhy::names(row.why).into(); }
             if let Some(ms) = row.gpu_time_ms { line["gpu_time_ms"] = ms.into(); }
+            if let Some(ms) = row.gpu_layers_ms { line["gpu_layers_ms"] = ms.into(); }
             if let Some(mhz) = row.gpu_mhz { line["gpu_mhz"] = mhz.into(); }
             for (name, ms) in STAGE_NAMES.iter().zip(row.stages) { line[*name] = ms.into(); }
             // Since the last frame ended, in user space: the drawing thread's cycles and instructions,
