@@ -421,8 +421,6 @@ impl Renderer {
         if self.first_frame_submitted.load(Ordering::Acquire) {
             self.warm_effects(device);
         }
-        #[cfg(not(target_os = "macos"))]
-        self.prepare_underlay(device);
         #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
         self.report_pools();
     }
