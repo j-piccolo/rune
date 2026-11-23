@@ -564,7 +564,12 @@ impl Renderer {
         if range.is_empty() && range.end != self.count { return; }
         self.validate_layer_range(&range);
         self.flush_uploads(encoder);
-        let range = if range.start == 0 { self.cleared_start(load).min(range.end)..range.end } else { range };
+        let (load, range) = if range.start == 0 {
+            let (load, start) = self.cleared_pass(load, 0);
+            (load, start.min(range.end)..range.end)
+        } else {
+            (load, range)
+        };
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -900,7 +905,7 @@ impl Renderer {
             t
         });
         let blurs = self.has_backdrop_blur();
-        let start = self.cleared_start(load).max(self.under.min(self.count));
+        let (load, start) = self.cleared_pass(load, self.under.min(self.count));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {

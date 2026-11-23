@@ -19,12 +19,12 @@ fn clear(c: [f32; 4]) -> wgpu::LoadOp<wgpu::Color> {
 
 #[test]
 fn the_run_ends_at_the_first_instance_that_could_change_a_pixel_over_the_clear() {
-    assert_eq!(Cleared::of(&page()).len, 2);
-    assert_eq!(Cleared::of(&[]).len, 0);
-    assert_eq!(Cleared::of(&[rect([0.0, 0.0, 64.0, 48.0], [0.5, 0.5, 0.5, 0.5])]).len, 0, "a translucent root clears to another colour");
+    assert_eq!(Cleared::of(&page(), (64, 48)).len, 2);
+    assert_eq!(Cleared::of(&[], (64, 48)).len, 0);
+    assert_eq!(Cleared::of(&[rect([0.0, 0.0, 64.0, 48.0], [0.5, 0.5, 0.5, 0.5])], (64, 48)).len, 0, "a translucent root clears to another colour");
     let mut clipped_inside = page();
     clipped_inside[1].clip = [0.0, 0.0, 64.0, 48.0];
-    assert_eq!(Cleared::of(&clipped_inside).len, 2, "a clip holding the whole rect clips nothing");
+    assert_eq!(Cleared::of(&clipped_inside, (64, 48)).len, 2, "a clip holding the whole rect clips nothing");
     type Change = fn(&mut Instance);
     let cases: [(&str, Change); 9] = [
         ("a rect off whole pixels", |i| i.rect[1] = 0.5),
@@ -40,13 +40,13 @@ fn the_run_ends_at_the_first_instance_that_could_change_a_pixel_over_the_clear()
     for (what, change) in cases {
         let mut list = page();
         change(&mut list[1]);
-        assert_eq!(Cleared::of(&list).len, 1, "{what} ends the run");
+        assert_eq!(Cleared::of(&list, (64, 48)).len, 1, "{what} ends the run");
     }
 }
 
 #[test]
 fn a_pass_starts_past_the_run_only_when_it_clears_to_its_colour_and_short_of_any_surface() {
-    let cleared = Cleared::of(&page());
+    let cleared = Cleared::of(&page(), (64, 48));
     assert_eq!(cleared.start(clear(C), u32::MAX), 2);
     assert_eq!(cleared.start(clear([0.0, 0.0, 0.0, 1.0]), u32::MAX), 0, "another clear colour");
     assert_eq!(cleared.start(wgpu::LoadOp::Load, u32::MAX), 0, "a pass that keeps what the target holds");
