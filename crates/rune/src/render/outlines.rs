@@ -41,7 +41,7 @@ impl Renderer {
         }
         for page in 0..self.images.len() {
             let Some((texture, _)) = &self.images[page] else { continue };
-            let bind = Self::bind_group(device, &self.bind_layout, &self.globals, outlines, &self.atlas, texture, None);
+            let bind = Self::bind_group_images(device, &self.bind_layout, &self.globals, outlines, &self.atlas, texture, None, self.srgb_blend);
             if let Some(slot) = &mut self.images[page] { slot.1 = bind; }
         }
         self.rebind_layers(device);

@@ -74,34 +74,43 @@ const CORNER: &str = "    let p = select(lo, hi, corner > vec2<f32>(0.5));";
 /// same code on the same flat inputs at the same pixel centres, so every pixel still shaded gets
 /// the value the whole quad gave it, and a pixel no longer shaded got zero, which blends to
 /// nothing.
-const BAND: &str = r#"    if (kind > 10.5 && kind < 11.5 && i.uv.z == 0.0 && any(i.uv.xy != vec2<f32>(0.0))) {
+const BAND: &str = r#"    if (kind > 10.5 && kind < 11.5) {
         let lower_open = i.params.x >= 1.5;
         let upper_open = i.params.w >= 1.5;
         let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
         let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
         let below = lower_open || all(i.fill == vec4<f32>(0.0));
         let above = upper_open || all(i.border == vec4<f32>(0.0));
-        // The axis the gradient mostly runs along, and how far a stop's edge moves along it from
-        // one side of the quad to the other (nothing for a gradient straight along the axis; an
-        // angle of 90 degrees is a few parts in a hundred million off it in f32).
-        let down = abs(i.uv.y) >= abs(i.uv.x);
-        let slope = select(i.uv.x, i.uv.y, down);
-        let across = select(i.uv.y, i.uv.x, down);
-        let reach = abs(across / slope) * select(hi.y - lo.y, hi.x - lo.x, down) * 0.5 + 1.0;
-        let middle = select(i.rect.x + i.rect.z * 0.5, i.rect.y + i.rect.w * 0.5, down);
-        let at0 = middle + (t0 - 0.5) / slope;
-        let at1 = middle + (t1 - 0.5) / slope;
-        var near = select(lo.x, lo.y, down);
-        var far = select(hi.x, hi.y, down);
-        if (slope > 0.0) {
-            if (below) { near = max(near, at0 - reach); }
-            if (above) { far = min(far, at1 + reach); }
-        } else {
-            if (below) { far = min(far, at0 + reach); }
-            if (above) { near = max(near, at1 - reach); }
+        if (i.uv.z == 0.0 && any(i.uv.xy != vec2<f32>(0.0))) {
+            // The axis the gradient mostly runs along, and how far a stop's edge moves along it from
+            // one side of the quad to the other (nothing for a gradient straight along the axis; an
+            // angle of 90 degrees is a few parts in a hundred million off it in f32).
+            let down = abs(i.uv.y) >= abs(i.uv.x);
+            let slope = select(i.uv.x, i.uv.y, down);
+            let across = select(i.uv.y, i.uv.x, down);
+            let reach = abs(across / slope) * select(hi.y - lo.y, hi.x - lo.x, down) * 0.5 + 1.0;
+            let middle = select(i.rect.x + i.rect.z * 0.5, i.rect.y + i.rect.w * 0.5, down);
+            let at0 = middle + (t0 - 0.5) / slope;
+            let at1 = middle + (t1 - 0.5) / slope;
+            var near = select(lo.x, lo.y, down);
+            var far = select(hi.x, hi.y, down);
+            if (slope > 0.0) {
+                if (below) { near = max(near, at0 - reach); }
+                if (above) { far = min(far, at1 + reach); }
+            } else {
+                if (below) { far = min(far, at0 + reach); }
+                if (above) { near = max(near, at1 - reach); }
+            }
+            far = max(far, near);
+            if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
+        } else if (i.uv.z > 0.0 && above) {
+            // A radial stop segment with an open or clear outer edge is zero outside its outer
+            // ellipse `t = t1`: bound the quad to that ellipse plus a pixel of slack.
+            let c = i.rect.xy + i.uv.xy;
+            let r_bound = abs(i.uv.zw) * max(t1, 0.0) + vec2<f32>(1.0);
+            lo = max(lo, c - r_bound);
+            hi = max(min(hi, c + r_bound), lo);
         }
-        far = max(far, near);
-        if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
     }
 "#;
 
@@ -116,10 +125,14 @@ pub(super) fn banded_wgsl() -> std::borrow::Cow<'static, str> {
 }
 
 /// Windfoil's WGSL with its fragment entry pinned to `kind` (shader.wgsl `fragment_kind`): the
-/// compiler drops every other kind's code. The vertex stage is unchanged.
+/// compiler drops every other kind's code. Gradient pipelines also carry `BAND` in the vertex stage.
 pub(crate) fn pinned_wgsl(kind: u32) -> Option<String> {
-    let windfoil = windfoil_wgsl();
-    (windfoil.matches(PINNED_OFF).count() == 1).then(|| windfoil.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
+    let base: std::borrow::Cow<'static, str> = if kind == Kind::Radial.as_u32() {
+        banded_wgsl()
+    } else {
+        windfoil_wgsl().into()
+    };
+    (base.matches(PINNED_OFF).count() == 1).then(|| base.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
 }
 
 /// outline.wgsl's switch for subpixel outline glyphs, off but in the subpixel variant.

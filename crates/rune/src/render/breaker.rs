@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 use crate::machine::{Attempt, Effects, Seq};
-use super::{Blend, Renderer, layer_blur, layers::FORMAT};
+use super::{Blend, Renderer, layer_blur};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Feature {
@@ -178,17 +178,18 @@ impl Renderer {
     }
 
     fn build_feature(&mut self, device: &wgpu::Device, feature: Feature) {
+        let lfmt = self.layer_format();
         // `Rgba8Snorm` never allows `RENDER_ATTACHMENT`, so every pipeline fails validation
         // regardless of blend state or passthrough bytecode.
         #[cfg(test)]
-        let format = if self.breakers.refuse == Some(feature) { wgpu::TextureFormat::Rgba8Snorm } else { FORMAT };
+        let format = if self.breakers.refuse == Some(feature) { wgpu::TextureFormat::Rgba8Snorm } else { lfmt };
         #[cfg(not(test))]
-        let format = FORMAT;
+        let format = lfmt;
         match feature {
             Feature::Isolation => {
-                if !self.extra.iter().any(|(f, _)| *f == FORMAT) {
+                if lfmt != self.format && !self.extra.iter().any(|(f, _)| *f == lfmt) {
                     let pipeline = Self::pipeline(device, &self.layout, &self.shader, format, self.vertex_entry, Blend::SourceOver);
-                    self.extra.push((FORMAT, pipeline));
+                    self.extra.push((lfmt, pipeline));
                 }
                 let formats: Vec<_> = [self.format].into_iter().chain(self.extra.iter().map(|(f, _)| *f)).collect();
                 for format in formats { self.add_layer_format(device, format); }
@@ -205,7 +206,8 @@ impl Renderer {
     fn drop_feature(&mut self, feature: Feature) {
         match feature {
             Feature::Isolation => {
-                self.extra.retain(|(f, _)| *f != FORMAT);
+                let lfmt = self.layer_format();
+                self.extra.retain(|(f, _)| *f != lfmt);
                 let broken = matches!(self.breakers.isolation, Health::Broken);
                 self.drop_layer_pipelines(broken);
             }
