@@ -482,7 +482,7 @@ fn parse_shader_consts(src: &WgslSources<'_>) -> ParsedShaderConsts {
     );
     let fs_max_kind = parse_f32(shader_path, "fs max kind", capture_once(shader_path, "fs discard threshold", &fs, "if (kind > {}) { discard; }")[0]).0;
     assert_eq!(fs_max_kind, uber_max_kind, "{shader_path}: base_vs and fs max kind thresholds differ");
-    let rect_thr = parse_f32(shader_path, "fs rect threshold", capture_once(shader_path, "fs rect branch", &fs, "if (kind < {}) { let d = sd_rounded")[0]).0;
+    let rect_thr = parse_f32(shader_path, "fs rect threshold", capture_once(shader_path, "fs rect branch", &fs, "if (kind < {}) { let soft = max(i.params.z, {}); let bw = i.params.x; let uniform")[0]).0;
     let kind_rect_f = parse_f32(shader_path, "fs flat_fill kind", capture_once(shader_path, "fs flat_fill kind", &fs, "let flat_fill = kind == {} &&")[0]).0;
     assert!(kind_rect_f >= 0.0 && kind_rect_f < rect_thr && kind_rect_f.fract() == 0.0, "{shader_path}: inconsistent KIND_RECT");
     let kind_rect = kind_rect_f as u8;

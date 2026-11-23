@@ -340,6 +340,7 @@ impl Renderer {
             // Same batches: only the effects' copies of their instances can be out of date.
             for (at, effect) in &mut self.effects { *effect = instances[*at as usize]; }
         }
+        self.solid_for_format(device);
         let has_layers = self.uploads.has_layers;
         // A loop-only frame that draws no layer leaves them as the last frame drew them.
         #[cfg(not(target_os = "macos"))]
@@ -456,6 +457,8 @@ impl Renderer {
         self.image_batches.clear();
         self.kinds.clear();
         self.kinds.extend(instances.iter().map(Instance::kind));
+        self.split.clear();
+        self.split.extend(instances.iter().map(super::splits));
         let (mut start, mut bind) = (0, BatchBind::Image(0));
         let mut has_layers = false;
         self.effects.clear();

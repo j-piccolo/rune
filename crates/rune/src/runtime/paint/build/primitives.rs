@@ -417,7 +417,8 @@ impl RuntimeCore {
                 _ => radii.map(|v| if v != 0.0 { v + g.copysign(v) } else { 0.0 }),
             };
             if c.a > 0.0 && ol.width > 0.0 {
-                self.instances.push(Instance {
+                // Nothing draws inside an outline's ring: a panel's draws as bands around its middle.
+                bands::push_ring(&mut self.instances, Instance {
                     rect: [r[0] - g, r[1] - g, w + 2.0 * g, h + 2.0 * g],
                     radii: ring_radii,
                     fill: [0.0; 4],
