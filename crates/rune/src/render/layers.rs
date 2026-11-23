@@ -93,14 +93,6 @@ impl Layers {
         })
     }
 
-    /// Start index (`begin`) of the first materialized top-level isolated layer, if any.
-    #[cfg(not(target_os = "macos"))]
-    pub(super) fn first_top_layer_begin(&self) -> Option<u32> {
-        self.plan.iter().enumerate().find_map(|(i, l)| {
-            (l.parent.is_none() && self.targets.get(i).is_some_and(Option::is_some)).then_some(l.begin)
-        })
-    }
-
     /// Kept textures get the budget left after this frame's visible caches.
     fn trim_retained(&mut self, active_bytes: u64) {
         let available = self.cache_budget.saturating_sub(active_bytes);

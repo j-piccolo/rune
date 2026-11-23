@@ -380,8 +380,6 @@ impl Renderer {
             }
         }
         self.prepare_backdrop_blur(device, queue, viewport);
-        #[cfg(not(target_os = "macos"))]
-        self.prepare_underlay(device);
         #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
         self.report_pools();
     }
