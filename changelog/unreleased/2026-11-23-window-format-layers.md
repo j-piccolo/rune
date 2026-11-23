@@ -1,0 +1,1 @@
+- A layer in the window's own format (8-bit, where the frame blends sRGB-encoded) draws its content with the window's pinned and slim pipelines and composites on the slim composite, as the window does, not with the general shader. No pixel changes.
