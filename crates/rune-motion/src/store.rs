@@ -196,6 +196,10 @@ pub struct AnimationStore {
 
     index: FxMap<(u64, u16), u32>,
     node_head: FxMap<u64, u32>,
+    /// Live track count and currently-animating track count per `PropId` (`0..128`), so queries
+    /// for properties with zero tracks or zero active animations skip the `index` hash lookup.
+    prop_tracks: [u32; 128],
+    prop_active: [u32; 128],
 
     events: Carry<MotionEvent>,
     retarget_audit: Option<RetargetAudit>,
@@ -244,6 +248,8 @@ impl AnimationStore {
             pending_free: NONE,
             index: FxMap::default(),
             node_head: FxMap::default(),
+            prop_tracks: [0; 128],
+            prop_active: [0; 128],
             events: Carry::new(),
             retarget_audit: None,
         }
@@ -524,6 +530,7 @@ impl AnimationStore {
             }
         };
         self.index.insert((node.0, prop.0), t);
+        if (prop.0 as usize) < 128 { self.prop_tracks[prop.0 as usize] += 1; }
         self.node_head.insert(node.0, t);
         t
     }

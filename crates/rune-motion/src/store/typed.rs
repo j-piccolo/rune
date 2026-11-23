@@ -137,8 +137,14 @@ impl AnimationStore {
         self.id_of(t)
     }
 
+    /// No node has a track for `prop`: a lookup can answer without hashing.
+    fn untracked(&self, prop: PropId) -> bool {
+        self.prop_tracks.get(prop.0 as usize) == Some(&0)
+    }
+
     /// The value presented at the last `tick` (what's on screen).
     pub fn get<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         Some(T::read_lanes(&self.l_value[l0..l0 + T::LANES]))
@@ -146,6 +152,7 @@ impl AnimationStore {
 
     /// The velocity at the last `tick`, in units per second.
     pub fn velocity<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         Some(T::read_lanes(&self.l_vel[l0..l0 + T::LANES]))
@@ -153,6 +160,7 @@ impl AnimationStore {
 
     /// The exact value at the current `now()` (may be between ticks).
     pub fn sample<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let mut out = [0.0; MAX_LANES];
         let l0 = self.t_lane0[t] as usize;
@@ -165,6 +173,7 @@ impl AnimationStore {
 
     /// The exact velocity at the current `now()`.
     pub fn sample_velocity<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let mut out = [0.0; MAX_LANES];
         let l0 = self.t_lane0[t] as usize;
@@ -177,6 +186,7 @@ impl AnimationStore {
 
     /// Where the property is going (the latest target, including delayed ones).
     pub fn target<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         let mut out = [0.0; MAX_LANES];
@@ -187,10 +197,12 @@ impl AnimationStore {
     }
 
     pub fn has<T>(&self, node: NodeId, prop: Prop<T>) -> bool {
+        if self.untracked(prop.id) { return false; }
         self.index.contains_key(&(node.0, prop.id.0))
     }
 
     pub fn is_animating<T>(&self, node: NodeId, prop: Prop<T>) -> bool {
+        if self.prop_active.get(prop.id.0 as usize) == Some(&0) { return false; }
         self.index.get(&(node.0, prop.id.0)).is_some_and(|&t| self.t_slot[t as usize] != NONE)
     }
 
