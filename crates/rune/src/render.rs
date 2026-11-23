@@ -321,6 +321,8 @@ pub struct Renderer {
     /// The pinned pipelines being made on their thread (`variant::start_pinned`), for this format.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
+    /// Scratch buffer for paint-order-preserving wave batching (`upload::wave_batch`).
+    reordered: Vec<Instance>,
     /// Each instance's kind (`params[1]`), as batched: where a run of one kind starts and ends.
     kinds: Vec<Option<Kind>>,
     /// Each instance, as batched: which quad path draws it (`classify_quad`).
