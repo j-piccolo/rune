@@ -91,7 +91,7 @@ pub(super) struct HeadlessLoop<'a> {
 /// and what the redraw planner made of it (`frames.jsonl`, with each list's offset), for tools that
 /// count what a frame asks of a GPU from the draw list itself, on any machine.
 #[cfg(all(feature = "frame-profile", not(target_os = "macos")))]
-fn dump_draw_list(k: usize, plan: &crate::window::damage::Plan, instances: &[crate::render::Instance], size: (u32, u32), clear: [f32; 4], keeps: bool, into_kept: bool) {
+pub(crate) fn dump_draw_list(k: usize, plan: &crate::window::damage::Plan, instances: &[crate::render::Instance], size: (u32, u32), clear: [f32; 4], keeps: bool, into_kept: bool) {
     use std::sync::{Mutex, OnceLock};
     static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     static OUT: Mutex<Option<(std::fs::File, std::fs::File, u64)>> = Mutex::new(None);
@@ -438,6 +438,8 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 animating: info.animating,
                 cpu_ms: self.fp_cpu0.map(|start| crate::frame::profile::cpu_ms().unwrap() - start),
                 gpu_wait_ms,
+                gpu_time_ms: None,
+                gpu_mhz: None,
             });
         }
         s.cpu_ms.push(ms);

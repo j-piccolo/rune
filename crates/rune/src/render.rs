@@ -115,6 +115,7 @@ pub use instance::unpack_clip_radii;
 pub use instance::unpack_fade;
 pub use layers::LayerStats;
 pub use offscreen::OFFSCREEN_FORMAT;
+pub use offscreen::WINDOW_FORMAT;
 pub use offscreen::Offscreen;
 pub use offscreen::write_png;
 #[cfg(not(target_arch = "wasm32"))]
