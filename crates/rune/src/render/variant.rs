@@ -122,6 +122,25 @@ pub(crate) fn pinned_wgsl(kind: u32) -> Option<String> {
     (windfoil.matches(PINNED_OFF).count() == 1).then(|| windfoil.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
 }
 
+/// The fragment a box's middle draws with (render.rs `SPLIT_VERTICES`): its fill, as the uber shader works it out
+/// there (`split_hole`), rounded as it rounds a flat fill. Windfoil's WGSL with this entry in place of its own, so
+/// the compiler keeps nothing else: a GPU runs a small shader for most of a big panel's pixels, not the uber shader
+/// that every kind's code sizes.
+const SOLID_ENTRY: &str = r#"
+@fragment
+fn fs(i: Out) -> @location(0) vec4<f32> {
+    if (projection.z == 0.0 && g.flags.y > 0.5 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0) {
+        return round(clamp(i.fill, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
+    }
+    return i.fill;
+}
+"#;
+
+pub(super) fn solid_wgsl() -> Option<String> {
+    let windfoil = windfoil_wgsl();
+    (windfoil.matches(FS_ENTRY).count() == 1).then(|| format!("{}\n{SOLID_ENTRY}", windfoil.replacen(FS_ENTRY, "fn fs_general(i: Out) -> vec4<f32> {", 1)))
+}
+
 /// outline.wgsl's switch for subpixel outline glyphs, off but in the subpixel variant.
 const SUBPIXEL_OFF: &str = shader_consts::OUTLINE_SUBPIXEL_OFF_DECL;
 
@@ -539,13 +558,14 @@ impl Renderer {
         }
         // Where the uber shader is compiled from WGSL as the renderer starts (Vulkan, GL), its pinned
         // pipelines can be too, on a thread: naga and the driver take milliseconds for each, where FXC
-        // takes tens of seconds. Asked for with `RUNE_PINNED_WGSL=1`, not the default: the smaller
-        // shaders shade a pixel for less (a tenth off the GPU's time on scrolling pages here), and the
-        // draw per run of a kind costs the CPU about as much in this machine's driver. Which way that
-        // goes on a small GPU with a small CPU is for a measurement there to say.
+        // takes tens of seconds. The smaller shaders shade a pixel for less (a tenth off the GPU's time
+        // on scrolling pages on an M1), and the draw per run of a kind costs the CPU about as much in
+        // that machine's driver. On a small GPU with a small CPU (Intel's 24-EU UHD on an N100, a bar's
+        // sheets and launcher) they took a fifth off the GPU's time for a few percent more CPU, and the
+        // frames inside a 240 fps budget went from 31% to 42%. `RUNE_PINNED_WGSL=0` turns them off.
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
         if matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs"
-            && std::env::var_os("RUNE_PINNED_WGSL").is_some_and(|v| v == "1") {
+            && std::env::var_os("RUNE_PINNED_WGSL").is_none_or(|v| v != "0") {
             let (sent, done) = std::sync::mpsc::channel();
             let (device, layout, format) = (device.clone(), self.layout.clone(), self.format);
             let spawned = std::thread::Builder::new().name("rune-pinned-pipelines".into()).spawn(move || {
@@ -564,14 +584,57 @@ impl Renderer {
         self.pinned = Some(Vec::new());
     }
 
+    /// The pipeline a box's middle draws with (`solid_wgsl`) for the renderer's format, made on a thread the first
+    /// frame that has none (where the uber shader compiles from WGSL here) and taken once it's made. Meanwhile, and
+    /// where it can't be made, a middle draws with the uber shader, which works out the same fill there (`i.whole`).
+    pub(super) fn solid_for_format(&mut self, device: &wgpu::Device) {
+        if self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
+        if let Some((format, done)) = &self.solid_building {
+            // Frame-profile builds wait for it, as for the pinned pipelines (`take_pinned`).
+            #[cfg(feature = "frame-profile")]
+            let got = done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected);
+            #[cfg(not(feature = "frame-profile"))]
+            let got = done.try_recv();
+            match got {
+                Ok(made) => {
+                    if *format == self.format { self.solid = Some((*format, made)); }
+                    self.solid_building = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.solid = Some((*format, None));
+                    self.solid_building = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if self.solid_building.is_some() || self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
+        }
+        // Asked for once per format: where it can't be made, or isn't made from WGSL, the uber shader draws middles.
+        let Some(wgsl) = solid_wgsl().filter(|_| matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs") else {
+            self.solid = Some((self.format, None));
+            return;
+        };
+        let (sent, done) = std::sync::mpsc::channel();
+        let (made_on, layout, format) = (device.clone(), self.layout.clone(), self.format);
+        let spawned = std::thread::Builder::new().name("rune-solid-pipeline".into()).spawn(move || {
+            let made = compile(&made_on, &wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p);
+            sent.send(made).ok();
+        });
+        if spawned.is_ok() {
+            self.solid_building = Some((format, done));
+            // Frame-profile builds take it now, as they take the pinned pipelines.
+            #[cfg(feature = "frame-profile")]
+            self.solid_for_format(device);
+        }
+    }
+
     /// Takes the pinned pipelines once their thread has made them for this format (one made for a format the
     /// renderer has since left is dropped, and that format's next use starts again).
     pub(super) fn take_pinned(&mut self) {
         let Some((format, done)) = &self.pinned_building else { return };
-        // Frame-profile builds with `RUNE_PINNED=all` wait for them, so a capture's every frame draws pinned (the
-        // screen comparison forces the split on); every other build never waits.
+        // Frame-profile builds wait for them, so every frame a capture or a frame budget times draws as the last does
+        // and no compile on their thread lands in a frame's counts; every other build never waits.
         #[cfg(feature = "frame-profile")]
-        let got = if super::pinned_forced() == Some(true) { done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { done.try_recv() };
+        let got = done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected);
         #[cfg(not(feature = "frame-profile"))]
         let got = done.try_recv();
         match got {
