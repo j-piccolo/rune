@@ -159,8 +159,10 @@ impl Renderer {
         })
     }
 
+    /// The image atlas: sRGB-encoded bytes, read as they are (shader.wgsl `image_texel` decodes
+    /// them where a frame blends linear).
     pub(super) fn image_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-        Self::texture(device, "image atlas", wgpu::TextureFormat::Rgba8UnormSrgb, width, height)
+        Self::texture(device, "image atlas", wgpu::TextureFormat::Rgba8Unorm, width, height)
     }
 
     /// A sampled texture the CPU fills with `write_rows`.

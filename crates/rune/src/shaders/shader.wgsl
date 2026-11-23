@@ -56,7 +56,7 @@ fn vs(i: In) -> Out {
 
 // Where a box (kind 0), a picture (kind 7) or a gradient's stop segment (kind 11) and its clip cover every pixel whole, past
 // its corners, its soft edge, a box's border and every edge's fade by a pixel more, on whole pixels;
-// empty (zero size) where that is under 16 pixels either way or the shape can't say (a band, per-side
+// empty (zero size) where that is under 8 pixels either way or the shape can't say (a band, per-side
 // borders, a clip with fade stops). Its coverage there is exactly 1 (clip.wgsl `box_inside`: `-min(a)`
 // past the corners' reach), and so is its clip's (`clip_alpha_stops`). An angled linear segment's quad is
 // narrowed first (the banded variant), and its middle taken within what's left.
@@ -83,7 +83,7 @@ fn split_hole(i: In) -> vec4<f32> {
     }
     let lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
     let hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
-    if (any(hi - lo < vec2<f32>(16.0))) {
+    if (any(hi - lo < vec2<f32>(8.0))) {
         return vec4<f32>(0.0);
     }
     return vec4<f32>(lo, hi);
@@ -315,16 +315,23 @@ fn srgb_encode(x: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v * 12.92, v <= vec3<f32>(0.0031308));
 }
 
+fn srgb_decode(x: vec3<f32>) -> vec3<f32> {
+    return select(pow((x + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
+}
+
 /// One image texel, premultiplied (the atlas holds straight alpha) so filtering doesn't darken edges.
+/// The atlas holds the sRGB-encoded bytes as they came: blending sRGB-encoded, a straight texel is
+/// used as it is, with no decode and encode around it.
 fn image_texel(t: vec2<i32>, premultiplied: bool) -> vec4<f32> {
     let c = textureLoad(images, t, 0);
     if (g.flags.x > 0.5) {
+        if (!premultiplied) { return vec4<f32>(c.rgb * c.a, c.a); }
         if (c.a <= 0.0) { return vec4<f32>(0.0); }
-        let lin = select(c.rgb, c.rgb / c.a, premultiplied);
-        return vec4<f32>(srgb_encode(lin) * c.a, c.a);
+        return vec4<f32>(srgb_encode(srgb_decode(c.rgb) / c.a) * c.a, c.a);
     }
-    if premultiplied { return c; }
-    return vec4<f32>(c.rgb * c.a, c.a);
+    let lin = srgb_decode(c.rgb);
+    if premultiplied { return vec4<f32>(lin, c.a); }
+    return vec4<f32>(lin * c.a, c.a);
 }
 
 // Arc length to the point nearest `p` (rect-local) on the centre line of a `bw`-wide ring inside
