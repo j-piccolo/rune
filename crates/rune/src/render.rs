@@ -276,6 +276,8 @@ pub(super) enum QuadMode {
     MiddleOnly,
     /// Plain 1:1 grayscale atlas glyph: slim 4-vertex glyph pipeline.
     PlainGlyph,
+    /// One band of a border ring with no fill, circular corners and no fade: `simple_ring_wgsl`.
+    Ring,
 }
 
 impl QuadMode {
@@ -761,6 +763,12 @@ impl Renderer {
                     tally_draw();
                     pass.draw(0..4, at..end);
                 }
+                QuadMode::Ring => {
+                    let p = middles.get(variant::RING_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
+                    bind(pass, bound, p);
+                    tally_draw();
+                    pass.draw(0..4, at..end);
+                }
                 QuadMode::PlainGlyph => {
                     let p = middles.get(variant::PLAIN_GLYPH_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
                     bind(pass, bound, p);
@@ -1023,6 +1031,11 @@ pub(super) fn classify_quad(instance: &Instance) -> QuadMode {
                 if simple { QuadMode::SplitSimpleRect } else { QuadMode::Split }
             } else if simple {
                 QuadMode::SimpleRect
+            } else if instance.uv[2] < 0.0 && instance.params[0] > 0.0 && instance.fill == [0.0; 4]
+                && instance.radii.iter().all(|&r| r >= 0.0)
+                && instance.fade[0] == 0 && instance.fade[1] == 0 && instance.fade[2] == 0 && (instance.fade[3] & 0x8000_0000) == 0
+            {
+                QuadMode::Ring
             } else {
                 QuadMode::Whole
             }

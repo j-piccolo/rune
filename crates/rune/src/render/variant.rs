@@ -142,8 +142,10 @@ pub(super) const LINEAR_MIDDLE_SLOT: usize = MIDDLE_KINDS.len() + 1;
 pub(super) const SIMPLE_RECT_SLOT: usize = MIDDLE_KINDS.len() + 2;
 /// Slot of the ultra-slim upright 1:1 non-additive, non-cutout, unfaded layer composite pipeline in `Renderer::solid`.
 pub(super) const PLAIN_LAYER_SLOT: usize = MIDDLE_KINDS.len() + 3;
+/// Slot of the slim border-ring band pipeline in `Renderer::solid`.
+pub(super) const RING_SLOT: usize = MIDDLE_KINDS.len() + 4;
 /// Total per-format pipelines in `Renderer::solid`.
-pub(super) const SOLID_COUNT: usize = MIDDLE_KINDS.len() + 4;
+pub(super) const SOLID_COUNT: usize = MIDDLE_KINDS.len() + 5;
 
 /// shader.wgsl's switch for a pipeline that draws middles only.
 const MIDDLE_OFF: &str = "const MIDDLE: bool = false;";
@@ -601,6 +603,8 @@ impl Renderer {
             made.push(compile(&made_on, &simple_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
             let plain_layer_wgsl = plain_layer_composite_wgsl();
             made.push(compile(&made_on, &plain_layer_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let ring_wgsl = simple_ring_wgsl();
+            made.push(compile(&made_on, &ring_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
             let layer = made.iter().map(|m| m.as_ref().map(|(shader, _)| Renderer::pipeline(&made_on, &layout, shader, super::layers::FORMAT, "vs", Blend::SourceOver))).collect::<Vec<_>>();
             let made = made.into_iter().map(|m| m.map(|(_, p)| p)).chain(layer).collect::<Vec<_>>();
             sent.send(made).ok();

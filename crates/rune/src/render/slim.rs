@@ -707,3 +707,98 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 "#)
 }
+
+/// Slim shader for one band of a border ring (`runtime/bands.rs`): a box with a border, no fill,
+/// circular corners and no fade. The uber shader's box path there is `border * ring` (`border_over`
+/// with a clear fill), so this works out only the ring and its clip, and discards where it's empty.
+pub(super) fn simple_ring_wgsl() -> String {
+    format!("{}\n{}", super::CLIP_WGSL, r#"
+struct Globals {
+    viewport: vec2<f32>,
+    pad: vec2<f32>,
+    flags: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> g: Globals;
+@group(0) @binding(3) var<uniform> projection: vec4<f32>;
+
+struct In {
+    @builtin(vertex_index) vi: u32,
+    @location(0) rect: vec4<f32>,
+    @location(1) radii: vec4<f32>,
+    @location(3) border: vec4<f32>,
+    @location(4) params: vec4<f32>,
+    @location(5) uv: vec4<f32>,
+    @location(6) clip: vec4<f32>,
+    @location(7) fade: vec4<u32>,
+};
+
+struct Out {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) rect: vec4<f32>,
+    @location(1) @interpolate(flat) radii: vec4<f32>,
+    @location(2) @interpolate(flat) border: vec4<f32>,
+    @location(3) @interpolate(flat) soft_bw: vec2<f32>,
+    @location(4) @interpolate(flat) clip: vec4<f32>,
+    @location(5) @interpolate(flat) clip_rad: u32,
+};
+
+fn sd_circ(p: vec2<f32>, half: vec2<f32>, radii: vec4<f32>) -> f32 {
+    var r = radii.x;
+    if (p.x > 0.0) {
+        r = select(radii.y, radii.z, p.y > 0.0);
+    } else {
+        r = select(radii.x, radii.w, p.y > 0.0);
+    }
+    r = min(r, min(half.x, half.y));
+    let q = abs(p) - half + vec2<f32>(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - r;
+}
+
+@vertex
+fn vs(i: In) -> Out {
+    // shader.wgsl `base_vs` for a box's quad, cut to its band's window.
+    let corner = vec2<f32>(f32(i.vi & 1u), f32((i.vi >> 1u) & 1u));
+    let grow = 1.0 + i.params.z * 2.0;
+    var lo = i.rect.xy - vec2<f32>(grow);
+    var hi = lo + (i.rect.zw + vec2<f32>(2.0 * grow));
+    if (i.uv.z < 0.0) {
+        lo = max(lo, i.rect.xy + i.uv.xy);
+        hi = max(min(hi, i.rect.xy + vec2<f32>(-i.uv.z, i.uv.w)), lo);
+    }
+    let p = select(lo, hi, corner > vec2<f32>(0.5));
+    let size_px = select(g.viewport, projection.zw, projection.z > 0.0);
+    let local = p - projection.xy;
+    var o: Out;
+    o.pos = vec4<f32>(local.x / size_px.x * 2.0 - 1.0, 1.0 - local.y / size_px.y * 2.0, 0.0, 1.0);
+    o.rect = i.rect;
+    o.radii = i.radii;
+    o.border = i.border;
+    o.soft_bw = vec2<f32>(max(i.params.z, 0.5), i.params.x);
+    o.clip = i.clip;
+    o.clip_rad = i.fade.w;
+    return o;
+}
+
+@fragment
+fn fs(i: Out) -> @location(0) vec4<f32> {
+    let screen = i.pos.xy + projection.xy;
+    let half = i.rect.zw * 0.5;
+    let d = sd_circ(screen - (i.rect.xy + half), half, i.radii);
+    let soft2 = i.soft_bw.x * 2.0;
+    let ring = max(clamp(0.5 - d / soft2, 0.0, 1.0) - clamp(0.5 - (d + i.soft_bw.y) / soft2, 0.0, 1.0), 0.0);
+    if (ring == 0.0) { discard; }
+    let hard = vec4<f32>(screen - i.clip.xy, i.clip.zw - screen);
+    var ca = 1.0;
+    if (!all(hard >= vec4<f32>(0.5625))) {
+        let r = clamp(hard + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(1.0));
+        ca = r.x * r.y * r.z * r.w;
+    }
+    if (i.clip_rad != 0u) {
+        let ch = (i.clip.zw - i.clip.xy) * 0.5;
+        ca *= clamp(0.5 - sd_circ(screen - i.clip.xy - ch, ch, unpack_clip_radii(i.clip_rad)), 0.0, 1.0);
+    }
+    return i.border * ring * ca;
+}
+"#)
+}
