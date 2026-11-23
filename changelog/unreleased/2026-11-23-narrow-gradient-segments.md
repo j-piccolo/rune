@@ -1,0 +1,1 @@
+- A vertical or horizontal linear gradient's stop segment narrows its rect on the CPU to the band where it draws (padded for its soft edge, whole pixels, and kept whole across a rounded corner), with its stops moved to match, so a sheen's segments draw small quads that batch instead of the whole box each. No pixel changes.
