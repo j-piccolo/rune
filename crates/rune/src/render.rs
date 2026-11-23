@@ -684,7 +684,8 @@ impl Renderer {
             };
             for run in kind_runs(&self.kinds, span) {
                 let kind = self.kinds[run.start as usize];
-                let pipeline = pinned_pipeline(pinned, kind).unwrap_or(&self.pipeline);
+                // A kind with no pinned pipeline draws with the pass's own: the window's, or the layer format's.
+                let pipeline = pinned_pipeline(pinned, kind).unwrap_or(frame_pipeline);
                 if !std::ptr::eq(pipeline, bound) { pass.set_pipeline(pipeline); bound = pipeline; }
                 self.draw_quads(pass, run, bound, middles);
             }
