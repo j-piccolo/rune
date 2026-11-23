@@ -10,6 +10,7 @@
 
 use super::instance::shader_consts;
 use super::*;
+use super::slim::*;
 use crate::machine::Effects;
 
 const _: () = {
@@ -133,6 +134,16 @@ pub(crate) fn pinned_banded_wgsl(kind: u32) -> Option<String> {
 /// The kinds whose middle (shader.wgsl `split_hole`) draws with a pipeline of its own (`middle_wgsl`): boxes,
 /// pictures and gradient segments, in the order `Renderer`'s middle pipelines are in.
 pub(super) const MIDDLE_KINDS: [u32; 3] = [Kind::Rect.as_u32(), Kind::Image.as_u32(), Kind::Radial.as_u32()];
+/// Slot of the slim plain-atlas-glyph pipeline in `Renderer::solid`, right after `MIDDLE_KINDS`.
+pub(super) const PLAIN_GLYPH_SLOT: usize = MIDDLE_KINDS.len();
+/// Slot of the vertex-interpolated linear-gradient middle pipeline in `Renderer::solid`.
+pub(super) const LINEAR_MIDDLE_SLOT: usize = MIDDLE_KINDS.len() + 1;
+/// Slot of the slim borderless circular-corner rect pipeline in `Renderer::solid`.
+pub(super) const SIMPLE_RECT_SLOT: usize = MIDDLE_KINDS.len() + 2;
+/// Slot of the ultra-slim upright 1:1 non-additive, non-cutout, unfaded layer composite pipeline in `Renderer::solid`.
+pub(super) const PLAIN_LAYER_SLOT: usize = MIDDLE_KINDS.len() + 3;
+/// Total per-format pipelines in `Renderer::solid`.
+pub(super) const SOLID_COUNT: usize = MIDDLE_KINDS.len() + 4;
 
 /// shader.wgsl's switch for a pipeline that draws middles only.
 const MIDDLE_OFF: &str = "const MIDDLE: bool = false;";
@@ -622,10 +633,24 @@ impl Renderer {
         let (made_on, layout, format) = (device.clone(), self.layout.clone(), self.format);
         let spawned = std::thread::Builder::new().name("rune-middle-pipelines".into()).spawn(move || {
             // For the window's format, then for its layers' (`layers::FORMAT`), where a fading page draws.
-            let made: Vec<_> = MIDDLE_KINDS.iter().map(|&kind| {
-                let wgsl = middle_wgsl(kind)?;
+            let mut made: Vec<_> = MIDDLE_KINDS.iter().map(|&kind| {
+                let wgsl = if kind == Kind::Rect.as_u32() {
+                    solid_rect_wgsl()
+                } else if kind == Kind::Radial.as_u32() {
+                    radial_middle_wgsl()
+                } else {
+                    middle_wgsl(kind)?
+                };
                 compile(&made_on, &wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok()
             }).collect();
+            let glyph_wgsl = plain_glyph_wgsl();
+            made.push(compile(&made_on, &glyph_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let linear_wgsl = linear_grad_middle_wgsl();
+            made.push(compile(&made_on, &linear_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let simple_wgsl = simple_rect_wgsl();
+            made.push(compile(&made_on, &simple_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let plain_layer_wgsl = plain_layer_composite_wgsl();
+            made.push(compile(&made_on, &plain_layer_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
             let layer = made.iter().map(|m| m.as_ref().map(|(shader, _)| Renderer::pipeline(&made_on, &layout, shader, super::layers::FORMAT, "vs", Blend::SourceOver))).collect::<Vec<_>>();
             let made = made.into_iter().map(|m| m.map(|(_, p)| p)).chain(layer).collect::<Vec<_>>();
             sent.send(made).ok();
