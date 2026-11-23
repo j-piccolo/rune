@@ -63,14 +63,14 @@ fn vs(i: In) -> Out {
 fn split_hole(i: In) -> vec4<f32> {
     let kind = i.params.y;
     let image = kind > 6.5 && kind < 7.5;
-    let shape = (kind < 0.5 && i.uv.z >= 0.0 && (i.params.x <= 0.0 || all(i.uv == vec4<f32>(0.0))))
+    let shape = (kind < 0.5 && i.uv.z >= 0.0)
         || (kind > 10.5 && kind < 11.5) || image;
     if (!shape || i.fade.z != 0u) {
         return vec4<f32>(0.0);
     }
     let r = i.radii;
     let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
-    let border = select(0.0, max(i.params.x, 0.0), kind < 0.5);
+    let border = select(0.0, max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), kind < 0.5);
     // A picture's edge is half a pixel soft (its `params.z` says whether it's premultiplied).
     let soft = select(max(i.params.z, 0.5), 0.5, image);
     let e = reach + soft + border + 1.0;
@@ -112,6 +112,9 @@ fn base_vs(i: In) -> Out {
         grow = 1.0;
     } else if (kind > 4.5 && kind < 9.5) {
         grow = 1.0;
+    }
+    if (MIDDLE && sub == 0u) {
+        grow = 0.0;
     }
     var lo = i.rect.xy - vec2<f32>(grow);
     // Effect slots (kind 12) reserve their place in the stream and cover no pixels.
@@ -524,7 +527,8 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         // fragment whole and add nothing over the fill (`box_inside`; `border_over`'s ring is then 0
         // and the fill under it whole), which is most of a panel's pixels.
         let uniform = bw <= 0.0 || i.uv.z < 0.0 || all(i.uv == vec4<f32>(0.0));
-        if (uniform && box_inside(half - abs(screen - center), i.radii, soft + max(bw, 0.0))) {
+        let max_bw = select(max(bw, 0.0), max(bw, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), !uniform);
+        if (box_inside(half - abs(screen - center), i.radii, soft + max_bw)) {
             col = i.fill;
         } else if (bw > 0.0) {
             let d = sd_rounded(screen - center, half, i.radii);

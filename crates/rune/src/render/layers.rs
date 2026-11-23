@@ -882,8 +882,22 @@ impl Renderer {
             self.draw_plain(pass, format, cursor..l.begin, target, true, hook);
             let disposition = self.layers.planner.dispositions.get(index).copied().unwrap_or(Disposition::Skip);
             if let (Disposition::Render { .. } | Disposition::Cached { .. }, Some(t)) = (disposition, &self.layers.targets[index]) {
+                let plain_layer = self.layer_blend(target) != Blend::PlusLighter
+                    && l.turn.is_none() && !l.free && l.hole[3] <= 0.0 && l.blend != Blend::PlusLighter
+                    && l.cache.is_none()
+                    && l.fade[0] == 0 && l.fade[1] == 0 && l.fade[2] == 0
+                    && (l.fade[3] & 0x8000_0000) == 0;
+                let plain_pipe = plain_layer.then(|| {
+                    self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * super::variant::SOLID_COUNT).and_then(|(_, p)| {
+                        let (window, layer) = p.split_at(super::variant::SOLID_COUNT);
+                        let slice = if target.is_none() && format == self.format { Some(window) } else if target.is_some() && format == FORMAT { Some(layer) } else { None };
+                        slice?.get(super::variant::PLAIN_LAYER_SLOT)?.as_ref()
+                    })
+                }).flatten();
                 let pipeline = if self.layer_blend(target) == Blend::PlusLighter {
                     &self.layers.additive.as_ref().expect("prepared dissolve").1
+                } else if let Some(p) = plain_pipe {
+                    p
                 } else { &self.layers.pipelines.iter().find(|(f, _)| *f == format).expect("Renderer::add_format first").1 };
                 pass.set_pipeline(pipeline);
                 if let Some(properties) = &self.springs { pass.set_bind_group(1, &properties.group, &[]); }

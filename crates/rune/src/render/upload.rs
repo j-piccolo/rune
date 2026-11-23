@@ -409,9 +409,9 @@ impl Renderer {
         self.image_batches.clear();
         self.kinds.clear();
         self.kinds.extend(instances.iter().map(Instance::kind));
-        self.split.clear();
-        self.split.extend(instances.iter().map(super::splits));
-        together(instances, &self.split, &mut self.together);
+        self.quad_mode.clear();
+        self.quad_mode.extend(instances.iter().map(super::classify_quad));
+        together(instances, &self.quad_mode, &mut self.together);
         self.big.clear();
         self.big.extend(instances.iter().map(|i| i.rect[2] * i.rect[3] >= super::BIG));
         let (mut start, mut bind) = (0, BatchBind::Image(0));
@@ -555,7 +555,7 @@ mod tests;
 
 /// Whether each split instance can draw with the one before it, middles then bands (`Renderer::draw_quads`): it is
 /// split, of the same kind, and its quad, soft edge and all, overlaps none in its group (at most `GROUP` long).
-fn together(instances: &[Instance], split: &[bool], out: &mut Vec<bool>) {
+fn together(instances: &[Instance], quad_mode: &[super::QuadMode], out: &mut Vec<bool>) {
     const GROUP: usize = 64;
     out.clear();
     out.resize(instances.len(), false);
@@ -565,9 +565,9 @@ fn together(instances: &[Instance], split: &[bool], out: &mut Vec<bool>) {
     };
     let mut group: Vec<[f32; 4]> = Vec::new();
     for (at, instance) in instances.iter().enumerate() {
-        if !split[at] { group.clear(); continue; }
+        if !quad_mode[at].is_split() { group.clear(); continue; }
         let r = reach(instance);
-        let joins = at > 0 && split[at - 1] && instances[at - 1].kind() == instance.kind() && group.len() < GROUP
+        let joins = at > 0 && quad_mode[at - 1] == quad_mode[at] && instances[at - 1].kind() == instance.kind() && group.len() < GROUP
             && group.iter().all(|g| r[2] <= g[0] || g[2] <= r[0] || r[3] <= g[1] || g[3] <= r[1]);
         if !joins { group.clear(); }
         out[at] = joins;

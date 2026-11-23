@@ -36,6 +36,7 @@ mod prewarm {
 }
 mod uber_wgsl;
 mod upload;
+mod slim;
 mod variant;
 mod warmup;
 #[cfg(target_os = "macos")]
@@ -260,6 +261,31 @@ pub enum EffectPhase<'a, 'p> {
 pub type EffectBackdropHook<'h> = dyn FnMut(EffectPhase<'_, '_>, &EffectSite<'_>) + 'h;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuadMode {
+    /// Ordinary 4-vertex quad on its kind or frame pipeline.
+    Whole,
+    /// Borderless, circular-corner, unfaded `Kind::Rect` drawn whole on `simple_rect_wgsl`.
+    SimpleRect,
+    /// Large shape split into middle (`SPLIT_MIDDLE`) + bands (`SPLIT_BANDS`).
+    Split,
+    /// Large borderless, circular-corner, unfaded `Kind::Rect`: `solid_rect_wgsl` middle + `simple_rect_wgsl` bands.
+    SplitSimpleRect,
+    /// Large linear `Kind::Radial` whose middle lies in `[t0, t1]`: `linear_grad_middle_wgsl` middle + bands.
+    SplitLinear,
+    /// Plain whole-pixel borderless unrounded rect `>= BIG` inside an unfaded clip: 4-vertex middle only, no bands.
+    MiddleOnly,
+    /// Plain 1:1 grayscale atlas glyph: slim 4-vertex glyph pipeline.
+    PlainGlyph,
+}
+
+impl QuadMode {
+    #[inline]
+    pub(super) fn is_split(self) -> bool {
+        matches!(self, QuadMode::Split | QuadMode::SplitSimpleRect | QuadMode::SplitLinear)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchBind {
     /// Glyph atlas page 0 with image atlas page `usize`.
     Image(usize),
@@ -297,8 +323,8 @@ pub struct Renderer {
     pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     /// Each instance's kind (`params[1]`), as batched: where a run of one kind starts and ends.
     kinds: Vec<Option<Kind>>,
-    /// Each instance, as batched: whether it draws apart (`SPLIT_VERTICES`).
-    split: Vec<bool>,
+    /// Each instance, as batched: which quad path draws it (`classify_quad`).
+    quad_mode: Vec<QuadMode>,
     /// Each instance, as batched: whether it draws apart with the one before it in one draw, middles then bands
     /// (`together`): the same kind, both split, and clear of every other in their group.
     together: Vec<bool>,
@@ -552,10 +578,10 @@ impl Renderer {
         #[cfg(feature = "frame-profile")]
         let pinned = pinned.filter(|_| pinned_forced() != Some(false));
         let mut bound = frame_pipeline;
-        // A shape's middle draws with its kind's middle pipeline where the frame's own pipeline would draw it: the
-        // window's, or a layer's (`layers::FORMAT`) drawn over as the window is (not additively).
-        let middles = self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * variant::MIDDLE_KINDS.len()).and_then(|(_, p)| {
-            let (window, layer) = p.split_at(variant::MIDDLE_KINDS.len());
+        // A shape's middle (and plain atlas glyphs) draws with its slim pipeline where the frame's own pipeline
+        // would draw it: the window's, or a layer's (`layers::FORMAT`) drawn over as the window is (not additively).
+        let middles = self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * variant::SOLID_COUNT).and_then(|(_, p)| {
+            let (window, layer) = p.split_at(variant::SOLID_COUNT);
             if target.is_none() && format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
                 Some(window)
             } else if target.is_some() && format == layers::FORMAT && self.layer_blend(target) != Blend::PlusLighter
@@ -606,69 +632,145 @@ impl Renderer {
                     let pipeline = pinned_pipeline(p, self.kinds.get(i as usize).copied().flatten())?;
                     (run.len() >= LONG_RUN || self.big.get(i as usize).copied().unwrap_or(false)).then_some(pipeline)
                 };
-                let mut picks: Vec<(u32, Option<&wgpu::RenderPipeline>)> = Vec::new();
+                let mut cur_start: Option<u32> = None;
+                let mut cur_pick: Option<&wgpu::RenderPipeline> = None;
+                let mut cur_end = 0u32;
+                let same_pick = |a: Option<&wgpu::RenderPipeline>, b: Option<&wgpu::RenderPipeline>| match (a, b) {
+                    (Some(x), Some(y)) => std::ptr::eq(x, y),
+                    (None, None) => true,
+                    _ => false,
+                };
                 for run in kind_runs(&self.kinds, span.clone()) {
-                    for i in run.clone() { picks.push((i, choose(&run, i))); }
+                    for i in run.clone() {
+                        let pick = choose(&run, i);
+                        match cur_start {
+                            Some(_) if same_pick(cur_pick, pick) && cur_end == i => {
+                                cur_end = i + 1;
+                            }
+                            Some(s) => {
+                                let fallback = cur_pick.unwrap_or(frame_pipeline);
+                                // Unsplit alternating runs stay in one frame_pipeline draw without slim-pipeline switches.
+                                let run_middles = cur_pick.and(middles);
+                                self.draw_quads(pass, s..cur_end, fallback, &mut bound, run_middles);
+                                cur_start = Some(i);
+                                cur_pick = pick;
+                                cur_end = i + 1;
+                            }
+                            None => {
+                                cur_start = Some(i);
+                                cur_pick = pick;
+                                cur_end = i + 1;
+                            }
+                        }
+                    }
                 }
-                let mut at = 0;
-                while at < picks.len() {
-                    let pick = picks[at].1;
-                    let mut end = at + 1;
-                    while end < picks.len() && match (pick, picks[end].1) { (Some(a), Some(b)) => std::ptr::eq(a, b), (None, None) => true, _ => false } { end += 1; }
-                    let pipeline = pick.unwrap_or(frame_pipeline);
-                    if !std::ptr::eq(bound, pipeline) { pass.set_pipeline(pipeline); bound = pipeline; }
-                    self.draw_quads(pass, picks[at].0..picks[end - 1].0 + 1, bound, middles);
-                    at = end;
+                if let Some(s) = cur_start {
+                    let fallback = cur_pick.unwrap_or(frame_pipeline);
+                    let run_middles = cur_pick.and(middles);
+                    self.draw_quads(pass, s..cur_end, fallback, &mut bound, run_middles);
                 }
                 continue;
             };
             for run in kind_runs(&self.kinds, span) {
                 let kind = self.kinds[run.start as usize];
                 // A kind with no pinned pipeline draws with the pass's own: the window's, or the layer format's.
-                let pipeline = pinned_pipeline(pinned, kind).unwrap_or(frame_pipeline);
-                if !std::ptr::eq(pipeline, bound) { pass.set_pipeline(pipeline); bound = pipeline; }
-                self.draw_quads(pass, run, bound, middles);
+                let fallback = pinned_pipeline(pinned, kind).unwrap_or(frame_pipeline);
+                self.draw_quads(pass, run, fallback, &mut bound, middles);
             }
         }
     }
 
-    /// Draws `range`'s quads with `bound`, a shape worth drawing apart (`split`) with `SPLIT_VERTICES`: with
-    /// `middles`, its middle with its kind's middle pipeline and its bands after, each shape in turn so paint order
-    /// holds.
-    fn draw_quads(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>, bound: &wgpu::RenderPipeline, middles: Option<&[Option<wgpu::RenderPipeline>]>) {
+    /// Draws `range`'s quads with `fallback`, switching to slim pipelines (`middles`) for split shapes,
+    /// middle-only whole-pixel rects, and plain atlas glyphs; updates `bound` to avoid redundant pipeline binds.
+    fn draw_quads<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'_>,
+        range: std::ops::Range<u32>,
+        fallback: &'a wgpu::RenderPipeline,
+        bound: &mut &'a wgpu::RenderPipeline,
+        middles: Option<&'a [Option<wgpu::RenderPipeline>]>,
+    ) {
         #[cfg(feature = "frame-profile")]
         let skip = |i: u32| self.kinds.get(i as usize).copied().flatten().is_some_and(|k| skipped_kinds().contains(&k.as_u32()));
         #[cfg(not(feature = "frame-profile"))]
         let skip = |_: u32| false;
+        let bind = |pass: &mut wgpu::RenderPass<'_>, bound: &mut &'a wgpu::RenderPipeline, p: &'a wgpu::RenderPipeline| {
+            if !std::ptr::eq(*bound, p) {
+                pass.set_pipeline(p);
+                *bound = p;
+            }
+        };
         let mut at = range.start;
         while at < range.end {
             if skip(at) {
                 at += 1;
                 continue;
             }
-            let apart = self.split.get(at as usize).copied().unwrap_or(false);
+            let mode = self.quad_mode.get(at as usize).copied().unwrap_or(QuadMode::Whole);
             let mut end = at + 1;
-            while end < range.end && !skip(end) && self.split.get(end as usize).copied().unwrap_or(false) == apart { end += 1; }
-            match (apart, middles) {
-                (false, _) => pass.draw(0..4, at..end),
-                (true, None) => pass.draw(SPLIT_VERTICES, at..end),
-                (true, Some(middles)) => {
+            if middles.is_none() {
+                let apart = mode.is_split();
+                while end < range.end && !skip(end) && self.quad_mode.get(end as usize).copied().unwrap_or(QuadMode::Whole).is_split() == apart { end += 1; }
+                bind(pass, bound, fallback);
+                if apart {
+                    pass.draw(SPLIT_VERTICES, at..end);
+                } else {
+                    pass.draw(0..4, at..end);
+                }
+                at = end;
+                continue;
+            }
+            while end < range.end && !skip(end) && self.quad_mode.get(end as usize).copied().unwrap_or(QuadMode::Whole) == mode { end += 1; }
+            let middles = middles.unwrap();
+            match mode {
+                QuadMode::Whole => {
+                    bind(pass, bound, fallback);
+                    pass.draw(0..4, at..end);
+                }
+                QuadMode::SimpleRect => {
+                    let p = middles.get(variant::SIMPLE_RECT_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
+                    bind(pass, bound, p);
+                    pass.draw(0..4, at..end);
+                }
+                QuadMode::MiddleOnly => {
+                    let p = middles.first().and_then(Option::as_ref).unwrap_or(fallback);
+                    bind(pass, bound, p);
+                    pass.draw(0..4, at..end);
+                }
+                QuadMode::PlainGlyph => {
+                    let p = middles.get(variant::PLAIN_GLYPH_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
+                    bind(pass, bound, p);
+                    pass.draw(0..4, at..end);
+                }
+                QuadMode::Split | QuadMode::SplitSimpleRect | QuadMode::SplitLinear => {
                     // Shapes of one kind clear of each other draw their middles in one draw and their bands in
                     // another: with none over another, the order between them changes no pixel.
+                    let bands_pipe = if mode == QuadMode::SplitSimpleRect {
+                        middles.get(variant::SIMPLE_RECT_SLOT).and_then(Option::as_ref).unwrap_or(fallback)
+                    } else {
+                        fallback
+                    };
                     let mut i = at;
                     while i < end {
                         let mut j = i + 1;
                         while j < end && !skip(j) && self.together.get(j as usize).copied().unwrap_or(false) { j += 1; }
-                        let kind = self.kinds.get(i as usize).copied().flatten().map(Kind::as_u32);
-                        let middle = variant::MIDDLE_KINDS.iter().position(|&k| Some(k) == kind).and_then(|at| middles.get(at)?.as_ref());
+                        let middle = if mode == QuadMode::SplitLinear {
+                            middles.get(variant::LINEAR_MIDDLE_SLOT).and_then(Option::as_ref)
+                        } else {
+                            let kind = self.kinds.get(i as usize).copied().flatten().map(Kind::as_u32);
+                            variant::MIDDLE_KINDS.iter().position(|&k| Some(k) == kind).and_then(|at| middles.get(at)?.as_ref())
+                        };
                         match middle {
                             Some(middle) => {
-                                pass.set_pipeline(middle);
+                                bind(pass, bound, middle);
                                 pass.draw(SPLIT_MIDDLE, i..j);
-                                pass.set_pipeline(bound);
+                                bind(pass, bound, bands_pipe);
                                 pass.draw(SPLIT_BANDS, i..j);
                             }
-                            None => pass.draw(SPLIT_VERTICES, i..j),
+                            None => {
+                                bind(pass, bound, bands_pipe);
+                                pass.draw(SPLIT_VERTICES, i..j);
+                            }
                         }
                         i = j;
                     }
@@ -825,14 +927,74 @@ const BIG: f32 = 32.0 * 32.0;
 /// Instances of one kind in a row from which a run draws with that kind's pipeline in a span whose kinds alternate.
 const LONG_RUN: usize = 8;
 
-/// Whether `instance` is a box worth drawing apart: one whose middle the vertex shader can find (`split_hole`).
-fn splits(instance: &Instance) -> bool {
-    let shape = match instance.kind() {
-        Some(Kind::Rect) => instance.uv == [0.0; 4],
-        Some(Kind::Radial | Kind::Image) => true,
-        _ => false,
-    };
-    shape && instance.fade[2] == 0 && instance.rect[2] >= SPLIT_MIN && instance.rect[3] >= SPLIT_MIN
+/// Which quad path draws `instance`: plain atlas glyphs on their slim pipeline, plain whole-pixel
+/// borderless unrounded rects on the rect middle pipeline with no bands draw, borderless circular
+/// rects on `simple_rect_wgsl`, or large shapes split into middle + bands (`split_hole`).
+pub(super) fn classify_quad(instance: &Instance) -> QuadMode {
+    match instance.kind() {
+        Some(Kind::Glyph)
+            if instance.radii[3] == 0.0
+                && instance.radii[0] <= 0.5
+                && instance.params[0] == 0.0
+                && instance.uv[2] == 0.0
+                && instance.params[3] >= 0.0 =>
+        {
+            QuadMode::PlainGlyph
+        }
+        Some(Kind::Rect) => {
+            let [x, y, w, h] = instance.rect;
+            let [x1, y1] = [x + w, y + h];
+            let [cx0, cy0, cx1, cy1] = instance.clip;
+            let simple = instance.params[0] == 0.0
+                && instance.uv == [0.0; 4]
+                && instance.radii.iter().all(|&r| r >= 0.0)
+                && instance.fade[0] == 0
+                && instance.fade[1] == 0
+                && instance.fade[2] == 0
+                && (instance.fade[3] & 0x8000_0000) == 0;
+            if simple
+                && w * h >= BIG
+                && instance.params[2] <= 0.5
+                && instance.radii == [0.0; 4]
+                && instance.fade[3] == 0
+                && [x, y, x1, y1].iter().all(|v| v.fract() == 0.0)
+                && cx0 <= x && cy0 <= y && cx1 >= x1 && cy1 >= y1
+            {
+                QuadMode::MiddleOnly
+            } else if instance.uv[2] >= 0.0 && instance.fade[2] == 0 && w >= SPLIT_MIN && h >= SPLIT_MIN {
+                if simple { QuadMode::SplitSimpleRect } else { QuadMode::Split }
+            } else if simple {
+                QuadMode::SimpleRect
+            } else {
+                QuadMode::Whole
+            }
+        }
+        Some(Kind::Radial) if instance.fade[2] == 0 && instance.rect[2] >= SPLIT_MIN && instance.rect[3] >= SPLIT_MIN => {
+            if instance.uv[2] == 0.0 && (instance.uv[0] != 0.0 || instance.uv[1] != 0.0) {
+                let lower_open = instance.params[0] >= 1.5;
+                let upper_open = instance.params[3] >= 1.5;
+                let t0 = if lower_open { instance.params[0] - 2.0 } else { instance.params[0] };
+                let t1 = if upper_open { instance.params[3] - 2.0 } else { instance.params[3] };
+                if t1 > t0 + 1e-5 {
+                    let reach = instance.radii.into_iter().map(corner_extent).fold(0.0f32, f32::max);
+                    let e = reach + instance.params[2].max(0.5) + 1.0;
+                    let hw = (instance.rect[2] * 0.5 - e).max(0.0);
+                    let hh = (instance.rect[3] * 0.5 - e).max(0.0);
+                    let span = hw * instance.uv[0].abs() + hh * instance.uv[1].abs();
+                    if 0.5 - span >= t0 && 0.5 + span <= t1 {
+                        return QuadMode::SplitLinear;
+                    }
+                }
+            }
+            QuadMode::Split
+        }
+        Some(Kind::Image)
+            if instance.fade[2] == 0 && instance.rect[2] >= SPLIT_MIN && instance.rect[3] >= SPLIT_MIN =>
+        {
+            QuadMode::Split
+        }
+        _ => QuadMode::Whole,
+    }
 }
 
 /// Most runs a span is split into (`few_runs`), and fewest instances a run has on average.

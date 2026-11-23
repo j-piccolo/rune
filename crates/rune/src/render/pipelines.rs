@@ -90,7 +90,7 @@ impl Renderer {
             pinned_extra: Vec::new(),
             pinned_building: None,
             kinds: Vec::new(),
-            split: Vec::new(),
+            quad_mode: Vec::new(),
             together: Vec::new(),
             big: Vec::new(),
             #[cfg(feature = "frame-profile")]
