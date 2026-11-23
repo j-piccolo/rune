@@ -19,6 +19,11 @@ fn sd_continuous(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
 }
 
 fn sd_rounded(p: vec2<f32>, half: vec2<f32>, radii: vec4<f32>) -> f32 {
+    if (all(radii == vec4<f32>(0.0))) {
+        let q = abs(p) - half;
+        if (q.x <= 0.0 && q.y <= 0.0) { return max(q.x, q.y); }
+        return length(max(q, vec2<f32>(0.0)));
+    }
     // radii: top-left, top-right, bottom-right, bottom-left (y down). Negative is continuous.
     var r = radii.x;
     if (p.x > 0.0) {
@@ -110,6 +115,10 @@ fn unpack_f16x2(packed: u32) -> vec2<f32> {
 }
 
 fn clip_alpha_stops(p: vec2<f32>, c: vec4<f32>, packed: vec4<u32>, stops: vec2<f32>) -> f32 {
+    // Fast path for the common case: unrounded, unfaded clip and pixel strictly inside it.
+    if (all(packed == vec4<u32>(0u)) && p.x >= c.x + 0.5 && p.y >= c.y + 0.5 && p.x <= c.z - 0.5 && p.y <= c.w - 0.5) {
+        return 1.0;
+    }
     var f = vec4<f32>(0.0);
     if ((packed.x | packed.y) != 0u) {
         f = vec4<f32>(unpack_f16x2(packed.x), unpack_f16x2(packed.y));

@@ -33,8 +33,8 @@ const MOST: f32 = 0.6;
 /// Past this many instances the new list has that the old doesn't, a frame draws all of it without
 /// looking for where they are: a scroll moves every row, and checking the order of thousands of
 /// instances and bounding them only to find they cover the window costs a list's frame hundreds of
-/// microseconds. A typed glyph, a streamed line or a hover changes far fewer.
-const MANY: usize = 256;
+/// microseconds. A typed glyph, a streamed line, a hover, or a newly mounted row of chips changes fewer.
+const MANY: usize = 384;
 /// Rectangles a change is gathered into, at most.
 pub(super) const RECTS: usize = crate::render::MAX_RECTS;
 /// Rectangles a scroll's redraw is gathered into, at most.
@@ -567,7 +567,12 @@ fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: 
         for &j in &probes {
             let mut offers: Vec<[f32; 2]> = Vec::new();
             for i in window(j) {
-                if let Some(d) = moved(&om[i], &nm[j]) && !offers.contains(&d) { offers.push(d); }
+                if let Some(d) = moved(&om[i], &nm[j])
+                    && d[0].fract() == 0.0 && d[1].fract() == 0.0 && on_grid(d[0]) && on_grid(d[1])
+                    && !offers.contains(&d)
+                {
+                    offers.push(d);
+                }
             }
             for d in offers {
                 match votes.iter_mut().find(|(v, _)| *v == d) { Some(e) => e.1 += 1, None => votes.push((d, 1)) }

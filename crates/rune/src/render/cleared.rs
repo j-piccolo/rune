@@ -19,15 +19,57 @@ impl Renderer {
 /// every pixel as it was.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Cleared {
-    color: [f32; 4],
-    len: u32,
+    pub(super) color: [f32; 4],
+    pub(super) len: u32,
+    /// When the viewport is partitioned into `[0, 0, W, y0]` (`instances[1]`, `color`) and a
+    /// dominant opaque rect `[0, y0, W, H - y0]` (`instances[skip]`, `swap_color`) disjoint from
+    /// everything in `2..skip`, clearing to `swap_color` and starting at `1` lets us skip the
+    /// dominant rect (`1.94 MP`) and only draw the small top strip (`0.13 MP`).
+    pub(super) swap: Option<(u32, [f32; 4])>,
 }
 
 impl Cleared {
     pub(super) fn of(instances: &[Instance]) -> Self {
         let Some(color) = instances.first().map(|i| i.fill).filter(|c| c[3] == 1.0) else { return Self::default() };
         let len = instances.iter().take_while(|i| paints_only(i, color)).count();
-        Self { color, len: len as u32 }
+        let mut swap = None;
+        if len == 2 {
+            let r0 = instances[0].rect;
+            let r1 = instances[1].rect;
+            if r0[0] == 0.0 && r0[1] == 0.0 && r1[0] == 0.0 && r1[1] == 0.0 && r1[2] == r0[2] && r1[3] > 0.0 && r1[3] < r0[3] * 0.25 {
+                let want = [0.0, r1[3], r0[2], r0[3] - r1[3]];
+                let mut depth = 0usize;
+                for (k, inst) in instances.iter().enumerate().skip(2) {
+                    match inst.kind() {
+                        Some(Kind::Layer) => {
+                            if inst.fill[3] < 1.0 || inst.params[0] != 0.0 || inst.params[2] != 0.0 || inst.params[3] != 0.0 || inst.border[1] != 0.0 || inst.fade != [0; 4] || inst.radii[3] != 0.0 {
+                                depth += 1;
+                            }
+                            continue;
+                        }
+                        Some(Kind::LayerEnd) => {
+                            depth = depth.saturating_sub(1);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if depth == 0 && inst.rect == want && inst.fill[3] == 1.0 && paints_only(inst, inst.fill) {
+                        let disjoint = instances[2..k].iter().all(|prev| {
+                            if matches!(prev.kind(), Some(Kind::Layer | Kind::LayerEnd)) { return true; }
+                            let Some((x0, y0, x1, y1)) = prev.damage_quad_bounds() else { return true };
+                            let c = prev.clip;
+                            let (x0, y0, x1, y1) = (x0.max(c[0]), y0.max(c[1]), x1.min(c[2]), y1.min(c[3]));
+                            !(x1 > x0 && y1 > y0 && y1 > want[1])
+                        });
+                        if disjoint {
+                            swap = Some((k as u32, inst.fill));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        Self { color, len: len as u32, swap }
     }
 
     /// Where a pass opening with `load` starts drawing the list: past these instances when it

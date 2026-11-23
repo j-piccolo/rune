@@ -517,10 +517,11 @@ impl Renderer {
             for bd in &self.backdrops { blur.bind_backdrop(device, bd.format, &bd.view); }
             self.backdrop_blur = Some(blur);
         }
+        let lfmt = self.layer_format();
         let Some(blur) = &mut self.backdrop_blur else { return };
         blur.ensure_composite(device, self.format);
         for (format, _) in &self.extra { blur.ensure_composite(device, *format); }
-        if self.layers.targets.iter().any(Option::is_some) { blur.ensure_composite(device, layers::FORMAT); }
+        if self.layers.targets.iter().any(Option::is_some) { blur.ensure_composite(device, lfmt); }
         let viewport = [vw as f32, vh as f32];
         let mut placed = Vec::new();
         let mut need = [STEP; 2];

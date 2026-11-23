@@ -58,7 +58,7 @@ pub(super) struct Layers {
     pub additive: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     pub blur: Option<layer_blur::Pipeline>,
     viewport: (u32, u32),
-    image_generation: u64,
+    pub(super) image_generation: u64,
     allocations: u64,
     /// The atlas and outline texture generation: every target's base bind group names the
     /// generation it was made against, and a parked target is bound again only when a layer takes
@@ -88,6 +88,14 @@ impl Layers {
         self.plan.iter().enumerate().all(|(i, l)| match self.planner.dispositions.get(i) {
             Some(Disposition::Inline | Disposition::Skip) | None => true,
             Some(Disposition::Render { .. } | Disposition::Cached { .. }) => l.turn.is_none() && !l.free && l.blur == 0.0,
+        })
+    }
+
+    /// Start index (`begin`) of the first materialized top-level isolated layer, if any.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn first_top_layer_begin(&self) -> Option<u32> {
+        self.plan.iter().enumerate().find_map(|(i, l)| {
+            (l.parent.is_none() && self.targets.get(i).is_some_and(Option::is_some)).then_some(l.begin)
         })
     }
 
@@ -206,6 +214,15 @@ pub(super) struct Target {
     /// This frame's layer is what the texture holds already: no pass draws it again, and the
     /// frame only composites it (a fade changes a layer's opacity every frame, and nothing in it).
     unchanged: std::sync::atomic::AtomicBool,
+    /// When the layer has an opaque base fill covering `rect`, its clear colour (lets full redraws
+    /// use `LoadOp::Clear(bg)` and skip the base rect, and partial updates use `LoadOp::Load`).
+    opaque_clear: Option<[f32; 4]>,
+    /// Layer-local dirty scissor `[x, y, w, h]` when only a few instances inside an opaque-base
+    /// layer changed since the last frame (e.g. a small spinner inside a full-screen video layer).
+    dirty_rect: Option<[u32; 4]>,
+    /// True when this top-level layer sits directly over the window's opaque clear colour with no
+    /// overlapping instances drawn before it, allowing unblended `fast_layer_over_clear` compositing.
+    over_clear: bool,
     /// Test-only: the outline texture's height the base bind group was made against.
     #[cfg(test)]
     outline_rows: u32,
@@ -225,8 +242,232 @@ struct Holds {
 
 impl Holds {
     fn is(&self, rect: [f32; 4], viewport: (u32, u32), texels: u64, images: u64, binding: u64, instances: &[Instance]) -> bool {
-        self.rect == rect && self.viewport == viewport && self.texels == texels && self.images == images && self.binding == binding
-            && bytemuck::cast_slice::<Instance, u8>(&self.instances) == bytemuck::cast_slice::<Instance, u8>(instances)
+        if self.rect[2] != rect[2] || self.rect[3] != rect[3]
+            || self.viewport != viewport || self.texels != texels || self.images != images || self.binding != binding
+            || self.instances.len() != instances.len()
+        {
+            return false;
+        }
+        if self.rect[0] == rect[0] && self.rect[1] == rect[1] {
+            return bytemuck::cast_slice::<Instance, u8>(&self.instances) == bytemuck::cast_slice::<Instance, u8>(instances);
+        }
+        // A layer that only translated (e.g. an offset+opacity arrive transition) draws the exact
+        // same texture pixels when every child instance shifted by the same delta, because the
+        // layer projection subtracts `rect.xy`.
+        let (dx, dy) = (rect[0] - self.rect[0], rect[1] - self.rect[1]);
+        self.instances.iter().zip(instances).all(|(a, b)| {
+            if !matches!(a.kind(), Some(Kind::Rect | Kind::Shadow | Kind::Glyph | Kind::Inset | Kind::Gradient | Kind::Image | Kind::Dashed | Kind::Radial)) {
+                return false;
+            }
+            let clip_ok = (a.clip == b.clip && (a.clip[0] < -1e5
+                || (a.clip[0] <= a.rect[0] && a.clip[1] <= a.rect[1]
+                    && a.clip[2] >= a.rect[0] + a.rect[2] && a.clip[3] >= a.rect[1] + a.rect[3]
+                    && b.clip[0] <= b.rect[0] && b.clip[1] <= b.rect[1]
+                    && b.clip[2] >= b.rect[0] + b.rect[2] && b.clip[3] >= b.rect[1] + b.rect[3])))
+                || ((b.clip[0] - a.clip[0] - dx).abs() <= 1e-3
+                    && (b.clip[1] - a.clip[1] - dy).abs() <= 1e-3
+                    && (b.clip[2] - a.clip[2] - dx).abs() <= 1e-3
+                    && (b.clip[3] - a.clip[3] - dy).abs() <= 1e-3);
+            a.rect[2] == b.rect[2] && a.rect[3] == b.rect[3]
+                && (b.rect[0] - a.rect[0] - dx).abs() <= 1e-3
+                && (b.rect[1] - a.rect[1] - dy).abs() <= 1e-3
+                && clip_ok
+                && a.radii == b.radii
+                && a.fill == b.fill
+                && a.border == b.border
+                && a.params == b.params
+                && a.uv == b.uv
+                && a.fade == b.fade
+        })
+    }
+}
+
+fn opaque_base(first: Option<&Instance>, rect: [f32; 4]) -> Option<[f32; 4]> {
+    let i = first?;
+    if i.kind() != Some(Kind::Rect)
+        || i.fill[3] != 1.0
+        || i.params[0] != 0.0
+        || i.params[2] > 0.5
+        || i.radii != [0.0; 4]
+        || i.fade != [0; 4]
+    {
+        return None;
+    }
+    let (rx1, ry1) = (rect[0] + rect[2], rect[1] + rect[3]);
+    let covers = i.rect[0] <= rect[0]
+        && i.rect[1] <= rect[1]
+        && i.rect[0] + i.rect[2] >= rx1
+        && i.rect[1] + i.rect[3] >= ry1
+        && i.clip[0] <= rect[0]
+        && i.clip[1] <= rect[1]
+        && i.clip[2] >= rx1
+        && i.clip[3] >= ry1;
+    covers.then_some(i.fill)
+}
+
+fn partial_layer_dirty(holds: &Holds, rect: [f32; 4], viewport: (u32, u32), texels: u64, images: u64, binding: u64, instances: &[Instance]) -> Option<[u32; 4]> {
+    if holds.rect != rect || holds.viewport != viewport || holds.texels != texels || holds.images != images || holds.binding != binding || holds.instances.len() != instances.len() {
+        return None;
+    }
+    let (rw, rh) = (rect[2] as u32, rect[3] as u32);
+    if rw == 0 || rh == 0 { return None; }
+    let mut changed = 0usize;
+    let mut box_ = [u32::MAX, u32::MAX, 0u32, 0u32];
+    let mut grow = |i: &Instance| {
+        let Some((x0, y0, x1, y1)) = i.damage_quad_bounds() else { return };
+        let lx0 = ((x0 - rect[0] - 1.0).floor().max(0.0) as u32).min(rw);
+        let ly0 = ((y0 - rect[1] - 1.0).floor().max(0.0) as u32).min(rh);
+        let lx1 = ((x1 - rect[0] + 1.0).ceil().max(0.0) as u32).min(rw);
+        let ly1 = ((y1 - rect[1] + 1.0).ceil().max(0.0) as u32).min(rh);
+        if lx1 > lx0 && ly1 > ly0 {
+            box_[0] = box_[0].min(lx0);
+            box_[1] = box_[1].min(ly0);
+            box_[2] = box_[2].max(lx1);
+            box_[3] = box_[3].max(ly1);
+        }
+    };
+    for (a, b) in holds.instances.iter().zip(instances) {
+        if bytemuck::bytes_of(a) != bytemuck::bytes_of(b) {
+            changed += 1;
+            if changed > 16 { return None; }
+            grow(a);
+            grow(b);
+        }
+    }
+    if changed == 0 || box_[2] <= box_[0] || box_[3] <= box_[1] { return None; }
+    let dw = box_[2] - box_[0];
+    let dh = box_[3] - box_[1];
+    if u64::from(dw) * u64::from(dh) * 4 >= u64::from(rw) * u64::from(rh) { return None; }
+    Some([box_[0], box_[1], dw, dh])
+}
+
+fn disjoint_before(instances: &[Instance], from: usize, to: usize, rect: [f32; 4]) -> bool {
+    let (rx0, ry0, rx1, ry1) = (rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]);
+    for i in &instances[from..to] {
+        if matches!(i.kind(), Some(Kind::Layer | Kind::LayerEnd)) {
+            continue;
+        }
+        let Some((x0, y0, x1, y1)) = i.damage_quad_bounds() else { continue };
+        let c = i.clip;
+        let (x0, y0, x1, y1) = (x0.max(c[0]), y0.max(c[1]), x1.min(c[2]), y1.min(c[3]));
+        if x1 > x0 && y1 > y0 && x0 < rx1 && rx0 < x1 && y0 < ry1 && ry0 < y1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Transforms a premultiplied colour `c` for affine in-place layer inlining at group `opacity`
+/// over an opaque `bg` colour: `T(S, α) = (opacity * S + α * (1 - opacity) * bg, α)`.
+#[inline]
+fn affine_color(c: [f32; 4], opacity: f32, bg: [f32; 4]) -> [f32; 4] {
+    let k = c[3] * (1.0 - opacity);
+    [
+        c[0] * opacity + bg[0] * k,
+        c[1] * opacity + bg[1] * k,
+        c[2] * opacity + bg[2] * k,
+        c[3],
+    ]
+}
+
+/// Inlines top-level plain `SourceOver` layers that have an opaque full-layer base and sit
+/// directly over the window's opaque clear colour (no overlapping earlier instances, no nested
+/// layers/images/effects) by applying the exact affine colour transform `T(S, α)` to each child.
+/// Eliminates the offscreen texture, second render pass, and full-layer `textureLoad` composite.
+pub(super) fn inline_affine_layers(instances: &[Instance]) -> std::borrow::Cow<'_, [Instance]> {
+    if !instances.iter().any(|i| i.kind() == Some(Kind::Layer)) {
+        return std::borrow::Cow::Borrowed(instances);
+    }
+    let cleared = super::cleared::Cleared::of(instances);
+    if cleared.len == 0 || cleared.color[3] != 1.0 {
+        return std::borrow::Cow::Borrowed(instances);
+    }
+    let bg = cleared.color;
+    let cleared_len = cleared.len as usize;
+    let mut out: Option<Vec<Instance>> = None;
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < instances.len() {
+        match instances[i].kind() {
+            Some(Kind::Layer) => {
+                if depth == 0 {
+                    let begin = i;
+                    let mut end = begin + 1;
+                    let mut d = 1usize;
+                    while end < instances.len() && d > 0 {
+                        match instances[end].kind() {
+                            Some(Kind::Layer) => d += 1,
+                            Some(Kind::LayerEnd) => d -= 1,
+                            _ => {}
+                        }
+                        if d > 0 { end += 1; }
+                    }
+                    let l = &instances[begin];
+                    let opacity = l.fill[3];
+                    let clip_ok = l.clip[0] < -1e5 || l.clip.iter().all(|v| v.fract() == 0.0);
+                    let vis_rect = if l.clip[0] < -1e5 {
+                        l.rect
+                    } else {
+                        let x0 = l.rect[0].max(l.clip[0]);
+                        let y0 = l.rect[1].max(l.clip[1]);
+                        let x1 = (l.rect[0] + l.rect[2]).min(l.clip[2]);
+                        let y1 = (l.rect[1] + l.rect[3]).min(l.clip[3]);
+                        [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
+                    };
+                    let qualifies = end < instances.len()
+                        && opacity > 0.0
+                        && opacity < 1.0
+                        && l.params[0] == 0.0
+                        && l.params[2] == 0.0
+                        && l.params[3] == 0.0
+                        && l.border[1] == 0.0
+                        && l.fade == [0; 4]
+                        && l.radii[3] == 0.0
+                        && clip_ok
+                        && begin >= cleared_len
+                        && disjoint_before(instances, cleared_len, begin, vis_rect)
+                        && instances[begin + 1..end].iter().all(|c| match c.kind() {
+                            Some(Kind::Rect | Kind::Shadow | Kind::Glyph | Kind::Inset | Kind::Gradient | Kind::Dashed | Kind::Radial | Kind::LayerEnd) => true,
+                            Some(Kind::Layer) => {
+                                c.fill[3] >= 1.0
+                                    && c.params[0] == 0.0
+                                    && c.params[2] == 0.0
+                                    && c.params[3] == 0.0
+                                    && c.border[1] == 0.0
+                                    && c.fade == [0; 4]
+                                    && c.radii[3] == 0.0
+                                    && (c.clip[0] < -1e5 || c.clip.iter().all(|v| v.fract() == 0.0))
+                            }
+                            _ => false,
+                        });
+                    if qualifies {
+                        let buf = out.get_or_insert_with(|| instances.to_vec());
+                        buf[begin].fill[3] = 1.0;
+                        for c in &mut buf[begin + 1..end] {
+                            if matches!(c.kind(), Some(Kind::Layer | Kind::LayerEnd)) {
+                                continue;
+                            }
+                            c.fill = affine_color(c.fill, opacity, bg);
+                            if matches!(c.kind(), Some(Kind::Rect | Kind::Gradient | Kind::Dashed | Kind::Radial | Kind::Inset)) {
+                                c.border = affine_color(c.border, opacity, bg);
+                            }
+                        }
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                depth += 1;
+            }
+            Some(Kind::LayerEnd) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(instances),
     }
 }
 
@@ -278,9 +519,16 @@ fn union(a: &mut [f32; 4], b: [f32; 4]) {
 }
 
 impl Renderer {
+    /// Target format for isolated layer textures: uses the window's 8-bit format when blending in
+    /// gamma space (`srgb_blend`) to halve bandwidth and avoid software f16 conversions, and
+    /// `Rgba16Float` (`FORMAT`) for linear/HDR rendering.
+    pub(super) fn layer_format(&self) -> wgpu::TextureFormat {
+        if self.srgb_blend { self.format } else { FORMAT }
+    }
+
     fn target_bytes(t: &Target) -> u64 {
         let mut bytes = u64::from(t.texture.width()) * u64::from(t.texture.height())
-            * u64::from(FORMAT.block_copy_size(None).unwrap());
+            * u64::from(t.texture.format().block_copy_size(None).unwrap());
         if let Some(blur) = &t.blur {
             bytes += blur.bytes();
         }
@@ -562,13 +810,14 @@ impl Renderer {
             t.composite = composite;
             t.composite_parent = parent_identity;
         }
+        let lfmt = self.layer_format();
         if self.layers.targets.iter().any(Option::is_some) {
-            self.add_format(device, FORMAT);
+            self.add_format(device, lfmt);
             self.add_layer_format(device, self.format);
             for index in 0..self.extra.len() { self.add_layer_format(device, self.extra[index].0); }
         }
         if self.layers.plan.iter().any(|l| l.blend == Blend::PlusLighter) && let Some(s) = &mut self.surfaces {
-            s.add_plus_lighter(device, FORMAT);
+            s.add_plus_lighter(device, lfmt);
         }
         debug_assert!(self.layers.planner.dispositions.iter().zip(&self.layers.targets)
             .all(|(d, t)| t.is_some() == matches!(d, Disposition::Render { .. } | Disposition::Cached { .. })),
@@ -613,7 +862,7 @@ impl Renderer {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("isolated group"), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            format: self.layer_format(), usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
@@ -629,6 +878,7 @@ impl Renderer {
             quad: Self::instance_buffer(device, 1), base, composite, images: Vec::new(), glyphs: Vec::new(), image_generation: u64::MAX, blur: None,
             cache: None, last_used: 0, content_size: [0.0; 2], binding: self.layers.bindings,
             holds: Default::default(), pending: Default::default(), unchanged: Default::default(),
+            opaque_clear: None, dirty_rect: None, over_clear: false,
             #[cfg(test)]
             outline_rows: self.uber.outlines().map_or(0, wgpu::Texture::height) }
     }
@@ -650,6 +900,7 @@ impl Renderer {
                     let t = self.layers.targets[index].as_mut().expect("a claimed cache has its target");
                     t.cache = cache;
                     if cache.is_some() { t.last_used = stamp; }
+                    t.over_clear = false;
                     let mut quad = Instance::begin_layer(rect, l.clip, LayerSpec {
                         opacity: l.opacity, blend: l.blend, ..Default::default() });
                     // A hit composites the same turned quad a miss drew: the turn belongs to the
@@ -673,6 +924,13 @@ impl Renderer {
                         && !content.iter().any(|i| i.kind().is_none_or(|k| matches!(k, Kind::Layer | Kind::LayerEnd | Kind::Effect | Kind::BackdropBlur)));
                     let holds = t.holds.get_mut().unwrap_or_else(|e| e.into_inner());
                     let same = plain && holds.as_ref().is_some_and(|h| h.is(rect, viewport, texels, images, t.binding, content));
+                    let ob = if l.blur == 0.0 && !l.free && l.turn.is_none() { opaque_base(content.first(), rect) } else { None };
+                    t.opaque_clear = ob;
+                    t.dirty_rect = if !same && plain && ob.is_some() {
+                        holds.as_ref().and_then(|h| partial_layer_dirty(h, rect, viewport, texels, images, t.binding, content))
+                    } else {
+                        None
+                    };
                     *t.unchanged.get_mut() = same;
                     if !same {
                         *holds = None;
@@ -692,9 +950,20 @@ impl Renderer {
                         }
                     }
                     staging.write_buffer(&t.projection, 0, bytemuck::cast_slice(&rect));
+                    let over_clear = l.parent.is_none()
+                        && l.turn.is_none()
+                        && l.fade == [0; 4]
+                        && l.hole[3] <= 0.0
+                        && l.blend == Blend::SourceOver
+                        && self.cleared.len > 0
+                        && self.cleared.color[3] == 1.0
+                        && (self.cleared.len as usize) <= (l.begin as usize)
+                        && disjoint_before(instances, self.cleared.len as usize, l.begin as usize, rect);
+                    t.over_clear = over_clear;
                     let mut quad = Instance::begin_layer(rect, l.clip, LayerSpec {
                         opacity: l.opacity, blend: l.blend, ..Default::default() });
                     if let Some((angle, pivot)) = l.turn { quad = quad.turned(angle, pivot); }
+                    else if over_clear { quad.border = self.cleared.color; }
                     quad.fade = l.fade;
                     quad.radii = l.hole;
                     staging.write_buffer(&t.quad, 0, bytemuck::bytes_of(&quad));
@@ -756,21 +1025,23 @@ impl Renderer {
 
     pub(super) fn add_layer_format(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         if self.layers.pipelines.iter().any(|(f, _)| *f == format) { return; }
-        // With the standard `"vs"` vertex entry, the layer composite pipeline for `format` is
-        // identical to the renderer's own main or `extra` uber pipeline; clone instead of
-        // compiling a duplicate.
-        let pipeline = if self.vertex_entry == "vs" {
-            if format == self.format {
-                Some(self.pipeline.clone())
-            } else {
-                self.extra.iter().find(|(f, _)| *f == format).map(|(_, p)| p.clone())
-            }
+        let pipeline = if cfg!(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32"))) {
+            super::fast::layer_composite_pipeline(device, &self.layout, format, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)
         } else {
-            None
+            // With the standard `"vs"` vertex entry, the layer composite pipeline for `format` is
+            // identical to the renderer's own main or `extra` uber pipeline; clone instead of
+            // compiling a duplicate.
+            let shared = if self.vertex_entry == "vs" {
+                if format == self.format {
+                    Some(self.pipeline.clone())
+                } else {
+                    self.extra.iter().find(|(f, _)| *f == format).map(|(_, p)| p.clone())
+                }
+            } else {
+                None
+            };
+            shared.unwrap_or_else(|| Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver))
         };
-        let pipeline = pipeline.unwrap_or_else(|| {
-            Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver)
-        });
         self.layers.pipelines.push((format, pipeline));
     }
 
@@ -817,7 +1088,7 @@ impl Renderer {
             if t.image_generation == self.layers.image_generation { continue; }
             t.images.clear();
             t.images.extend(self.images.iter().map(|page| page.as_ref().map(|(texture, _)|
-                Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, texture, Some(&t.projection)))));
+                Self::bind_group_images(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, texture, Some(&t.projection), self.srgb_blend))));
             t.glyphs.clear();
             t.glyphs.extend(self.atlas_pages.iter().map(|(texture, _)|
                 Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), texture, texture, Some(&t.projection))));
@@ -883,11 +1154,18 @@ impl Renderer {
             let Some(target) = &self.layers.targets[index] else { continue };
             if target.unchanged.load(std::sync::atomic::Ordering::Relaxed) { continue; }
             let rect = disposition.rect();
+            let (load, start_at) = if target.dirty_rect.is_some() {
+                (wgpu::LoadOp::Load, l.begin + 1)
+            } else if let Some(bg) = target.opaque_clear {
+                (wgpu::LoadOp::Clear(wgpu::Color { r: bg[0] as f64, g: bg[1] as f64, b: bg[2] as f64, a: bg[3] as f64 }), l.begin + 2)
+            } else {
+                (wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), l.begin + 1)
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("isolated group"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.view, depth_slice: None, resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                 })], depth_stencil_attachment: None,
                 timestamp_writes: if first { timestamps.map(|t| wgpu::RenderPassTimestampWrites {
                     query_set: t.query_set, beginning_of_pass_write_index: t.beginning_of_pass_write_index,
@@ -898,7 +1176,10 @@ impl Renderer {
             first = false;
             pass.set_viewport(0.0, 0.0, rect[2], rect[3], 0.0, 1.0);
             let mut active = ActivePass::owned(pass, encoder, &target.view);
-            self.draw_layer_range(&mut active, FORMAT, l.begin + 1..l.end, Some(index), hook);
+            if let Some(dirty) = target.dirty_rect {
+                active.set_scissor(Some(dirty), [rect[2] as u32, rect[3] as u32]);
+            }
+            self.draw_layer_range(&mut active, target.texture.format(), start_at..l.end, Some(index), hook);
             drop(active);
             if let Some(blur) = &target.blur {
                 self.layers.blur.as_ref().unwrap().encode(encoder, blur, &target.view);
@@ -917,10 +1198,24 @@ impl Renderer {
             assert!(l.end < range.end, "draw_range must not split a layer scope");
             self.draw_plain(pass, format, cursor..l.begin, target, true, hook);
             let disposition = self.layers.planner.dispositions.get(index).copied().unwrap_or(Disposition::Skip);
-            if let (Disposition::Render { .. } | Disposition::Cached { .. }, Some(t)) = (disposition, &self.layers.targets[index]) {
+            if let (Disposition::Render { rect, .. } | Disposition::Cached { rect, .. }, Some(t)) = (disposition, &self.layers.targets[index]) {
+                let plain_fast = self.springs.is_none()
+                    && self.layer_blend(target) == Blend::SourceOver
+                    && l.blend == Blend::SourceOver
+                    && l.turn.is_none()
+                    && l.fade == [0; 4]
+                    && l.hole[3] <= 0.0
+                    && (t.content_size[0] - rect[2]).abs() <= 0.5
+                    && (t.content_size[1] - rect[3]).abs() <= 0.5
+                    && rect.iter().all(|v| v.fract() == 0.0)
+                    && (l.clip[0] < -1e5 || l.clip.iter().all(|v| v.fract() == 0.0));
                 let pipeline = if self.layer_blend(target) == Blend::PlusLighter {
                     &self.layers.additive.as_ref().expect("prepared dissolve").1
-                } else { &self.layers.pipelines.iter().find(|(f, _)| *f == format).expect("Renderer::add_format first").1 };
+                } else if plain_fast && let Some((_, fp)) = self.fast.iter().find(|(f, _)| *f == format) {
+                    if target.is_none() && t.over_clear { &fp.fast_layer_over_clear } else { &fp.fast_layer }
+                } else {
+                    &self.layers.pipelines.iter().find(|(f, _)| *f == format).expect("Renderer::add_format first").1
+                };
                 pass.set_pipeline(pipeline);
                 if let Some(properties) = &self.springs { pass.set_bind_group(1, &properties.group, &[]); }
                 pass.set_bind_group(0, &t.composite, &[]);
