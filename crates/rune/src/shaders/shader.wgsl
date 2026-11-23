@@ -43,6 +43,8 @@ struct Out {
     @location(6) @interpolate(flat) uv: vec4<f32>,
     @location(7) @interpolate(flat) clip: vec4<f32>,
     @location(8) @interpolate(flat) fade: vec4<u32>,
+    // The middle of a box drawn apart (`split_hole`): the box and its clip cover every pixel of it.
+    @location(9) @interpolate(flat) whole: u32,
 };
 
 // Layer composites use `vs` even with GPU springs: the layer's contents already sampled the
@@ -52,8 +54,54 @@ fn vs(i: In) -> Out {
     return base_vs(i);
 }
 
+// Where a box (kind 0), a picture (kind 7) or a gradient's stop segment (kind 11) and its clip cover every pixel whole, past
+// its corners, its soft edge, a box's border and every edge's fade by a pixel more, on whole pixels;
+// empty (zero size) where that is under 8 pixels either way or the shape can't say (a band, per-side
+// borders, a clip with fade stops). Its coverage there is exactly 1 (clip.wgsl `box_inside`: `-min(a)`
+// past the corners' reach), and so is its clip's (`clip_alpha_stops`). An angled linear segment's quad is
+// narrowed first (the banded variant), and its middle taken within what's left.
+fn split_hole(i: In) -> vec4<f32> {
+    let kind = i.params.y;
+    let image = kind > 6.5 && kind < 7.5;
+    let shape = (kind < 0.5 && i.uv.z >= 0.0)
+        || (kind > 10.5 && kind < 11.5) || image;
+    if (!shape || i.fade.z != 0u) {
+        return vec4<f32>(0.0);
+    }
+    let r = i.radii;
+    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let border = select(0.0, max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), kind < 0.5);
+    // A picture's edge is half a pixel soft (its `params.z` says whether it's premultiplied).
+    let soft = select(max(i.params.z, 0.5), 0.5, image);
+    let e = reach + soft + border + 1.0;
+    let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
+    var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
+    if (i.fade.w != 0u) {
+        let c = unpack_clip_radii(i.fade.w);
+        let corner = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
+        edge = max(edge, vec4<f32>(corner + 1.0));
+    }
+    let lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
+    let hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    if (any(hi - lo < vec2<f32>(8.0))) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(lo, hi);
+}
+
 fn base_vs(i: In) -> Out {
-    let corner = vec2<f32>(f32(i.vi & 1u), f32(i.vi >> 1u));
+    // Vertices 0..4 draw the quad. A box drawn apart (render.rs `SPLIT_VERTICES`) takes vertices 4..34
+    // instead: five quads of six vertices (a strip, each quad's first and last vertex twice, so the
+    // triangles between them have no area), its middle (`split_hole`) and the four bands around it,
+    // which meet on whole pixels; a box with no middle draws whole as the first band and nothing else.
+    var corner = vec2<f32>(f32(i.vi & 1u), f32((i.vi >> 1u) & 1u));
+    var sub = 0u;
+    if (i.vi >= 4u) {
+        let j = i.vi - 4u;
+        sub = j / 6u + 1u;
+        let k = u32(clamp(i32(j % 6u) - 1, 0, 3));
+        corner = vec2<f32>(f32(k & 1u), f32(k >> 1u));
+    }
     let kind = i.params.y;
     var grow = 1.0 + i.params.z * 2.0;
     if (kind > 0.5 && kind < 1.5) {
@@ -65,6 +113,9 @@ fn base_vs(i: In) -> Out {
     } else if (kind > 4.5 && kind < 9.5) {
         grow = 1.0;
     }
+    if (MIDDLE && sub == 0u) {
+        grow = 0.0;
+    }
     var lo = i.rect.xy - vec2<f32>(grow);
     // Effect slots (kind 12) reserve their place in the stream and cover no pixels.
     let size = select(i.rect.zw + vec2<f32>(2.0 * grow), vec2<f32>(0.0), kind > 11.5);
@@ -74,6 +125,26 @@ fn base_vs(i: In) -> Out {
     if (kind < 1.5 && i.uv.z < 0.0) {
         lo = max(lo, i.rect.xy + i.uv.xy);
         hi = max(min(hi, i.rect.xy + vec2<f32>(-i.uv.z, i.uv.w)), lo);
+    }
+    // The banded variant narrows a gradient segment's quad here (render/variant.rs `BAND`), before a split.
+    var whole = 0u;
+    if (sub > 0u) {
+        // The middle within the quad as narrowed, so the five quads partition what it draws.
+        var hole = split_hole(i);
+        hole = vec4<f32>(max(hole.xy, lo), min(hole.zw, hi));
+        if (hole.z > hole.x && hole.w > hole.y) {
+            switch sub {
+                case 1u: { lo = hole.xy; hi = hole.zw; whole = 1u; }
+                case 2u: { hi = vec2<f32>(hi.x, hole.y); }
+                case 3u: { lo = vec2<f32>(lo.x, hole.y); hi = vec2<f32>(hole.x, hole.w); }
+                case 4u: { lo = vec2<f32>(hole.z, hole.y); hi = vec2<f32>(hi.x, hole.w); }
+                default: { lo = vec2<f32>(lo.x, hole.w); }
+            }
+        } else if (sub != 2u) {
+            // No middle: the box draws whole as the first band, and its middle (which the small solid
+            // pipeline draws, render.rs `SPLIT_MIDDLE`) and the other bands draw nothing.
+            hi = lo;
+        }
     }
     let p = select(lo, hi, corner > vec2<f32>(0.5));
     var screen = p;
@@ -105,6 +176,7 @@ fn base_vs(i: In) -> Out {
     o.uv = i.uv;
     o.clip = i.clip;
     o.fade = i.fade;
+    o.whole = whole;
     return o;
 }
 
@@ -250,7 +322,13 @@ fn srgb_encode(x: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v * 12.92, v <= vec3<f32>(0.0031308));
 }
 
+fn srgb_decode(x: vec3<f32>) -> vec3<f32> {
+    return select(pow((x + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
+}
+
 /// One image texel, premultiplied (the atlas holds straight alpha) so filtering doesn't darken edges.
+/// The atlas holds the sRGB-encoded bytes as they came: blending sRGB-encoded, a straight texel is
+/// used as it is, with no decode and encode around it.
 fn image_texel(t: vec2<i32>, premultiplied: bool) -> vec4<f32> {
     let c = textureLoad(images, t, 0);
     if (g.flags.x > 0.5) {
@@ -373,6 +451,15 @@ fn layer_texel(t: vec2<i32>, size: vec2<f32>, clamp_unit: bool) -> vec4<f32> {
 // and a fragment no longer pays for shapes it isn't. -1 is the shader every kind can draw with.
 const PINNED_KIND: f32 = -1.0;
 
+// The pipeline a shape's middle draws with (render/variant.rs `middle_wgsl`) sets this: every fragment it
+// shades is in a middle (`split_hole`), so the compiler drops the coverage and clip a middle skips.
+const MIDDLE: bool = false;
+
+// The fragment is in its shape's middle (`split_hole`): covered whole, its clip too.
+fn in_middle(i: Out) -> bool {
+    return MIDDLE || i.whole != 0u;
+}
+
 fn fragment_kind(i: Out) -> f32 {
     if (PINNED_KIND >= 0.0) { return PINNED_KIND; }
     return i.params.y;
@@ -421,6 +508,14 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     }
     let kind = fragment_kind(i);
     if (kind > 11.5) { discard; }
+    // A box's middle (`split_hole`): its fill, whole, as the rest of this shader works it out there,
+    // rounded as it rounds a flat fill below. A radial segment's middle works out its colour below.
+    if (in_middle(i) && kind < 0.5) {
+        if (projection.z == 0.0 && g.flags.y > 0.5 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0) {
+            return round(clamp(i.fill, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
+        }
+        return i.fill;
+    }
     // Fragment position is the rasterizer's exact pixel centre; interpolated `i.p` drifts by
     // subpixel ULPs on D3D12, turning exact 1.0 edge coverage into 1.0 - eps (which drops to
     // 1 - 1/2048 in Rgba16Float layer targets). Only rotated glyphs need interpolated `i.p`.
@@ -429,10 +524,17 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     let center = i.rect.xy + half;
     var col = vec4<f32>(0.0);
     if (kind < 0.5) {
-        let d = sd_rounded(screen - center, half, i.radii);
         let soft = max(i.params.z, 0.5);
         let bw = i.params.x;
-        if (bw > 0.0) {
+        // Past the soft edge and a border of one width all round, the box and its border cover the
+        // fragment whole and add nothing over the fill (`box_inside`; `border_over`'s ring is then 0
+        // and the fill under it whole), which is most of a panel's pixels.
+        let uniform = bw <= 0.0 || i.uv.z < 0.0 || all(i.uv == vec4<f32>(0.0));
+        let max_bw = select(max(bw, 0.0), max(bw, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), !uniform);
+        if (box_inside(half - abs(screen - center), i.radii, soft + max_bw)) {
+            col = i.fill;
+        } else if (bw > 0.0) {
+            let d = sd_rounded(screen - center, half, i.radii);
             // Per-side widths (top, right, bottom, left) in `uv`, as CSS `border-bottom` and the
             // like; all zero is `bw` all round, and a band window (runtime/bands.rs) has a
             // negative `uv.z`.
@@ -447,6 +549,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             }
             col = border_over(i.fill, i.border, d, inner_d, soft, bw, i.params.w, !sides && any(i.radii != vec4<f32>(0.0)));
         } else {
+            let d = sd_rounded(screen - center, half, i.radii);
             col = i.fill * clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
         }
     } else if (kind < 1.5) {
@@ -481,7 +584,8 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
                 return vec4<f32>(0.0);
             }
             let soft = max(i.params.z, 0.5);
-            let cov = clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
+            // Its middle (`split_hole`) is covered whole.
+            let cov = select(clamp(0.5 - d / (soft * 2.0), 0.0, 1.0), 1.0, in_middle(i));
             let u = select(clamp((t - t0) / (t1 - t0), 0.0, 1.0), select(0.0, 1.0, t >= t0), t1 <= t0 + 1e-6);
             col = mix(i.fill, i.border, u) * cov;
         } else if (kind > 9.5) {
@@ -503,9 +607,16 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let t0 = clamp(lo + vec2<i32>(base), lo, hi);
             let t1 = clamp(lo + vec2<i32>(base) + vec2<i32>(1, 1), lo, hi);
             let premultiplied = i.params.z > 0.5;
-            let c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
+            var c: vec4<f32>;
+            if (all(f == vec2<f32>(0.0))) {
+                // Drawn at its own size on whole pixels: each pixel is one texel, which the four-tap mix
+                // returns exactly with weights of zero, for a quarter of the loads and encodes.
+                c = image_texel(t0, premultiplied);
+            } else {
+                c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
                         mix(image_texel(vec2<i32>(t0.x, t1.y), premultiplied), image_texel(t1, premultiplied), f.x), f.y);
-            col = c * (i.fill.a * clamp(0.5 - d, 0.0, 1.0));
+            }
+            col = c * (i.fill.a * select(clamp(0.5 - d, 0.0, 1.0), 1.0, in_middle(i)));
         }
     } else if (kind > 4.5 && kind < 5.5) {
         col = i.fill * segment(screen, i.radii.xy, i.radii.zw, i.params.x, i.params.z > 0.5);
@@ -568,7 +679,11 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             col = i.fill * pow(cov, i.params.w);
         }
     }
-    let source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
+    // A middle's clip covers it whole (`split_hole`).
+    var source = col;
+    if (!in_middle(i)) {
+        source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
+    }
     // On a direct byte surface cpu_boot::blend converts the source *after* mask gamma,
     // colour, shape coverage and clipping. The mask texel itself isn't the blend source.
     let flat_fill = kind == 0.0 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0;

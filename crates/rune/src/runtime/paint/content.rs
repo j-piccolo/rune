@@ -454,28 +454,37 @@ impl RuntimeCore {
             let base_d_origin = if scale_motion == ScaleMotion::Still && tk == 1.0 { base_rest } else { [0.0, 0.0] };
             let reveal = if spec.cold.advance_in.is_none() { self.motion.reveal_fade(n.id) } else { None };
             let drawn_len = n.elided.map_or(spec.content.len(), |e| e.drawn_len(spec.content.len()));
+            let has_decos = !spec.spans.is_empty()
+                || !spec.cold.pills.is_empty()
+                || !spec.cold.rings.is_empty()
+                || !spec.cold.highlights.is_empty()
+                || !spec.cold.strikes.is_empty()
+                || !link_fx.is_empty();
+            if has_decos {
             self.paint.deco_scratch.clear();
             let mut pill_icons = Vec::new();
             let mut bare_all = Vec::new();
             let pill_bg = spec.cold.pill_colors.map_or(spec.rich_style().link.alpha(0.2), |(bg, _)| bg);
-            for piece in flow.pieces_in(rows.start, rows.end) {
-                let layout = piece.layout;
-                let d_origin = [base_d_origin[0], base_d_origin[1] + piece.y];
-                let (spans_here, pills) = (piece.spans(&spec.spans), piece.pills(&spec.cold.pills));
-                let from = self.paint.deco_scratch.len();
-                crate::text::pill_chips(layout, &pills, spec.style.size, s, d_origin, pill_bg, &mut self.paint.deco_scratch, &mut pill_icons);
-                // Elided text draws its decorations over the drawn string's offsets.
-                let drawn_spans = n.elided.map(|e| e.spans(&spans_here));
-                let spans = drawn_spans.as_deref().unwrap_or(&spans_here);
-                let drawn_rings = n.elided.map(|e| e.rings(&spec.cold.rings));
-                self.text.decorations_with_rings(layout, spans, drawn_rings.as_deref().unwrap_or(&spec.cold.rings), spec.cold.span_radius, s, d_origin, &mut self.paint.deco_scratch);
-                if !piece.is_whole() {
-                    for d in &mut self.paint.deco_scratch[from..] { d.byte = piece.content(d.byte as usize) as u32; }
-                }
-                if !pills.is_empty() {
-                    let mut bare = Vec::new();
-                    crate::text::bare_icons(layout, &pills, s, d_origin, &mut bare);
-                    bare_all.extend(bare.into_iter().map(|(k, at, px)| (pills[k].clone(), at, px)));
+            if !spec.spans.is_empty() || !spec.cold.pills.is_empty() || !spec.cold.rings.is_empty() {
+                for piece in flow.pieces_in(rows.start, rows.end) {
+                    let layout = piece.layout;
+                    let d_origin = [base_d_origin[0], base_d_origin[1] + piece.y];
+                    let (spans_here, pills) = (piece.spans(&spec.spans), piece.pills(&spec.cold.pills));
+                    let from = self.paint.deco_scratch.len();
+                    crate::text::pill_chips(layout, &pills, spec.style.size, s, d_origin, pill_bg, &mut self.paint.deco_scratch, &mut pill_icons);
+                    // Elided text draws its decorations over the drawn string's offsets.
+                    let drawn_spans = n.elided.map(|e| e.spans(&spans_here));
+                    let spans = drawn_spans.as_deref().unwrap_or(&spans_here);
+                    let drawn_rings = n.elided.map(|e| e.rings(&spec.cold.rings));
+                    self.text.decorations_with_rings(layout, spans, drawn_rings.as_deref().unwrap_or(&spec.cold.rings), spec.cold.span_radius, s, d_origin, &mut self.paint.deco_scratch);
+                    if !piece.is_whole() {
+                        for d in &mut self.paint.deco_scratch[from..] { d.byte = piece.content(d.byte as usize) as u32; }
+                    }
+                    if !pills.is_empty() {
+                        let mut bare = Vec::new();
+                        crate::text::bare_icons(layout, &pills, s, d_origin, &mut bare);
+                        bare_all.extend(bare.into_iter().map(|(k, at, px)| (pills[k].clone(), at, px)));
+                    }
                 }
             }
             if !spec.cold.highlights.is_empty() {
@@ -483,20 +492,22 @@ impl RuntimeCore {
                 let marks = drawn.as_deref().unwrap_or(&spec.cold.highlights);
                 self.text.highlight_decorations_flow(flow, marks, drawn_len, s, base_d_origin, rows.clone(), &mut self.paint.deco_scratch);
             }
-            for piece in flow.pieces_in(rows.start, rows.end) {
-                let d_origin = [base_d_origin[0], base_d_origin[1] + piece.y];
-                let strikes = piece.strikes(&spec.cold.strikes);
-                let from = self.paint.deco_scratch.len();
-                if !strikes.is_empty() {
-                    let spans_here = piece.spans(&spec.spans);
-                    let drawn_spans = n.elided.map(|e| e.spans(&spans_here));
-                    let spans = drawn_spans.as_deref().unwrap_or(&spans_here);
-                    let drawn = n.elided.map(|e| e.strikes(&strikes));
-                    self.text.strike_decorations(piece.layout, spans, drawn.as_deref().unwrap_or(&strikes), color, s, d_origin, &mut self.paint.deco_scratch);
-                }
-                link_fx.decos_piece(&piece, drawn_len, s, d_origin, &mut self.paint.deco_scratch);
-                if !piece.is_whole() {
-                    for d in &mut self.paint.deco_scratch[from..] { d.byte = piece.content(d.byte as usize) as u32; }
+            if !spec.cold.strikes.is_empty() || !link_fx.is_empty() {
+                for piece in flow.pieces_in(rows.start, rows.end) {
+                    let d_origin = [base_d_origin[0], base_d_origin[1] + piece.y];
+                    let strikes = piece.strikes(&spec.cold.strikes);
+                    let from = self.paint.deco_scratch.len();
+                    if !strikes.is_empty() {
+                        let spans_here = piece.spans(&spec.spans);
+                        let drawn_spans = n.elided.map(|e| e.spans(&spans_here));
+                        let spans = drawn_spans.as_deref().unwrap_or(&spans_here);
+                        let drawn = n.elided.map(|e| e.strikes(&strikes));
+                        self.text.strike_decorations(piece.layout, spans, drawn.as_deref().unwrap_or(&strikes), color, s, d_origin, &mut self.paint.deco_scratch);
+                    }
+                    link_fx.decos_piece(&piece, drawn_len, s, d_origin, &mut self.paint.deco_scratch);
+                    if !piece.is_whole() {
+                        for d in &mut self.paint.deco_scratch[from..] { d.byte = piece.content(d.byte as usize) as u32; }
+                    }
                 }
             }
             if !spec.cold.rings.is_empty() || spec.cold.highlights.iter().any(|h| h.ring.is_some()) {
@@ -614,6 +625,7 @@ impl RuntimeCore {
                     clip,
                     fade,
                 );
+            }
             }
             if spec.selectable && n.input.is_none() {
                 // A mark keeps the active selection's highlight, whatever the window's focus, and
@@ -733,6 +745,7 @@ impl RuntimeCore {
                 };
                 self.text.set_glide([0.0; 2]);
                 let base = premul(color, o, srgb);
+                let base_exp = self.text.coverage_exponent(base);
                 let lands = self.motion.flights().iter().any(|f| f.lands(&n.path, n.key.as_deref()));
                 for q in if lands { &[][..] } else { &self.paint.glyph_scratch[..] } {
                     let [x0, y0] = if zoom == 1.0 && origin == r_origin { [q.rect[0], q.rect[1]] } else {
@@ -774,7 +787,8 @@ impl RuntimeCore {
                         }
                         f = f.map(|v| v * a);
                     }
-                    self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, f, clip, fade)
+                    let exp = if f == base { base_exp } else { self.text.coverage_exponent(f) };
+                    self.instances.extend(glyph_or_image_exp(q, &self.text, &mut self.images, f, exp, clip, fade)
                         .map(|g| zoom_glyph(g, origin, r_origin, zoom)));
                     *glyph_count += 1;
                     // A colour or outline glyph draws per frame, from another atlas or a record.

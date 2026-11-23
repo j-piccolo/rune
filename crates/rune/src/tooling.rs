@@ -167,6 +167,11 @@ mod eased_input;
 pub(crate) use eased_input::step_resize;
 #[path = "tooling/headless.rs"]
 mod headless;
+#[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+#[path = "tooling/frame_log.rs"]
+mod frame_log;
+#[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+pub use frame_log::FrameLog;
 #[path = "tooling/loop_check.rs"]
 mod loop_check;
 #[path = "tooling/html.rs"]

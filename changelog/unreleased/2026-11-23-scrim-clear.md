@@ -1,0 +1,1 @@
+- A frame whose first instance is a plain rect over the whole window (a dialog's translucent scrim) and that clears to transparent clears to that rect's colour instead and starts after it: over transparent, the rect leaves exactly its own colour in every pixel. A window's worth of fragments less each frame. No pixel changes.

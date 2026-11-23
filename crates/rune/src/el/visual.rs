@@ -64,6 +64,8 @@ pub struct VisualCold {
     pub(crate) effect: Option<crate::el::effect::EffectSlot>,
     /// Backdrop blur standard deviation in points (`El::backdrop_blur`); 0 is off.
     pub(crate) backdrop_blur: f32,
+    /// The compositor may show `pixels` under the window instead (`El::underlay`).
+    pub(crate) underlay: bool,
     /// The hover track's enter and exit curves (default: snappy spring both ways).
     pub hover_motion: Option<Rc<(Anim, Anim)>>,
     /// Hover curves for this element and the hover tracks below it without their own.
@@ -159,6 +161,7 @@ impl Empty for VisualCold {
         pixels_fit: None,
         effect: None,
         backdrop_blur: 0.0,
+        underlay: false,
         hover_motion: None,
         hover_within: None,
         group_opacity: None,

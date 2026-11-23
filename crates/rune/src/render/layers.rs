@@ -371,11 +371,11 @@ fn affine_color(c: [f32; 4], opacity: f32, bg: [f32; 4]) -> [f32; 4] {
 /// directly over the window's opaque clear colour (no overlapping earlier instances, no nested
 /// layers/images/effects) by applying the exact affine colour transform `T(S, α)` to each child.
 /// Eliminates the offscreen texture, second render pass, and full-layer `textureLoad` composite.
-pub(super) fn inline_affine_layers(instances: &[Instance]) -> std::borrow::Cow<'_, [Instance]> {
+pub(super) fn inline_affine_layers(instances: &[Instance], viewport: (u32, u32)) -> std::borrow::Cow<'_, [Instance]> {
     if !instances.iter().any(|i| i.kind() == Some(Kind::Layer)) {
         return std::borrow::Cow::Borrowed(instances);
     }
-    let cleared = super::cleared::Cleared::of(instances);
+    let cleared = super::cleared::Cleared::of(instances, viewport);
     if cleared.len == 0 || cleared.color[3] != 1.0 {
         return std::borrow::Cow::Borrowed(instances);
     }
@@ -1199,10 +1199,25 @@ impl Renderer {
                     && (t.content_size[1] - rect[3]).abs() <= 0.5
                     && rect.iter().all(|v| v.fract() == 0.0)
                     && (l.clip[0] < -1e5 || l.clip.iter().all(|v| v.fract() == 0.0));
+                // Otherwise an upright, unfaded, not additive composite still skips the general composite's work.
+                let plain_layer = self.layer_blend(target) != Blend::PlusLighter
+                    && l.turn.is_none() && !l.free && l.hole[3] <= 0.0 && l.blend != Blend::PlusLighter
+                    && l.cache.is_none()
+                    && l.fade[0] == 0 && l.fade[1] == 0 && l.fade[2] == 0
+                    && (l.fade[3] & 0x8000_0000) == 0;
+                let plain_pipe = plain_layer.then(|| {
+                    self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * super::variant::SOLID_COUNT).and_then(|(_, p)| {
+                        let (window, layer) = p.split_at(super::variant::SOLID_COUNT);
+                        let slice = if target.is_none() && format == self.format { Some(window) } else if target.is_some() && format == FORMAT { Some(layer) } else { None };
+                        slice?.get(super::variant::PLAIN_LAYER_SLOT)?.as_ref()
+                    })
+                }).flatten();
                 let pipeline = if self.layer_blend(target) == Blend::PlusLighter {
                     &self.layers.additive.as_ref().expect("prepared dissolve").1
                 } else if plain_fast && let Some((_, fp)) = self.fast.iter().find(|(f, _)| *f == format) {
                     if target.is_none() && t.over_clear { &fp.fast_layer_over_clear } else { &fp.fast_layer }
+                } else if let Some(p) = plain_pipe {
+                    p
                 } else {
                     &self.layers.pipelines.iter().find(|(f, _)| *f == format).expect("Renderer::add_format first").1
                 };
@@ -1301,20 +1316,40 @@ impl Renderer {
             Warming::Unasked => {
                 if !WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) { return; }
                 let made = Warmed::default();
-                let (to, device, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
+                let (to, made_on, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
+                let composite_wgsl = self.composite_wgsl();
                 let thread = std::thread::Builder::new().name("rune-warm-layers".into()).spawn(move || {
                     // What `build_feature` makes for isolation: the uber pipeline for layer
                     // targets, and the composite for the window's format and theirs.
                     let mut pipelines = Vec::new();
-                    let verdict = breaker::checked(&device, || {
-                        for (format, entry) in [(FORMAT, entry), (format, "vs"), (FORMAT, "vs")] {
-                            pipelines.push((format, entry, Renderer::pipeline(&device, &layout, &shader, format, entry, Blend::SourceOver)));
+                    let composite = composite_wgsl.and_then(|wgsl| {
+                        super::variant::compile(&made_on, &wgsl, |pinned| Renderer::pipeline(&made_on, &layout, pinned, format, "vs", Blend::SourceOver)).ok()
+                    });
+                    let verdict = breaker::checked(&made_on, || {
+                        pipelines.push((FORMAT, entry, Renderer::pipeline(&made_on, &layout, &shader, FORMAT, entry, Blend::SourceOver)));
+                        for format in [format, FORMAT] {
+                            let pipeline = match &composite {
+                                Some((pinned, _)) => Renderer::pipeline(&made_on, &layout, pinned, format, "vs", Blend::SourceOver),
+                                None => Renderer::pipeline(&made_on, &layout, &shader, format, "vs", Blend::SourceOver),
+                            };
+                            pipelines.push((format, "vs", pipeline));
                         }
                     });
                     let taken = matches!(verdict, breaker::Verdict::Now(None));
                     *to.lock().unwrap_or_else(|e| e.into_inner()) = Some((pipelines, taken));
                 });
-                self.layers.warming = if thread.is_ok() { Warming::Making(made) } else { Warming::Done };
+                self.layers.warming = match thread {
+                    // Frame-profile builds wait for them, as for the pinned pipelines, and take them now.
+                    #[cfg(feature = "frame-profile")]
+                    Ok(thread) => {
+                        thread.join().ok();
+                        self.layers.warming = Warming::Making(made);
+                        return self.warm_isolation(device);
+                    }
+                    #[cfg(not(feature = "frame-profile"))]
+                    Ok(_) => Warming::Making(made),
+                    Err(_) => Warming::Done,
+                };
             }
             Warming::Making(made) => {
                 let Some((pipelines, taken)) = made.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };

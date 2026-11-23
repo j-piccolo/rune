@@ -255,13 +255,20 @@ pub(in crate::runtime) fn inside_rounded(rect: [f32; 4], mask: [f32; 4], radii: 
     const AA: f32 = 1.0;
     if rect[2] <= rect[0] || rect[3] <= rect[1] { return true; }
     if rect[0] < mask[0] || rect[1] < mask[1] || rect[2] > mask[2] || rect[3] > mask[3] { return false; }
+    if radii == [0.0; 4] { return true; }
     let corners = [(mask[0], mask[1], 1.0, 1.0), (mask[2], mask[1], -1.0, 1.0), (mask[2], mask[3], -1.0, -1.0), (mask[0], mask[3], 1.0, -1.0)];
+    let pts = [(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])];
     corners.iter().zip(radii).all(|(&(cx, cy, sx, sy), radius)| {
+        if radius == 0.0 { return true; }
         let e = crate::render::corner_extent(radius);
-        [(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])].iter().all(|&(x, y)| {
+        let limit = radius - AA;
+        let limit_sq = limit * limit;
+        pts.iter().all(|&(x, y)| {
             let (dx, dy) = ((x - cx) * sx, (y - cy) * sy);
             if dx >= e || dy >= e { return true; }
-            radius > 0.0 && (radius - dx).hypot(radius - dy) <= radius - AA
+            if limit <= 0.0 { return false; }
+            let (rx, ry) = (radius - dx, radius - dy);
+            rx * rx + ry * ry <= limit_sq
         })
     })
 }
@@ -294,9 +301,14 @@ pub(in crate::runtime) fn zoom_glyph(mut g: Instance, origin: [f32; 2], r_origin
 /// A text glyph's instance: alpha-atlas coverage tinted by `fill`, or a colour glyph's image
 /// at `fill`'s alpha. None when the image atlas can't place it.
 pub(in crate::runtime) fn glyph_or_image(q: &GlyphQuad, text: &TextSystem, images: &mut crate::pixels::ImageAtlas, fill: [f32; 4], clip: [f32; 4], fade: [f32; 4]) -> Option<Instance> {
+    glyph_or_image_exp(q, text, images, fill, text.coverage_exponent(fill), clip, fade)
+}
+
+/// [`glyph_or_image`] with a precomputed `coverage_exponent(fill)` hoisted out of a glyph loop.
+pub(in crate::runtime) fn glyph_or_image_exp(q: &GlyphQuad, text: &TextSystem, images: &mut crate::pixels::ImageAtlas, fill: [f32; 4], exp: f32, clip: [f32; 4], fade: [f32; 4]) -> Option<Instance> {
     if q.color == 0 {
         let mut g = glyph(q, fill, clip, fade);
-        g.params[3] = text.coverage_exponent(fill);
+        g.params[3] = exp;
         return Some(g);
     }
     let image = images.place(text.color_glyph(q.color), [q.rect[2], q.rect[3]])?;

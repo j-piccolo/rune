@@ -60,6 +60,15 @@ impl AnimationStore {
         }
     }
 
+    /// `animate_changed` settling within `eps` (a position threshold, velocity ten times it) instead of the
+    /// prop class's: for an owner that knows how far a value still to move can show.
+    pub(crate) fn animate_changed_eps<T: Animatable>(&mut self, node: NodeId, prop: Prop<T>, target: T, anim: Anim, eps: f32) -> (TrackId, bool) {
+        if let Some(t) = self.index.get(&(node.0, prop.id.0)).copied() {
+            self.t_meta[t as usize].eps = eps;
+        }
+        self.animate_changed(node, prop, target, anim)
+    }
+
     /// Animates with an explicit per-lane starting velocity (gesture handoff).
     pub fn animate_with_velocity<T: Animatable>(
         &mut self,
@@ -96,7 +105,7 @@ impl AnimationStore {
                 let k = decay.k();
                 let l0 = self.t_lane0[t] as usize;
                 let now = self.time_of(t);
-                let eps = self.t_meta[t].class.eps(self.pixel_scale);
+                let eps = self.track_eps(t);
                 for i in 0..n {
                     let l = l0 + i;
                     let (x, v) = (cur[i], vel[i]);
@@ -128,8 +137,14 @@ impl AnimationStore {
         self.id_of(t)
     }
 
+    /// No node has a track for `prop`: a lookup can answer without hashing.
+    fn untracked(&self, prop: PropId) -> bool {
+        self.prop_tracks.get(prop.0 as usize) == Some(&0)
+    }
+
     /// The value presented at the last `tick` (what's on screen).
     pub fn get<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         Some(T::read_lanes(&self.l_value[l0..l0 + T::LANES]))
@@ -137,6 +152,7 @@ impl AnimationStore {
 
     /// The velocity at the last `tick`, in units per second.
     pub fn velocity<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         Some(T::read_lanes(&self.l_vel[l0..l0 + T::LANES]))
@@ -144,6 +160,7 @@ impl AnimationStore {
 
     /// The exact value at the current `now()` (may be between ticks).
     pub fn sample<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let mut out = [0.0; MAX_LANES];
         let l0 = self.t_lane0[t] as usize;
@@ -156,6 +173,7 @@ impl AnimationStore {
 
     /// The exact velocity at the current `now()`.
     pub fn sample_velocity<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let mut out = [0.0; MAX_LANES];
         let l0 = self.t_lane0[t] as usize;
@@ -168,6 +186,7 @@ impl AnimationStore {
 
     /// Where the property is going (the latest target, including delayed ones).
     pub fn target<T: Animatable>(&self, node: NodeId, prop: Prop<T>) -> Option<T> {
+        if self.untracked(prop.id) { return None; }
         let t = *self.index.get(&(node.0, prop.id.0))? as usize;
         let l0 = self.t_lane0[t] as usize;
         let mut out = [0.0; MAX_LANES];
@@ -178,10 +197,12 @@ impl AnimationStore {
     }
 
     pub fn has<T>(&self, node: NodeId, prop: Prop<T>) -> bool {
+        if self.untracked(prop.id) { return false; }
         self.index.contains_key(&(node.0, prop.id.0))
     }
 
     pub fn is_animating<T>(&self, node: NodeId, prop: Prop<T>) -> bool {
+        if self.prop_active.get(prop.id.0 as usize) == Some(&0) { return false; }
         self.index.get(&(node.0, prop.id.0)).is_some_and(|&t| self.t_slot[t as usize] != NONE)
     }
 
@@ -269,7 +290,7 @@ impl AnimationStore {
             let t = self.active[i] as usize;
             let now = self.time_of(t);
             let (l0, n) = (self.t_lane0[t] as usize, self.t_n[t] as usize);
-            let eps = self.t_meta[t].class.eps(self.pixel_scale);
+            let eps = self.track_eps(t);
             let mut hit = false;
             for l in l0..l0 + n {
                 if self.l_curve[l] == Curve::Spring(old) {
