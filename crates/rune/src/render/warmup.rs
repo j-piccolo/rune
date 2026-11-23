@@ -34,6 +34,7 @@ pub(super) struct WarmRenderer {
     pub(super) pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     pub(super) kinds: Vec<Option<Kind>>,
     pub(super) split: Vec<bool>,
+    pub(super) together: Vec<bool>,
     pub(super) big: Vec<bool>,
     #[cfg(feature = "frame-profile")]
     pub(super) pass_mark: Option<(wgpu::QuerySet, u32)>,
@@ -101,6 +102,7 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            together,
             big,
             #[cfg(feature = "frame-profile")]
             pass_mark,
@@ -159,6 +161,7 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            together,
             big,
             #[cfg(feature = "frame-profile")]
             pass_mark,
@@ -247,6 +250,7 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            together,
             big,
             #[cfg(feature = "frame-profile")]
             pass_mark,
@@ -305,6 +309,7 @@ impl Renderer {
             pinned_building,
             kinds,
             split,
+            together,
             big,
             #[cfg(feature = "frame-profile")]
             pass_mark,
