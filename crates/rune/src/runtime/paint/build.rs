@@ -209,7 +209,7 @@ impl RuntimeCore {
                 None => (pinh.pressed, pinh.press_to),
             };
             // Loops and reveals run on the node's clock (`El::time_scale`).
-            let track = self.motion.loop_track(n.id);
+            let track = if n.looping.is_some() { self.motion.loop_track(n.id) } else { None };
             let lnow = if track.is_some() { self.scene.store().node_time(n.id) } else { self.t };
             let loop_value = track.map(|l| l.sample_at(lnow, self.clock, self.reduced_motion));
             if fades(n.looping.as_deref().copied()) && let Some(v) = loop_value {
@@ -248,13 +248,14 @@ impl RuntimeCore {
             // counts as moving until it holds still, then rasterizes crisp at its resting scale.
             let has_live_scale = n.live.iter().any(|b| b.property == crate::live::Property::Scale);
             let tracked_scale = if has_live_scale { static_k * p.transform.scale.x } else { static_k };
-            let scale_settling = if tracked_scale != 1.0 || has_live_scale || self.paint.static_scales.contains_key(&n.id) {
+            let scale_settling = if tracked_scale != 1.0 || has_live_scale || (!self.paint.static_scales.is_empty() && self.paint.static_scales.contains_key(&n.id)) {
                 pose::step_static_scale(&mut self.paint.static_scales, &mut self.paint.scale_frame, n.id, tracked_scale, self.t, self.settled, has_live_scale)
             } else { false };
             let store = self.scene.store();
             // A presence that only fades or slides scales nothing: text under it draws as it
             // rests, not from its outlines.
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || (store.is_animating(n.id, prop::PRESENCE) && self.scene.presence_scales(n.id))
+            let scale_animating = (p.flags & rune_motion::flags::ANIMATED != 0
+                && (store.is_animating(n.id, prop::SCALE) || (store.is_animating(n.id, prop::PRESENCE) && self.scene.presence_scales(n.id))))
                 || (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
                 || (n.scale_track && store.is_animating(n.id, P_SCALE))
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
@@ -573,11 +574,15 @@ impl RuntimeCore {
             } else {
                 None
             };
-            let packed_fade = crate::render::pack_fade(fade, fade_origin, clip);
-            for instance in &mut self.instances[first_instance..] {
-                instance.fade = packed_fade;
+            if first_instance < self.instances.len() {
+                let packed_fade = crate::render::pack_fade(fade, fade_origin, clip);
+                for instance in &mut self.instances[first_instance..] {
+                    instance.fade = packed_fade;
+                }
+                if self.tree.nodes[i].text.is_some() {
+                    self.clip_text_instances(i, first_instance, (r, r_exact), sc, clip, fade, fade_origin);
+                }
             }
-            self.clip_text_instances(i, first_instance, (r, r_exact), sc, clip, fade, fade_origin);
             let n = &self.tree.nodes[i];
             if let Some((_, radii)) = rounded {
                 for instance in &mut self.instances[primitive_start..] {
