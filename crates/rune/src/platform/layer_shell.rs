@@ -20,6 +20,13 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
+use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
+use wayland_client::protocol::wl_subsurface::WlSubsurface;
+use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_client::protocol::{wl_output::{self, WlOutput}, wl_seat::{self, WlSeat}, wl_pointer::{self, WlPointer}, wl_keyboard::{self, WlKeyboard}, wl_touch::{self, WlTouch}};
 use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
@@ -471,6 +478,65 @@ impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
 impl Dispatch<ExtBackgroundEffectSurfaceV1, ()> for State {
     fn event(_: &mut Self, _: &ExtBackgroundEffectSurfaceV1, _: <ExtBackgroundEffectSurfaceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
+impl Dispatch<WlSubcompositor, ()> for State {
+    fn event(_: &mut Self, _: &WlSubcompositor, _: <WlSubcompositor as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlSubsurface, ()> for State {
+    fn event(_: &mut Self, _: &WlSubsurface, _: <WlSubsurface as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlShm, ()> for State {
+    fn event(_: &mut Self, _: &WlShm, _: <WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlShmPool, ()> for State {
+    fn event(_: &mut Self, _: &WlShmPool, _: <WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WlBuffer, ()> for State {
+    fn event(_: &mut Self, _: &WlBuffer, _: <WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WpViewporter, ()> for State {
+    fn event(_: &mut Self, _: &WpViewporter, _: <WpViewporter as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<WpViewport, ()> for State {
+    fn event(_: &mut Self, _: &WpViewport, _: <WpViewport as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+/// A picture under a surface (`LayerSurface::set_underlay`): a subsurface below it.
+struct Underlay {
+    surface: WlSurface,
+    sub: WlSubsurface,
+    viewport: Option<WpViewport>,
+    buffer: Option<WlBuffer>,
+    /// The picture its buffer holds (`Pixels::signature`) and its size.
+    holds: Option<((u64, u64), (u32, u32))>,
+    /// A picture it can't hold (a texel not opaque, or no bytes kept), drawn by the window instead.
+    refused: Option<((u64, u64), (u32, u32))>,
+    /// Its buffer is attached.
+    shown: bool,
+}
+
+/// `rgba` (straight alpha) as an XRGB8888 buffer of `size` in shared memory; none if a texel isn't opaque.
+#[allow(unsafe_code)]
+fn shm_picture(shm: &WlShm, qh: &QueueHandle<State>, rgba: &[u8], size: (u32, u32)) -> Option<WlBuffer> {
+    use std::io::Write;
+    use std::os::fd::{AsFd, FromRawFd};
+    let len = size.0 as usize * size.1 as usize * 4;
+    if len == 0 || rgba.len() != len { return None; }
+    let mut bgrx = vec![0u8; len];
+    for (out, p) in bgrx.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        if p[3] != 0xff { return None; }
+        out.copy_from_slice(&[p[2], p[1], p[0], 0xff]);
+    }
+    // SAFETY: a new descriptor, owned by the file from here on.
+    let fd = unsafe { libc::memfd_create(c"rune-underlay".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 { return None; }
+    // SAFETY: `fd` is open and owned by nothing else.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(&bgrx).ok()?;
+    let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
+    let buffer = pool.create_buffer(0, size.0 as i32, size.1 as i32, size.0 as i32 * 4, wl_shm::Format::Xrgb8888, qh, ());
+    pool.destroy();
+    Some(buffer)
+}
 
 /// The cursor-shape-v1 shape for `c`, as `os_cursor` maps winit's. An image is the arrow.
 fn shape(c: crate::el::Cursor) -> Shape {
@@ -654,6 +720,9 @@ pub(crate) struct LayerSurface {
     /// region last sent (none: no blur).
     blur: Option<ExtBackgroundEffectSurfaceV1>,
     blur_sent: Option<Vec<[i32; 4]>>,
+    /// What an underlay is made with (`set_underlay`), where the compositor has it, and the one made.
+    sub: Option<(WlSubcompositor, WlShm, Option<WpViewporter>)>,
+    underlay: Option<Underlay>,
     display: NonNull<std::ffi::c_void>,
     /// Why the surface closed when a fatal display error ended it; `None` for compositor `closed`.
     close_reason: Option<String>,
@@ -822,6 +891,9 @@ impl LayerSurface {
         let blur = globals.bind::<ExtBackgroundEffectManagerV1, _, _>(&qh, 1..=1, ()).ok()
             .map(|manager| manager.get_background_effect(&surface, &qh, ()));
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
+        let sub = globals.bind::<WlSubcompositor, _, _>(&qh, 1..=1, ()).ok()
+            .zip(globals.bind::<WlShm, _, _>(&qh, 1..=1, ()).ok())
+            .map(|(subcompositor, shm)| (subcompositor, shm, globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok()));
         let text_input_manager = want_keys
             .then(|| globals.bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ()).ok())
             .flatten();
@@ -838,7 +910,7 @@ impl LayerSurface {
             text_input,
             ..State::default()
         };
-        let mut this = LayerSurface { namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, shell, output, seat, options: options.clone(), queue, state, role, surface, blur, blur_sent: None, display: display.display, close_reason: None };
+        let mut this = LayerSurface { namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, shell, output, seat, options: options.clone(), queue, state, role, surface, blur, blur_sent: None, sub, underlay: None, display: display.display, close_reason: None };
         this.place(at);
         // A layer surface's first commit asks for its configure. A lock surface is configured
         // unasked, and a commit before it acks that is a protocol error that ends the client.
@@ -973,6 +1045,60 @@ impl LayerSurface {
             None => effect.set_blur_region(None),
         }
         self.blur_sent = next;
+    }
+
+    /// Shows `pixels` (`size` texels, one a device pixel, opaque) under the surface, `points` big,
+    /// with the next commit, as a subsurface below it; `None` takes it down. Whether it shows: not
+    /// where the compositor has no subsurfaces or shared memory, or the image keeps no bytes.
+    pub fn set_underlay(&mut self, pixels: Option<&crate::pixels::Pixels>, size: (u32, u32), points: (f32, f32)) -> bool {
+        let Some(pixels) = pixels else {
+            if let Some(u) = &mut self.underlay && u.shown {
+                u.surface.attach(None, 0, 0);
+                u.surface.commit();
+                u.shown = false;
+            }
+            return false;
+        };
+        let Some((subcompositor, shm, viewporter)) = &self.sub else { return false };
+        let qh = self.queue.handle();
+        let parent = &self.surface;
+        let compositor = &self.compositor;
+        let u = self.underlay.get_or_insert_with(|| {
+            let surface = compositor.create_surface(&qh, ());
+            let sub = subcompositor.get_subsurface(&surface, parent, &qh, ());
+            sub.place_below(parent);
+            sub.set_position(0, 0);
+            // Input goes to the window over it.
+            let region = compositor.create_region(&qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+            let viewport = viewporter.as_ref().map(|v| v.get_viewport(&surface, &qh, ()));
+            Underlay { surface, sub, viewport, buffer: None, holds: None, refused: None, shown: false }
+        });
+        let holds = (pixels.signature(), size);
+        if u.refused == Some(holds) { return false; }
+        if u.holds != Some(holds) {
+            let Some(buffer) = shm_picture(shm, &qh, &pixels.rgba(), size) else {
+                u.refused = Some(holds);
+                return false;
+            };
+            u.surface.attach(Some(&buffer), 0, 0);
+            u.surface.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
+            if let Some(old) = u.buffer.replace(buffer) { old.destroy(); }
+            u.holds = Some(holds);
+        } else if !u.shown {
+            u.surface.attach(u.buffer.as_ref(), 0, 0);
+            u.surface.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
+        } else {
+            return true;
+        }
+        match &u.viewport {
+            Some(viewport) => viewport.set_destination(points.0.round().max(1.0) as i32, points.1.round().max(1.0) as i32),
+            None => u.surface.set_buffer_scale((size.0 as f32 / points.0.max(1.0)).round().max(1.0) as i32),
+        }
+        u.surface.commit();
+        u.shown = true;
+        true
     }
 
     pub fn set_input(&mut self, input: OverlayInput) {
@@ -1264,6 +1390,17 @@ impl Drop for LayerSurface {
             if output.version() >= 3 { output.release(); } else { backend.destroy_object(&output.id()).ok(); }
         }
         if let Some(blur) = self.blur.take() { blur.destroy(); }
+        if let Some(u) = self.underlay.take() {
+            if let Some(viewport) = u.viewport { viewport.destroy(); }
+            u.sub.destroy();
+            u.surface.destroy();
+            if let Some(buffer) = u.buffer { buffer.destroy(); }
+        }
+        if let Some((subcompositor, shm, viewporter)) = self.sub.take() {
+            subcompositor.destroy();
+            if shm.version() >= 2 { shm.release(); }
+            if let Some(viewporter) = viewporter { viewporter.destroy(); }
+        }
         match &self.role {
             Role::Layer(layer) => layer.destroy(),
             Role::Lock(lock) => lock.destroy(),
