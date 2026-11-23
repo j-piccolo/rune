@@ -203,6 +203,8 @@ impl AnimationStore {
         if self.t_slot[t] == NONE {
             self.t_slot[t] = self.active.len() as u32;
             self.active.push(t as u32);
+            let p = self.t_meta[t].prop.0 as usize;
+            if p < 128 { self.prop_active[p] += 1; }
         }
     }
 
@@ -213,6 +215,8 @@ impl AnimationStore {
             self.t_slot[moved] = slot as u32;
         }
         self.t_slot[t] = NONE;
+        let p = self.t_meta[t].prop.0 as usize;
+        if p < 128 { self.prop_active[p] -= 1; }
     }
 
     pub(super) fn push_pending(&mut self, l: usize, mut ev: Pending) {
@@ -348,7 +352,9 @@ impl AnimationStore {
             self.deactivate(t, slot);
         }
         let m = self.t_meta[t];
-        self.index.remove(&(m.node.0, m.prop.0));
+        if self.index.remove(&(m.node.0, m.prop.0)).is_some() && (m.prop.0 as usize) < 128 {
+            self.prop_tracks[m.prop.0 as usize] -= 1;
+        }
         self.lane_free[n].push(l0 as u32);
         // Removal cancels the animation: whoever waits on its completion hears so.
         self.take_token(t, false);
