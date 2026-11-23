@@ -43,6 +43,8 @@ struct Out {
     @location(6) @interpolate(flat) uv: vec4<f32>,
     @location(7) @interpolate(flat) clip: vec4<f32>,
     @location(8) @interpolate(flat) fade: vec4<u32>,
+    // The middle of a box drawn apart (`split_hole`): the box and its clip cover every pixel of it.
+    @location(9) @interpolate(flat) whole: u32,
 };
 
 // Layer composites use `vs` even with GPU springs: the layer's contents already sampled the
@@ -52,8 +54,51 @@ fn vs(i: In) -> Out {
     return base_vs(i);
 }
 
+// Where a box (kind 0) or a radial gradient's stop segment (kind 11 with a centre, `uv.z > 0`) and its
+// clip cover every pixel whole, past its corners, its soft edge, a box's border and every edge's fade by a
+// pixel more, on whole pixels; empty (zero size) where that is under 32 pixels either way or the shape
+// can't say (a band, per-side borders, a clip with fade stops). Its coverage there is exactly 1
+// (clip.wgsl `box_inside`: `-min(a)` past the corners' reach), and so is its clip's (`clip_alpha_stops`).
+// An angled linear segment never splits: the banded variant narrows its quad by the quad's own extent.
+fn split_hole(i: In) -> vec4<f32> {
+    let kind = i.params.y;
+    let shape = (kind < 0.5 && i.uv.z >= 0.0 && (i.params.x <= 0.0 || all(i.uv == vec4<f32>(0.0))))
+        || (kind > 10.5 && kind < 11.5 && i.uv.z > 0.0);
+    if (!shape || i.fade.z != 0u) {
+        return vec4<f32>(0.0);
+    }
+    let r = i.radii;
+    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let border = select(0.0, max(i.params.x, 0.0), kind < 0.5);
+    let e = reach + max(i.params.z, 0.5) + border + 1.0;
+    let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
+    var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
+    if (i.fade.w != 0u) {
+        let c = unpack_clip_radii(i.fade.w);
+        let corner = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
+        edge = max(edge, vec4<f32>(corner + 1.0));
+    }
+    let lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
+    let hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    if (any(hi - lo < vec2<f32>(32.0))) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(lo, hi);
+}
+
 fn base_vs(i: In) -> Out {
-    let corner = vec2<f32>(f32(i.vi & 1u), f32(i.vi >> 1u));
+    // Vertices 0..4 draw the quad. A box drawn apart (render.rs `SPLIT_VERTICES`) takes vertices 4..34
+    // instead: five quads of six vertices (a strip, each quad's first and last vertex twice, so the
+    // triangles between them have no area), its middle (`split_hole`) and the four bands around it,
+    // which meet on whole pixels; a box with no middle draws whole as the first band and nothing else.
+    var corner = vec2<f32>(f32(i.vi & 1u), f32((i.vi >> 1u) & 1u));
+    var sub = 0u;
+    if (i.vi >= 4u) {
+        let j = i.vi - 4u;
+        sub = j / 6u + 1u;
+        let k = u32(clamp(i32(j % 6u) - 1, 0, 3));
+        corner = vec2<f32>(f32(k & 1u), f32(k >> 1u));
+    }
     let kind = i.params.y;
     var grow = 1.0 + i.params.z * 2.0;
     if (kind > 0.5 && kind < 1.5) {
@@ -74,6 +119,23 @@ fn base_vs(i: In) -> Out {
     if (kind < 1.5 && i.uv.z < 0.0) {
         lo = max(lo, i.rect.xy + i.uv.xy);
         hi = max(min(hi, i.rect.xy + vec2<f32>(-i.uv.z, i.uv.w)), lo);
+    }
+    var whole = 0u;
+    if (sub > 0u) {
+        let hole = split_hole(i);
+        if (hole.z > hole.x) {
+            switch sub {
+                case 1u: { lo = hole.xy; hi = hole.zw; whole = 1u; }
+                case 2u: { hi = vec2<f32>(hi.x, hole.y); }
+                case 3u: { lo = vec2<f32>(lo.x, hole.y); hi = vec2<f32>(hole.x, hole.w); }
+                case 4u: { lo = vec2<f32>(hole.z, hole.y); hi = vec2<f32>(hi.x, hole.w); }
+                default: { lo = vec2<f32>(lo.x, hole.w); }
+            }
+        } else if (sub != 2u) {
+            // No middle: the box draws whole as the first band, and its middle (which the small solid
+            // pipeline draws, render.rs `SPLIT_MIDDLE`) and the other bands draw nothing.
+            hi = lo;
+        }
     }
     let p = select(lo, hi, corner > vec2<f32>(0.5));
     var screen = p;
@@ -105,6 +167,7 @@ fn base_vs(i: In) -> Out {
     o.uv = i.uv;
     o.clip = i.clip;
     o.fade = i.fade;
+    o.whole = whole;
     return o;
 }
 
@@ -417,6 +480,14 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     }
     let kind = fragment_kind(i);
     if (kind > 11.5) { discard; }
+    // A box's middle (`split_hole`): its fill, whole, as the rest of this shader works it out there,
+    // rounded as it rounds a flat fill below. A radial segment's middle works out its colour below.
+    if (i.whole != 0u && kind < 0.5) {
+        if (projection.z == 0.0 && g.flags.y > 0.5 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0) {
+            return round(clamp(i.fill, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
+        }
+        return i.fill;
+    }
     // Fragment position is the rasterizer's exact pixel centre; interpolated `i.p` drifts by
     // subpixel ULPs on D3D12, turning exact 1.0 edge coverage into 1.0 - eps (which drops to
     // 1 - 1/2048 in Rgba16Float layer targets). Only rotated glyphs need interpolated `i.p`.
@@ -425,10 +496,16 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     let center = i.rect.xy + half;
     var col = vec4<f32>(0.0);
     if (kind < 0.5) {
-        let d = sd_rounded(screen - center, half, i.radii);
         let soft = max(i.params.z, 0.5);
         let bw = i.params.x;
-        if (bw > 0.0) {
+        // Past the soft edge and a border of one width all round, the box and its border cover the
+        // fragment whole and add nothing over the fill (`box_inside`; `border_over`'s ring is then 0
+        // and the fill under it whole), which is most of a panel's pixels.
+        let uniform = bw <= 0.0 || i.uv.z < 0.0 || all(i.uv == vec4<f32>(0.0));
+        if (uniform && box_inside(half - abs(screen - center), i.radii, soft + max(bw, 0.0))) {
+            col = i.fill;
+        } else if (bw > 0.0) {
+            let d = sd_rounded(screen - center, half, i.radii);
             // Per-side widths (top, right, bottom, left) in `uv`, as CSS `border-bottom` and the
             // like; all zero is `bw` all round, and a band window (runtime/bands.rs) has a
             // negative `uv.z`.
@@ -443,6 +520,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             }
             col = border_over(i.fill, i.border, d, inner_d, soft, bw, i.params.w, !sides && any(i.radii != vec4<f32>(0.0)));
         } else {
+            let d = sd_rounded(screen - center, half, i.radii);
             col = i.fill * clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
         }
     } else if (kind < 1.5) {
@@ -462,7 +540,8 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             // `fill` at t0 (`params.x`) to `border` at t1 (`params.w`); `+ 2.0` marks an open
             // interior stop boundary so adjacent segments partition the quad without overlap.
             let soft = max(i.params.z, 0.5);
-            let cov = clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
+            // Its middle (`split_hole`) is covered whole.
+            let cov = select(clamp(0.5 - d / (soft * 2.0), 0.0, 1.0), 1.0, i.whole != 0u);
             let t0_raw = i.params.x;
             let t1_raw = i.params.w;
             let lower_open = t0_raw >= 1.5;
@@ -561,7 +640,11 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             col = i.fill * pow(cov, i.params.w);
         }
     }
-    let source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
+    // A middle's clip covers it whole (`split_hole`).
+    var source = col;
+    if (i.whole == 0u) {
+        source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
+    }
     // On a direct byte surface cpu_boot::blend converts the source *after* mask gamma,
     // colour, shape coverage and clipping. The mask texel itself isn't the blend source.
     let flat_fill = kind == 0.0 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0;

@@ -370,7 +370,8 @@ impl RuntimeCore {
             let ow = pixel_snap::line_width(ol.width * s) * sc;
             let g = pixel_snap::line_width(ol.offset * s) * sc + ow;
             if c.a > 0.0 && ol.width > 0.0 {
-                self.instances.push(Instance {
+                // Nothing draws inside an outline's ring: a panel's draws as bands around its middle.
+                bands::push_ring(&mut self.instances, Instance {
                     rect: [r[0] - g, r[1] - g, w + 2.0 * g, h + 2.0 * g],
                     radii: radii.map(|v| if v != 0.0 { v + g.copysign(v) } else { 0.0 }),
                     fill: [0.0; 4],

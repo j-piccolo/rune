@@ -297,6 +297,13 @@ pub struct Renderer {
     pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     /// Each instance's kind (`params[1]`), as batched: where a run of one kind starts and ends.
     kinds: Vec<Option<Kind>>,
+    /// Each instance, as batched: whether it draws apart (`SPLIT_VERTICES`).
+    split: Vec<bool>,
+    /// The pipeline a box's middle draws with where the frame's own pipeline would draw it (`variant::solid_wgsl`),
+    /// for the format it was made for (`None`: it can't be made for that format).
+    solid: Option<(wgpu::TextureFormat, Option<wgpu::RenderPipeline>)>,
+    /// The solid pipeline being made on its thread (`variant::start_solid`), for this format.
+    solid_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Option<wgpu::RenderPipeline>>)>,
     lcd_frame: bool,
     /// The window's wake, for work a frame starts on another thread (set_frame_wake).
     frame_wake: Option<std::sync::Arc<crate::live::Wake>>,
@@ -524,6 +531,8 @@ impl Renderer {
         #[cfg(feature = "frame-profile")]
         let pinned = pinned.filter(|_| pinned_forced() != Some(false));
         let mut bound = frame_pipeline;
+        // A box's middle draws with the small solid pipeline where the frame's own pipeline would draw it.
+        let solid = self.solid.as_ref().filter(|(f, _)| std::ptr::eq(frame_pipeline, &self.pipeline) && target.is_none() && format == self.format && *f == format).and_then(|(_, p)| p.as_ref());
         if let Some(properties) = &self.springs { pass.set_bind_group(1, &properties.group, &[]); }
         pass.set_vertex_buffer(0, self.instances.slice(..));
         let start = self.image_batches.partition_point(|(batch, _)| batch.end <= range.start);
@@ -557,7 +566,7 @@ impl Renderer {
             PINNED_DRAWN[usize::from(split.is_some())].fetch_add(u64::from(span.end - span.start), std::sync::atomic::Ordering::Relaxed);
             let Some(pinned) = split else {
                 if !std::ptr::eq(bound, frame_pipeline) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
-                pass.draw(0..4, span);
+                self.draw_quads(pass, span, bound, solid);
                 continue;
             };
             for run in kind_runs(&self.kinds, span) {
@@ -567,8 +576,36 @@ impl Renderer {
                     .and_then(|at| pinned.get(at)?.as_ref())
                     .unwrap_or(&self.pipeline);
                 if !std::ptr::eq(pipeline, bound) { pass.set_pipeline(pipeline); bound = pipeline; }
-                pass.draw(0..4, run);
+                self.draw_quads(pass, run, bound, solid);
             }
+        }
+    }
+
+    /// Draws `range`'s quads with `bound`, a box worth drawing apart (`split`) with `SPLIT_VERTICES`: with
+    /// `solid`, a box's middle with that and its bands after, each box in turn so paint order holds.
+    fn draw_quads(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>, bound: &wgpu::RenderPipeline, solid: Option<&wgpu::RenderPipeline>) {
+        let mut at = range.start;
+        while at < range.end {
+            let apart = self.split.get(at as usize).copied().unwrap_or(false);
+            let mut end = at + 1;
+            while end < range.end && self.split.get(end as usize).copied().unwrap_or(false) == apart { end += 1; }
+            match (apart, solid) {
+                (false, _) => pass.draw(0..4, at..end),
+                (true, None) => pass.draw(SPLIT_VERTICES, at..end),
+                (true, Some(solid)) => {
+                    for i in at..end {
+                        if self.kinds.get(i as usize).copied().flatten() != Some(Kind::Rect) {
+                            pass.draw(SPLIT_VERTICES, i..i + 1);
+                            continue;
+                        }
+                        pass.set_pipeline(solid);
+                        pass.draw(SPLIT_MIDDLE, i..i + 1);
+                        pass.set_pipeline(bound);
+                        pass.draw(SPLIT_BANDS, i..i + 1);
+                    }
+                }
+            }
+            at = end;
         }
     }
 
@@ -676,6 +713,30 @@ pub(crate) fn report_pinned() {
     if std::env::var_os("RUNE_PINNED").is_none() || frame % 60 != 0 { return; }
     let [whole, split] = [0, 1].map(|i| PINNED_DRAWN[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     eprintln!("rune-pinned: {split} instances split into runs, {whole} drawn unsplit (frame {frame})");
+}
+
+/// The vertices a box drawn apart takes (shader.wgsl `base_vs`): its middle, where it and its clip cover every
+/// pixel whole and the fragment shader returns its fill, and four bands around it. A big panel's middle is most of
+/// its pixels, and working out its rounded corners, soft edge and clip there costs a small or software GPU several
+/// times what the fill does.
+const SPLIT_VERTICES: std::ops::Range<u32> = 4..34;
+/// Its middle's quad, and the four bands around it.
+const SPLIT_MIDDLE: std::ops::Range<u32> = 4..10;
+const SPLIT_BANDS: std::ops::Range<u32> = 10..34;
+
+/// Below this many device pixels either way a box draws whole: its middle (`split_hole`, 32 pixels at least past
+/// its corners and edges) would be small or empty, and the five quads cost more than they save.
+const SPLIT_MIN: f32 = 96.0;
+
+/// Whether `instance` is a box worth drawing apart: one whose middle the vertex shader can find (`split_hole`).
+fn splits(instance: &Instance) -> bool {
+    let shape = match instance.kind() {
+        Some(Kind::Rect) => instance.uv == [0.0; 4],
+        // An angled linear segment (no centre) is banded in the vertex stage instead (`variant::BAND`).
+        Some(Kind::Radial) => instance.uv[2] > 0.0,
+        _ => false,
+    };
+    shape && instance.fade[2] == 0 && instance.rect[2] >= SPLIT_MIN && instance.rect[3] >= SPLIT_MIN
 }
 
 /// Most runs a span is split into (`few_runs`), and fewest instances a run has on average.
