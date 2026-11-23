@@ -16,11 +16,28 @@ pub(in crate::runtime) fn push_shadow(out: &mut Vec<Instance>, inst: Instance, c
     push(out, inst, [x + e, y + e, x + caster[2] - e, y + caster[3] - e], inst.params[2] * 3.0 + 1.0);
 }
 
-/// Pushes the border-only `inst` (its fill clear): nothing draws past its ring.
+/// Pushes the border-only `inst` (its fill clear): nothing draws past its ring. The ring is `t` deep along its
+/// edges (its width, its soft edge and a pixel more: past that its coverage and its inner edge's are both whole, and
+/// it draws nothing) and `e` deep only where its corners bend in, so a big one draws as its four corners and four
+/// thin edges: a panel's one-pixel rim shades a strip three pixels wide, not one as deep as its corners.
 pub(in crate::runtime) fn push_ring(out: &mut Vec<Instance>, inst: Instance) {
-    let e = inst.radii.map(corner_extent).into_iter().fold(0.0, f32::max) + inst.params[0] + inst.params[2].max(0.5) + 1.0;
+    let t = inst.params[0] + inst.params[2].max(0.5) + 1.0;
+    let e = inst.radii.map(corner_extent).into_iter().fold(0.0, f32::max) + t;
     let [_, _, w, h] = inst.rect;
-    push(out, inst, [e, e, w - e, h - e], 1.0 + inst.params[2] * 2.0);
+    let grow = 1.0 + inst.params[2] * 2.0;
+    let [qx0, qy0, qx1, qy1] = [-grow, -grow, w + grow, h + grow];
+    // As `push` asks of its hole, and its edges thin enough to be worth eight quads.
+    if w - 2.0 * e < MIN_HOLE || h - 2.0 * e < MIN_HOLE || e <= t || inst.uv != [0.0; 4] {
+        push(out, inst, [e, e, w - e, h - e], grow);
+        return;
+    }
+    for [x0, y0, x1, y1] in [
+        [qx0, qy0, e, e], [e, qy0, w - e, t], [w - e, qy0, qx1, e],
+        [qx0, e, t, h - e], [w - t, e, qx1, h - e],
+        [qx0, h - e, e, qy1], [e, h - t, w - e, qy1], [w - e, h - e, qx1, qy1],
+    ] {
+        out.push(Instance { uv: [x0, y0, -x1, y1], ..inst });
+    }
 }
 
 /// `inst` whole, or as bands around `hole` (x0 y0 x1 y1 relative to its rect) when that's big

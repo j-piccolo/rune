@@ -347,7 +347,9 @@ impl RuntimeCore {
                 let under = border_paint::fill_under(Instance { fill: ov, ..ring }, false);
                 if under.rect[2] > 0.0 && under.rect[3] > 0.0 { self.instances.push(under); }
             } else if has_area && !apart && (ov[3] > 0.0005 || border_a > 0.0005) {
-                self.instances.push(Instance { fill: ov, ..ring });
+                // A clear overlay leaves nothing inside the ring: it draws as bands, as a border alone does.
+                let ring = Instance { fill: ov, ..ring };
+                if ov == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 && sides.is_none() { bands::push_ring(&mut self.instances, ring); } else { self.instances.push(ring); }
             }
         } else if apart {
             if fill[3] > 0.0005 {
