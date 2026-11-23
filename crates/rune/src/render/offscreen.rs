@@ -10,6 +10,9 @@ pub struct Offscreen {
 }
 
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// What a window's surface takes on Linux, where Vulkan and Mesa offer BGRA first: a frame budget's
+/// offscreen frames draw into it, as the window would (`remove_srgb_suffix` with sRGB blending).
+pub const WINDOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 impl Offscreen {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Offscreen {
