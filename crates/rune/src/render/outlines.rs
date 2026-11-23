@@ -34,7 +34,6 @@ impl Renderer {
         let variant::Uber::Windfoil { outlines, .. } = &self.uber else { return };
         if let Some((y, rows)) = store.take_dirty() {
             staging.write_texture_rows(outlines, y, rows);
-            self.layers.texels += 1;
         }
     }
 
