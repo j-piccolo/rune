@@ -260,6 +260,27 @@ impl Scene {
         self.apply(i, acts);
     }
 
+    /// How close a transition's presence settles to its end: within what moves its node less than an 8-bit
+    /// of an 8-bit level of fade and 1/256 of a device pixel of travel, which nobody can see. Presence's
+    /// class threshold (1e-5) holds for any travel; a fade from a third and a slide of a few dozen points ends
+    /// many frames before it, frames that redraw a fading page's layer for nothing shown. Travel by a fraction of
+    /// the node, scale, blur, reveal and drawing keep the class's (0: none chosen).
+    fn presence_eps(&self, i: usize) -> f32 {
+        let t = &self.nodes[i].transition;
+        let px = self.store.pixel_scale();
+        let mut eps: f32 = 1e-3;
+        for e in [&t.insertion, &t.removal] {
+            if e.offset_fraction != crate::value::Vec2::ZERO || e.reveal.is_some() || e.scale != 1.0 || e.blur != 0.0 || e.draw != 1.0 {
+                return 0.0;
+            }
+            let fade = (1.0 - e.opacity).abs();
+            if fade > 0.0 { eps = eps.min(1.0 / (1024.0 * fade)); }
+            let travel = e.offset.x.abs().max(e.offset.y.abs());
+            if travel > 0.0 { eps = eps.min(1.0 / (256.0 * px * travel)); }
+        }
+        eps.max(1e-5)
+    }
+
     fn presence_now(&self, i: usize) -> f32 {
         self.nodes[i].tracks[prop::PRESENCE.id.0 as usize].and_then(|t| self.sample(t)).map_or(1.0, |(x, _)| x[0])
     }
@@ -276,7 +297,12 @@ impl Scene {
                     }
                 }
                 Act::Ensure => self.ensure_prop(i, prop::PRESENCE),
-                Act::Run { target, anim } => self.track_animate(i, prop::PRESENCE, target, anim),
+                Act::Run { target, anim } => {
+                    let eps = self.presence_eps(i);
+                    let (id, changed) = self.store.animate_changed_eps(self.nodes[i].id, prop::PRESENCE, target, anim, eps);
+                    if let Some(slot) = self.nodes[i].tracks.get_mut(prop::PRESENCE.id.0 as usize) { *slot = Some(id); }
+                    self.nodes[i].dirty |= changed;
+                }
                 Act::Dirty => self.nodes[i].dirty = true,
                 Act::Anchor(a) => self.nodes[i].anchor = a,
                 Act::Reveal(r) => self.nodes[i].reveal = r,
