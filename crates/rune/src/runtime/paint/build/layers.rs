@@ -199,6 +199,32 @@ impl paint_state::PaintState {
 }
 
 impl RuntimeCore {
+    /// Whether fading group `i` paints a single thing, a label, an icon or a plain fill, with nothing over
+    /// it: its opacity then goes onto that paint, as on a lone node, not into a layer. A big
+    /// subtree counts as more.
+    pub(super) fn paints_once(&self, i: usize) -> bool {
+        let mut painted = false;
+        for j in i..self.tree.nodes.len() {
+            if j > i && !self.tree.is_descendant(j, i) { break; }
+            if j - i >= 32 { return false; }
+            let n = &self.tree.nodes[j];
+            let v = &n.vis;
+            if n.vis_flags.raise() || n.input.is_some() || v.outline.is_some() || v.effect.is_some()
+                || v.backdrop_blur > 0.0 || v.cutout.is_some() || v.hover().a > 0.0 || v.tracks_press()
+                || (self.tree.has_dissolve && self.paint.dissolve_scratch[j]) || self.focus_ring_visible(j)
+            {
+                return false;
+            }
+            // An icon draws as one glyph.
+            match own_paints(n) + usize::from(v.icon.is_some()) {
+                0 => {}
+                1 if !painted && (n.text.is_some() || v.fill.a > 0.0 || v.icon.is_some()) => painted = true,
+                _ => return false,
+            }
+        }
+        true
+    }
+
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -329,6 +355,11 @@ impl RuntimeCore {
         if !open_cache {
             strip_round_mask(clip, &mut own_round);
         }
+        // A square clip of its own can take the node clear of its ancestor's rounded corners.
+        let paints_inside = n.vis.shadows.is_empty() && n.vis.backdrop_blur == 0.0 && n.vis.outline.is_none();
+        if paints_inside && let Some((mask, radii)) = *rounded && inside_rounded(*clip, mask, radii) && !self.focus_ring_visible(i) {
+            *rounded = None;
+        }
         // A backdrop blur samples what is drawn before it, so it goes ahead of any layer this
         // element opens (a fade still blurs the window) and of its shadows, which skip it.
         let blur_hole = (n.vis.backdrop_blur > 0.0 && !skip_paint && visible && *backdrop_blurs < crate::MAX_BACKDROP_BLURS
@@ -345,6 +376,14 @@ impl RuntimeCore {
             layers.push((i, self.instances.len(), self.surfaces.len()));
             self.instances.push(marker);
             *clip = NO_CLIP; *fade = [0.0; 4]; *fade_origin = NO_CLIP;
+        }
+        // A node that clips itself rounded clear of its ancestor's corners, and paints nothing
+        // outside its rect, needs only its own mask: the ancestor's corners can't reach it.
+        if let (Some((mask, radii)), Some((own, _))) = (*rounded, own_round)
+            && n.vis.shadows.is_empty() && n.vis.backdrop_blur == 0.0 && n.vis.outline.is_none()
+            && inside_rounded(own, mask, radii) && !self.focus_ring_visible(i)
+        {
+            *rounded = None;
         }
         // Two rounded rectangles cannot generally be represented by one rounded rectangle.
         // Consume the ancestor on an outer composite, retaining both original corner centres.
@@ -380,7 +419,7 @@ impl RuntimeCore {
             self.text_clip(i, (r, r_exact), sc, *clip).is_some_and(|(text, ..)| inside_rounded(text, mask, radii))
         });
         *isolate |= open_cache || (rounded.is_some() && (n.text.as_ref().is_some_and(|t| (t.truncate_fade || t.cold.live.is_some()) && !glyphs_clear)
-            || n.input.as_ref().is_some_and(|i| i.single_line)));
+            || n.input.as_ref().is_some_and(|i| i.single_line) && !rounded.is_some_and(|(mask, radii)| inside_rounded(r, mask, radii))));
         // A soft clip fades each primitive on its own, so where one paints over another (an
         // image over its placeholder fill, a label over its bubble) the one beneath shows
         // through the fade, and the stack brightens or darkens towards the edge. A stack that
