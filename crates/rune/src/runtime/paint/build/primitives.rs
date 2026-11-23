@@ -232,8 +232,8 @@ impl RuntimeCore {
                     if c0[3] <= 0.0005 && c1[3] <= 0.0005 {
                         continue;
                     }
-                    let t0_val = rg.stops[seg].0;
-                    let t1_val = rg.stops[seg + 1].0;
+                    let mut t0_val = rg.stops[seg].0;
+                    let mut t1_val = rg.stops[seg + 1].0;
                     let (seg_rect, seg_radii, uv) = match rg.geometry {
                         crate::el::GradientGeometry::Radial { center, radius } => {
                             let cx = center[0] * w;
@@ -273,7 +273,73 @@ impl RuntimeCore {
                             let (sin, cos) = angle.sin_cos();
                             let (dx, dy) = (sin, -cos);
                             let span = (dx.abs() * w + dy.abs() * h).max(1e-3);
-                            ([r[0], r[1], w, h], radii, [dx / span, dy / span, 0.0, 0.0])
+                            let (ux, uy) = (dx / span, dy / span);
+                            let below = seg > 0 || c0 == [0.0; 4];
+                            let above = seg + 1 < segs || c1 == [0.0; 4];
+                            let cmax = radii.into_iter().map(crate::render::corner_extent).fold(0.0f32, f32::max).min(w * 0.5).min(h * 0.5);
+                            if dx.abs() < 1e-6 && uy != 0.0 && (below || above) {
+                                let y0 = h * 0.5 + (t0_val - 0.5) / uy;
+                                let y1 = h * 0.5 + (t1_val - 0.5) / uy;
+                                let (mut ly0, mut ly1) = if uy > 0.0 {
+                                    (if below { (y0 - pad).floor().max(0.0) } else { 0.0 }, if above { (y1 + pad).ceil().min(h) } else { h })
+                                } else {
+                                    (if above { (y1 - pad).floor().max(0.0) } else { 0.0 }, if below { (y0 + pad).ceil().min(h) } else { h })
+                                };
+                                if cmax > 0.0 {
+                                    if ly0 < cmax { ly0 = 0.0; }
+                                    if ly1 > h - cmax { ly1 = h; }
+                                    if ly0 == 0.0 { ly1 = ly1.max((2.0 * cmax).min(h)); }
+                                    if ly1 == h { ly0 = ly0.min((h - 2.0 * cmax).max(0.0)); }
+                                }
+                                if ly1 <= ly0 { continue; }
+                                let dt = (ly0 + (ly1 - ly0) * 0.5 - h * 0.5) * uy;
+                                let (nt0, nt1) = (t0_val - dt, t1_val - dt);
+                                if nt0 > -0.45 && nt0 < 1.45 && nt1 > -0.45 && nt1 < 1.45 {
+                                    t0_val = nt0;
+                                    t1_val = nt1;
+                                    let br = [
+                                        if ly0 == 0.0 { radii[0] } else { 0.0 },
+                                        if ly0 == 0.0 { radii[1] } else { 0.0 },
+                                        if ly1 == h { radii[2] } else { 0.0 },
+                                        if ly1 == h { radii[3] } else { 0.0 },
+                                    ];
+                                    ([r[0], r[1] + ly0, w, ly1 - ly0], br, [ux, uy, 0.0, 0.0])
+                                } else {
+                                    ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                                }
+                            } else if dy.abs() < 1e-6 && ux != 0.0 && (below || above) {
+                                let x0 = w * 0.5 + (t0_val - 0.5) / ux;
+                                let x1 = w * 0.5 + (t1_val - 0.5) / ux;
+                                let (mut lx0, mut lx1) = if ux > 0.0 {
+                                    (if below { (x0 - pad).floor().max(0.0) } else { 0.0 }, if above { (x1 + pad).ceil().min(w) } else { w })
+                                } else {
+                                    (if above { (x1 - pad).floor().max(0.0) } else { 0.0 }, if below { (x0 + pad).ceil().min(w) } else { w })
+                                };
+                                if cmax > 0.0 {
+                                    if lx0 < cmax { lx0 = 0.0; }
+                                    if lx1 > w - cmax { lx1 = w; }
+                                    if lx0 == 0.0 { lx1 = lx1.max((2.0 * cmax).min(w)); }
+                                    if lx1 == w { lx0 = lx0.min((w - 2.0 * cmax).max(0.0)); }
+                                }
+                                if lx1 <= lx0 { continue; }
+                                let dt = (lx0 + (lx1 - lx0) * 0.5 - w * 0.5) * ux;
+                                let (nt0, nt1) = (t0_val - dt, t1_val - dt);
+                                if nt0 > -0.45 && nt0 < 1.45 && nt1 > -0.45 && nt1 < 1.45 {
+                                    t0_val = nt0;
+                                    t1_val = nt1;
+                                    let br = [
+                                        if lx0 == 0.0 { radii[0] } else { 0.0 },
+                                        if lx1 == w { radii[1] } else { 0.0 },
+                                        if lx1 == w { radii[2] } else { 0.0 },
+                                        if lx0 == 0.0 { radii[3] } else { 0.0 },
+                                    ];
+                                    ([r[0] + lx0, r[1], lx1 - lx0, h], br, [ux, uy, 0.0, 0.0])
+                                } else {
+                                    ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                                }
+                            } else {
+                                ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                            }
                         }
                     };
                     let t0 = t0_val + if seg > 0 { 2.0 } else { 0.0 };
