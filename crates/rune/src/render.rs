@@ -323,6 +323,8 @@ pub struct Renderer {
     count: u32,
     /// The rects at the head of the list that a pass clearing to their colour leaves out (`cleared`).
     cleared: cleared::Cleared,
+    /// The instances ahead of this one lie under a picture the compositor shows (`set_underlay_start`).
+    under: u32,
     springs: Option<crate::gpu::springs::Bindings>,
     spring_instances: usize,
     layers: layers::Layers,
@@ -528,9 +530,20 @@ impl Renderer {
         }
         let frame_pipeline = self.draw_pipeline(format, target);
         pass.set_pipeline(frame_pipeline);
-        // The pinned pipelines draw the frame pass's runs of one kind (`variant::PINNED`), in paint order:
-        // only where the frame's own pipeline would draw (not a layer target, an additive layer or subpixel text).
-        let pinned = self.pinned.as_deref().filter(|p| p.iter().any(Option::is_some) && std::ptr::eq(frame_pipeline, &self.pipeline) && target.is_none() && format == self.format);
+        // The pinned pipelines draw runs of one kind (`variant::PINNED`), in paint order, where the frame's own pipeline
+        // would draw: the window's, or a layer's drawn over as the window is (not an additive layer or subpixel text).
+        // Made from WGSL they come for the window's format and then the layers' (`layers::FORMAT`).
+        let n = variant::PINNED_FROM_WGSL.len();
+        let pinned = self.pinned.as_deref().filter(|p| p.iter().any(Option::is_some)).and_then(|p| {
+            if target.is_none() && format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
+                Some(&p[..p.len().min(n)])
+            } else if p.len() == 2 * n && target.is_some() && format == layers::FORMAT && self.layer_blend(target) != Blend::PlusLighter
+                && self.extra.iter().any(|(f, e)| *f == format && std::ptr::eq(frame_pipeline, e)) {
+                Some(&p[n..])
+            } else {
+                None
+            }
+        });
         // Frame-profile builds: `RUNE_PINNED=off` draws every span with the general shader, `all` splits every span
         // whatever its runs; the screen comparison runs both against the general build.
         #[cfg(feature = "frame-profile")]
@@ -581,24 +594,28 @@ impl Renderer {
             #[cfg(feature = "frame-profile")]
             PINNED_DRAWN[usize::from(split.is_some())].fetch_add(u64::from(span.end - span.start), std::sync::atomic::Ordering::Relaxed);
             let Some(pinned) = split else {
-                // Its big instances (`BIG`) draw alone with their kind's pipeline all the same: the smaller shader
-                // shades their many pixels at a GPU's full rate, where the general one's size holds it down.
-                let mut at = span.start;
-                while at < span.end {
-                    let alone = pinned.filter(|_| self.big.get(at as usize).copied().unwrap_or(false))
-                        .and_then(|p| pinned_pipeline(p, self.kinds.get(at as usize).copied().flatten()));
-                    let (run, pipeline) = match alone {
-                        Some(pipeline) => (at..at + 1, pipeline),
-                        None => {
-                            let mut end = at + 1;
-                            while end < span.end && !(pinned.is_some() && self.big.get(end as usize).copied().unwrap_or(false)
-                                && pinned.and_then(|p| pinned_pipeline(p, self.kinds.get(end as usize).copied().flatten())).is_some()) { end += 1; }
-                            (at..end, frame_pipeline)
-                        }
-                    };
+                // A span whose kinds alternate still draws with each kind's pipeline where that pays: a run of
+                // `LONG_RUN` or more of one kind (a line of text, a list's rows), and an instance big enough
+                // (`BIG`) that the smaller shader shading its many pixels at a GPU's full rate outweighs a draw.
+                // The rest draws with the general shader, in as few draws as paint order allows.
+                let choose = |run: &std::ops::Range<u32>, i: u32| -> Option<&wgpu::RenderPipeline> {
+                    let p = pinned?;
+                    let pipeline = pinned_pipeline(p, self.kinds.get(i as usize).copied().flatten())?;
+                    (run.len() >= LONG_RUN || self.big.get(i as usize).copied().unwrap_or(false)).then_some(pipeline)
+                };
+                let mut picks: Vec<(u32, Option<&wgpu::RenderPipeline>)> = Vec::new();
+                for run in kind_runs(&self.kinds, span.clone()) {
+                    for i in run.clone() { picks.push((i, choose(&run, i))); }
+                }
+                let mut at = 0;
+                while at < picks.len() {
+                    let pick = picks[at].1;
+                    let mut end = at + 1;
+                    while end < picks.len() && match (pick, picks[end].1) { (Some(a), Some(b)) => std::ptr::eq(a, b), (None, None) => true, _ => false } { end += 1; }
+                    let pipeline = pick.unwrap_or(frame_pipeline);
                     if !std::ptr::eq(bound, pipeline) { pass.set_pipeline(pipeline); bound = pipeline; }
-                    self.draw_quads(pass, run.clone(), bound, middles);
-                    at = run.end;
+                    self.draw_quads(pass, picks[at].0..picks[end - 1].0 + 1, bound, middles);
+                    at = end;
                 }
                 continue;
             };
@@ -682,6 +699,10 @@ impl Renderer {
         self.springs.as_ref().is_some_and(|p| time < p.settle_at)
     }
 
+    /// The next frames leave out the instances ahead of `from`: a picture the compositor shows
+    /// under the window covers them (`RuntimeCore::underlay`). 0 draws them all.
+    pub fn set_underlay_start(&mut self, from: u32) { self.under = from; }
+
     /// Draws over what `view` already holds instead of clearing it (headless overlays).
     pub(crate) fn draw_over(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
         self.draw_load(encoder, view, wgpu::LoadOp::Load, None);
@@ -702,7 +723,7 @@ impl Renderer {
             t
         });
         let blurs = self.has_backdrop_blur();
-        let start = self.cleared_start(load);
+        let start = self.cleared_start(load).max(self.under.min(self.count));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -775,9 +796,9 @@ const SPLIT_VERTICES: std::ops::Range<u32> = 4..34;
 const SPLIT_MIDDLE: std::ops::Range<u32> = 4..10;
 const SPLIT_BANDS: std::ops::Range<u32> = 10..34;
 
-/// Below this many device pixels either way a shape draws whole: its middle (`split_hole`, 16 pixels at least past
+/// Below this many device pixels either way a shape draws whole: its middle (`split_hole`, 8 pixels at least past
 /// its corners and edges) would be small or empty, and the five quads cost more than they save.
-const SPLIT_MIN: f32 = 48.0;
+const SPLIT_MIN: f32 = 32.0;
 
 /// The pipeline pinned to `kind`, among the renderer's (`variant::PINNED_FROM_WGSL` order), if there is one.
 fn pinned_pipeline(pinned: &[Option<wgpu::RenderPipeline>], kind: Option<Kind>) -> Option<&wgpu::RenderPipeline> {
@@ -788,7 +809,10 @@ fn pinned_pipeline(pinned: &[Option<wgpu::RenderPipeline>], kind: Option<Kind>) 
 /// Device pixels an instance covers from which it draws alone with its kind's pipeline in a span whose kinds
 /// alternate: a panel, a card, a backdrop's picture. A draw and two pipeline switches cost the CPU a few
 /// microseconds; shading that many pixels with the general shader costs a small GPU far more.
-const BIG: f32 = 64.0 * 64.0;
+const BIG: f32 = 32.0 * 32.0;
+
+/// Instances of one kind in a row from which a run draws with that kind's pipeline in a span whose kinds alternate.
+const LONG_RUN: usize = 8;
 
 /// Whether `instance` is a box worth drawing apart: one whose middle the vertex shader can find (`split_hole`).
 fn splits(instance: &Instance) -> bool {

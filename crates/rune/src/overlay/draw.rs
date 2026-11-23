@@ -337,6 +337,21 @@ impl FrameHost for OverlayFrame<'_> {
     }
 
     fn render(&mut self, prepared: &mut PreparedOverlayFrame, info: &StepInfo) -> bool {
+        // A picture the compositor can show under the surface (`El::underlay`) goes there, and the
+        // frame leaves out what it covers; anything else takes it down.
+        #[allow(unused_mut)]
+        let mut under = 0;
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        {
+            let points = self.core.at.size;
+            let found = if self.app.has_compositor() || !underlays() { None } else { self.app.rt().underlay(prepared.size) };
+            if let Some(Live { backing: Backing::Layer(layer), .. }) = self.core.surface.live_mut()
+                && layer.set_underlay(found.as_ref().map(|(_, pixels)| pixels), prepared.size, points)
+            {
+                under = found.map_or(0, |(from, _)| from);
+            }
+        }
+        if let Some(renderer) = self.core.renderer.as_mut() { renderer.set_underlay_start(under); }
         let (Some(live), Some(renderer), Some(gpu)) = (
             self.core.surface.live(),
             self.core.renderer.as_mut(),
@@ -690,4 +705,11 @@ impl OverlayCore {
         renderer.submit(&gpu.queue, enc);
         rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok();
     }
+}
+
+/// Whether pictures go under the surface (`El::underlay`); `RUNE_UNDERLAY=0` draws them in the window.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+fn underlays() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUNE_UNDERLAY").is_none_or(|v| v != "0"))
 }

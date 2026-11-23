@@ -4,7 +4,8 @@
 //! headless run writes its frames (`RUNE_FRAME_LOG`), with everything the thread did since the
 //! last frame: the input it handled, the updates and the frames that settled them. Where the
 //! device has timestamps inside encoders, the GPU's own time for the frame and its clock as it
-//! drew come with it (`gpu_time_ms`, `gpu_mhz`).
+//! drew come with it (`gpu_time_ms`, `gpu_mhz`). A picture a compositor would show under the
+//! window (`El::underlay`) it leaves out, as a window on a surface that can hold one does.
 
 use crate::render::{Gpu, Offscreen, Renderer};
 
@@ -99,7 +100,10 @@ impl FrameLog {
             encoder.write_timestamp(&t.queries, 0);
             renderer.pass_mark = Some((t.queries.clone(), 1));
         }
+        // A picture the compositor would show under the window (`El::underlay`) isn't the window's to draw.
+        renderer.set_underlay_start(core.underlay(size).map_or(0, |(from, _)| from));
         crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &self.target.view, core, size, [0.0; 4]);
+        renderer.set_underlay_start(0);
         renderer.pass_mark = None;
         if let Some(t) = &self.timer {
             encoder.write_timestamp(&t.queries, 2);
