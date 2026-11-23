@@ -125,6 +125,7 @@ impl paint_state::PaintState {
         glyph_count: &mut usize,
     ) {
         while let Some(&(ancestor, start, surface_start)) = layers.last() {
+            if node_parent == Some(ancestor) { break; }
             let mut parent = node_parent;
             while parent.is_some_and(|p| p != ancestor) { parent = nodes[parent.unwrap()].parent; }
             if parent == Some(ancestor) { break; }
