@@ -698,13 +698,25 @@ impl Renderer {
         middles: Option<&'a [Option<wgpu::RenderPipeline>]>,
     ) {
         #[cfg(feature = "frame-profile")]
-        let skip = |i: u32| self.kinds.get(i as usize).copied().flatten().is_some_and(|k| skipped_kinds().contains(&k.as_u32()));
+        let skipping = !skipped_kinds().is_empty() || !skipped_modes().is_empty() || !skipped_rects().is_empty();
+        #[cfg(feature = "frame-profile")]
+        let skip = |i: u32| skipping && (self.kinds.get(i as usize).copied().flatten().is_some_and(|k| skipped_kinds().contains(&k.as_u32()))
+            || skipped_modes().contains(&(self.quad_mode.get(i as usize).copied().unwrap_or(QuadMode::Whole) as u32 + if middles.is_some() { 0 } else { 10 }))
+            || self.uploads.instance(i).is_some_and(|inst| skipped_rects().iter().any(|r| r.iter().zip(inst.rect).all(|(a, b)| (a - b).abs() < 0.75))));
         #[cfg(not(feature = "frame-profile"))]
         let skip = |_: u32| false;
+        #[cfg(feature = "frame-profile")]
+        if draw_trace() {
+            let modes: Vec<String> = (range.start..range.end).map(|i| format!("{}", self.quad_mode.get(i as usize).copied().unwrap_or(QuadMode::Whole) as u32)).collect();
+            eprintln!("rune-draw: {}..{} middles={} kinds={:?} modes={}", range.start, range.end, middles.is_some(),
+                self.kinds.get(range.start as usize).copied().flatten().map(Kind::as_u32), modes.join(""));
+        }
         let bind = |pass: &mut wgpu::RenderPass<'_>, bound: &mut &'a wgpu::RenderPipeline, p: &'a wgpu::RenderPipeline| {
             if !std::ptr::eq(*bound, p) {
                 pass.set_pipeline(p);
                 *bound = p;
+                #[cfg(feature = "frame-profile")]
+                DRAW_TALLY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         };
         let mut at = range.start;
@@ -720,8 +732,10 @@ impl Renderer {
                 while end < range.end && !skip(end) && self.quad_mode.get(end as usize).copied().unwrap_or(QuadMode::Whole).is_split() == apart { end += 1; }
                 bind(pass, bound, fallback);
                 if apart {
+                    tally_draw();
                     pass.draw(SPLIT_VERTICES, at..end);
                 } else {
+                    tally_draw();
                     pass.draw(0..4, at..end);
                 }
                 at = end;
@@ -732,21 +746,25 @@ impl Renderer {
             match mode {
                 QuadMode::Whole => {
                     bind(pass, bound, fallback);
+                    tally_draw();
                     pass.draw(0..4, at..end);
                 }
                 QuadMode::SimpleRect => {
                     let p = middles.get(variant::SIMPLE_RECT_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
                     bind(pass, bound, p);
+                    tally_draw();
                     pass.draw(0..4, at..end);
                 }
                 QuadMode::MiddleOnly => {
                     let p = middles.first().and_then(Option::as_ref).unwrap_or(fallback);
                     bind(pass, bound, p);
+                    tally_draw();
                     pass.draw(0..4, at..end);
                 }
                 QuadMode::PlainGlyph => {
                     let p = middles.get(variant::PLAIN_GLYPH_SLOT).and_then(Option::as_ref).unwrap_or(fallback);
                     bind(pass, bound, p);
+                    tally_draw();
                     pass.draw(0..4, at..end);
                 }
                 QuadMode::Split | QuadMode::SplitSimpleRect | QuadMode::SplitLinear => {
@@ -770,12 +788,15 @@ impl Renderer {
                         match middle {
                             Some(middle) => {
                                 bind(pass, bound, middle);
+                                tally_draw();
                                 pass.draw(SPLIT_MIDDLE, i..j);
                                 bind(pass, bound, bands_pipe);
+                                tally_draw();
                                 pass.draw(SPLIT_BANDS, i..j);
                             }
                             None => {
                                 bind(pass, bound, bands_pipe);
+                                tally_draw();
                                 pass.draw(SPLIT_VERTICES, i..j);
                             }
                         }
@@ -877,6 +898,35 @@ pub(crate) fn corner_extent(radius: f32) -> f32 {
 
 pub(crate) const CONTINUOUS_K: f32 = instance::shader_consts::CONTINUOUS_K;
 
+/// Frame-profile builds: `RUNE_SKIP_MODE=0,6` leaves the instances drawn on those `QuadMode`s undrawn (10 more
+/// for a span drawn without the slim pipelines), as `RUNE_SKIP_KIND` does kinds.
+#[cfg(feature = "frame-profile")]
+fn skipped_modes() -> &'static [u32] {
+    static SKIPPED: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SKIPPED.get_or_init(|| std::env::var("RUNE_SKIP_MODE").map(|v| v.split(',').filter_map(|k| k.trim().parse().ok()).collect()).unwrap_or_default())
+}
+
+/// Frame-profile builds: `RUNE_DRAW_TRACE` prints each `draw_quads` span, its kinds and quad modes.
+#[cfg(feature = "frame-profile")]
+fn draw_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUNE_DRAW_TRACE").is_some())
+}
+
+/// Frame-profile builds: `RUNE_SKIP_RECT=x,y,w,h;...` leaves the instances with those rects undrawn.
+#[cfg(feature = "frame-profile")]
+fn skipped_rects() -> &'static [[f32; 4]] {
+    static SKIPPED: std::sync::OnceLock<Vec<[f32; 4]>> = std::sync::OnceLock::new();
+    SKIPPED.get_or_init(|| std::env::var("RUNE_SKIP_RECT").map(|v| v.split(';').filter_map(|r| {
+        let n: Vec<f32> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
+    }).collect()).unwrap_or_default())
+}
+
+/// Frame-profile builds: pipeline binds and draws in `draw_quads`, reported with `RUNE_PINNED` (`report_pinned`).
+#[cfg(feature = "frame-profile")]
+pub(super) static DRAW_TALLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Frame-profile builds: `RUNE_SKIP_KIND=0,7` leaves the instances of those kinds (`Kind::as_u32`) undrawn in the
 /// frame's passes, so a frame budget can say what each kind costs a GPU: the time with them less the time without.
 #[cfg(feature = "frame-profile")]
@@ -904,7 +954,8 @@ pub(crate) fn report_pinned() {
     let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if std::env::var_os("RUNE_PINNED").is_none() || frame % 60 != 0 { return; }
     let [whole, split] = [0, 1].map(|i| PINNED_DRAWN[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    eprintln!("rune-pinned: {split} instances split into runs, {whole} drawn unsplit (frame {frame})");
+    let [binds, draws] = [0, 1].map(|i| DRAW_TALLY[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    eprintln!("rune-pinned: {split} instances split into runs, {whole} drawn unsplit, {binds} binds and {draws} draws in 60 frames (frame {frame})");
 }
 
 /// The vertices a box drawn apart takes (shader.wgsl `base_vs`): its middle, where it and its clip cover every
@@ -1033,4 +1084,11 @@ fn kind_runs(kinds: &[Option<Kind>], span: std::ops::Range<u32>) -> impl Iterato
         at = cur;
         Some(start as u32..cur as u32)
     })
+}
+
+/// Counts a `draw_quads` draw in frame-profile builds (`DRAW_TALLY`).
+#[inline]
+fn tally_draw() {
+    #[cfg(feature = "frame-profile")]
+    DRAW_TALLY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
