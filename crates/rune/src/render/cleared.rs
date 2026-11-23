@@ -9,25 +9,45 @@ use super::{Instance, Kind, Renderer};
 
 impl Renderer {
     /// Where the frame pass opening with `load` starts in the uploaded list (`Cleared::start`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn cleared_start(&self, load: wgpu::LoadOp<wgpu::Color>) -> u32 {
         let before = self.surfaces.as_ref().and_then(|s| (0..s.len()).map(|i| s.before_instance(i)).min());
         self.cleared.start(load, before.unwrap_or(u32::MAX))
     }
+
+    /// The pass's `LoadOp` and first instance: folds a full-window first rect (such as a translucent
+    /// scrim) into a transparent clear, or skips an opaque prefix matching `load`.
+    pub(super) fn cleared_pass(&self, load: wgpu::LoadOp<wgpu::Color>, under: u32) -> (wgpu::LoadOp<wgpu::Color>, u32) {
+        let before = self.surfaces.as_ref().and_then(|s| (0..s.len()).map(|i| s.before_instance(i)).min()).unwrap_or(u32::MAX);
+        if under == 0 && before >= 1
+            && let wgpu::LoadOp::Clear(c) = load
+            && [c.r, c.g, c.b, c.a] == [0.0; 4]
+            && let Some(s) = self.cleared.scrim
+        {
+            return (wgpu::LoadOp::Clear(wgpu::Color { r: s[0] as f64, g: s[1] as f64, b: s[2] as f64, a: s[3] as f64 }), 1);
+        }
+        (load, self.cleared.start(load, before).max(under))
+    }
 }
 
 /// The instances at the head of the list that, over a target holding `color` everywhere, leave
-/// every pixel as it was.
+/// every pixel as it was; plus a full-viewport plain first rect (`scrim`) that a transparent clear
+/// can fold directly into its clear colour.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Cleared {
     color: [f32; 4],
     len: u32,
+    scrim: Option<[f32; 4]>,
 }
 
 impl Cleared {
-    pub(super) fn of(instances: &[Instance]) -> Self {
-        let Some(color) = instances.first().map(|i| i.fill).filter(|c| c[3] == 1.0) else { return Self::default() };
+    pub(super) fn of(instances: &[Instance], viewport: (u32, u32)) -> Self {
+        let scrim = instances.first().filter(|i| covers_viewport(i, viewport)).map(|i| i.fill);
+        let Some(color) = instances.first().map(|i| i.fill).filter(|c| c[3] == 1.0) else {
+            return Self { scrim, ..Self::default() };
+        };
         let len = instances.iter().take_while(|i| paints_only(i, color)).count();
-        Self { color, len: len as u32 }
+        Self { color, len: len as u32, scrim }
     }
 
     /// Where a pass opening with `load` starts drawing the list: past these instances when it
@@ -39,6 +59,23 @@ impl Cleared {
             _ => 0,
         }
     }
+}
+
+/// `i` is a plain borderless, unrounded, unfaded rect covering the entire `viewport` inside an
+/// unfaded clip, so drawing it over a transparent clear produces `i.fill` at every pixel.
+fn covers_viewport(i: &Instance, (vw, vh): (u32, u32)) -> bool {
+    let (vw, vh) = (vw as f32, vh as f32);
+    let [x, y, w, h] = i.rect;
+    let [cx0, cy0, cx1, cy1] = i.clip;
+    vw > 0.0 && vh > 0.0
+        && i.kind() == Some(Kind::Rect)
+        && i.params[0] == 0.0
+        && i.params[2] <= 0.5
+        && i.radii == [0.0; 4]
+        && i.uv == [0.0; 4]
+        && i.fade == [0; 4]
+        && x <= 0.0 && y <= 0.0 && x + w >= vw && y + h >= vh
+        && cx0 <= 0.0 && cy0 <= 0.0 && cx1 >= vw && cy1 >= vh
 }
 
 /// `i` writes exactly `color`, which is opaque, to the pixels inside its rect and nothing to
