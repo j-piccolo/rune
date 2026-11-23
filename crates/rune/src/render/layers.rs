@@ -981,13 +981,22 @@ impl Renderer {
                 if !WARM_LAYERS.load(std::sync::atomic::Ordering::Relaxed) { return; }
                 let made = Warmed::default();
                 let (to, made_on, layout, shader, format, entry) = (made.clone(), device.clone(), self.layout.clone(), self.shader.clone(), self.format, self.vertex_entry);
+                let composite_wgsl = self.composite_wgsl();
                 let thread = std::thread::Builder::new().name("rune-warm-layers".into()).spawn(move || {
                     // What `build_feature` makes for isolation: the uber pipeline for layer
                     // targets, and the composite for the window's format and theirs.
                     let mut pipelines = Vec::new();
+                    let composite = composite_wgsl.and_then(|wgsl| {
+                        super::variant::compile(&made_on, &wgsl, |pinned| Renderer::pipeline(&made_on, &layout, pinned, format, "vs", Blend::SourceOver)).ok()
+                    });
                     let verdict = breaker::checked(&made_on, || {
-                        for (format, entry) in [(FORMAT, entry), (format, "vs"), (FORMAT, "vs")] {
-                            pipelines.push((format, entry, Renderer::pipeline(&made_on, &layout, &shader, format, entry, Blend::SourceOver)));
+                        pipelines.push((FORMAT, entry, Renderer::pipeline(&made_on, &layout, &shader, FORMAT, entry, Blend::SourceOver)));
+                        for format in [format, FORMAT] {
+                            let pipeline = match &composite {
+                                Some((pinned, _)) => Renderer::pipeline(&made_on, &layout, pinned, format, "vs", Blend::SourceOver),
+                                None => Renderer::pipeline(&made_on, &layout, &shader, format, "vs", Blend::SourceOver),
+                            };
+                            pipelines.push((format, "vs", pipeline));
                         }
                     });
                     let taken = matches!(verdict, breaker::Verdict::Now(None));

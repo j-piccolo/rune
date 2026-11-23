@@ -509,10 +509,13 @@ impl Renderer {
             let (sent, done) = std::sync::mpsc::channel();
             let (device, layout, format) = (device.clone(), self.layout.clone(), self.format);
             let spawned = std::thread::Builder::new().name("rune-pinned-pipelines".into()).spawn(move || {
-                let pinned: Vec<_> = PINNED_FROM_WGSL.iter().map(|&kind| {
+                // For the window's format, then for its layers' (`layers::FORMAT`), where a fading page draws.
+                let made: Vec<_> = PINNED_FROM_WGSL.iter().map(|&kind| {
                     let wgsl = pinned_banded_wgsl(kind)?;
-                    compile(&device, &wgsl, |shader| Renderer::pipeline(&device, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p)
+                    compile(&device, &wgsl, |shader| Renderer::pipeline(&device, &layout, shader, format, "vs", Blend::SourceOver)).ok()
                 }).collect();
+                let layer = made.iter().map(|m| m.as_ref().map(|(shader, _)| Renderer::pipeline(&device, &layout, shader, super::layers::FORMAT, "vs", Blend::SourceOver))).collect::<Vec<_>>();
+                let pinned: Vec<_> = made.into_iter().map(|m| m.map(|(_, p)| p)).chain(layer).collect();
                 sent.send(if pinned.iter().any(Option::is_some) { pinned } else { Vec::new() }).ok();
             });
             if spawned.is_ok() {
@@ -522,6 +525,18 @@ impl Renderer {
         }
         let _ = device;
         self.pinned = Some(Vec::new());
+    }
+
+    /// The WGSL a layer's composite draws with, pinned to it (`Kind::Layer`), where the uber shader compiles from
+    /// WGSL here: drawn with the uber shader, every fragment of a composite pays for registers its other kinds hold,
+    /// and a small GPU hides a float texel's fetch behind fewer fragments at a time.
+    pub(super) fn composite_wgsl(&self) -> Option<String> {
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+        if matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs"
+            && std::env::var_os("RUNE_PINNED_WGSL").is_none_or(|v| v != "0") {
+            return pinned_wgsl(Kind::Layer.as_u32());
+        }
+        None
     }
 
     /// The pipelines shapes' middles draw with (`middle_wgsl`) for the renderer's format, made on a thread the first
@@ -647,7 +662,7 @@ fn lcd_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, format: wg
 }
 
 /// `wgsl`'s module and pipeline, compiled now, or the error the device reported.
-fn compile(device: &wgpu::Device, wgsl: &str, make_pipeline: impl FnOnce(&dxbc::Shaders) -> wgpu::RenderPipeline) -> Result<(dxbc::Shaders, wgpu::RenderPipeline), String> {
+pub(super) fn compile(device: &wgpu::Device, wgsl: &str, make_pipeline: impl FnOnce(&dxbc::Shaders) -> wgpu::RenderPipeline) -> Result<(dxbc::Shaders, wgpu::RenderPipeline), String> {
     #[cfg(not(target_arch = "wasm32"))]
     let scopes = (device.push_error_scope(wgpu::ErrorFilter::Validation), device.push_error_scope(wgpu::ErrorFilter::Internal));
     let shader = dxbc::Shaders::one(device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("uber"), source: wgpu::ShaderSource::Wgsl(wgsl.into()) }));
