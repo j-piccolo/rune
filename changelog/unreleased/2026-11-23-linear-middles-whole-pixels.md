@@ -1,0 +1,1 @@
+- A linear gradient segment's middle draws with its colour interpolated between its corners whenever `t` stays between the stops at the corners of the whole pixels it covers, not only inside the box less its soft edge: a segment narrowed to its band (its rect ending half a pixel past its stops) now qualifies. No pixel changes.
