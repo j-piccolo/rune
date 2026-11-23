@@ -54,23 +54,26 @@ fn vs(i: In) -> Out {
     return base_vs(i);
 }
 
-// Where a box (kind 0) or a radial gradient's stop segment (kind 11 with a centre, `uv.z > 0`) and its
-// clip cover every pixel whole, past its corners, its soft edge, a box's border and every edge's fade by a
-// pixel more, on whole pixels; empty (zero size) where that is under 32 pixels either way or the shape
-// can't say (a band, per-side borders, a clip with fade stops). Its coverage there is exactly 1
-// (clip.wgsl `box_inside`: `-min(a)` past the corners' reach), and so is its clip's (`clip_alpha_stops`).
-// An angled linear segment never splits: the banded variant narrows its quad by the quad's own extent.
+// Where a box (kind 0), a picture (kind 7) or a gradient's stop segment (kind 11) and its clip cover every pixel whole, past
+// its corners, its soft edge, a box's border and every edge's fade by a pixel more, on whole pixels;
+// empty (zero size) where that is under 16 pixels either way or the shape can't say (a band, per-side
+// borders, a clip with fade stops). Its coverage there is exactly 1 (clip.wgsl `box_inside`: `-min(a)`
+// past the corners' reach), and so is its clip's (`clip_alpha_stops`). An angled linear segment's quad is
+// narrowed first (the banded variant), and its middle taken within what's left.
 fn split_hole(i: In) -> vec4<f32> {
     let kind = i.params.y;
+    let image = kind > 6.5 && kind < 7.5;
     let shape = (kind < 0.5 && i.uv.z >= 0.0 && (i.params.x <= 0.0 || all(i.uv == vec4<f32>(0.0))))
-        || (kind > 10.5 && kind < 11.5 && i.uv.z > 0.0);
+        || (kind > 10.5 && kind < 11.5) || image;
     if (!shape || i.fade.z != 0u) {
         return vec4<f32>(0.0);
     }
     let r = i.radii;
     let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
     let border = select(0.0, max(i.params.x, 0.0), kind < 0.5);
-    let e = reach + max(i.params.z, 0.5) + border + 1.0;
+    // A picture's edge is half a pixel soft (its `params.z` says whether it's premultiplied).
+    let soft = select(max(i.params.z, 0.5), 0.5, image);
+    let e = reach + soft + border + 1.0;
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
@@ -80,7 +83,7 @@ fn split_hole(i: In) -> vec4<f32> {
     }
     let lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
     let hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
-    if (any(hi - lo < vec2<f32>(32.0))) {
+    if (any(hi - lo < vec2<f32>(16.0))) {
         return vec4<f32>(0.0);
     }
     return vec4<f32>(lo, hi);
@@ -120,10 +123,13 @@ fn base_vs(i: In) -> Out {
         lo = max(lo, i.rect.xy + i.uv.xy);
         hi = max(min(hi, i.rect.xy + vec2<f32>(-i.uv.z, i.uv.w)), lo);
     }
+    // The banded variant narrows a gradient segment's quad here (render/variant.rs `BAND`), before a split.
     var whole = 0u;
     if (sub > 0u) {
-        let hole = split_hole(i);
-        if (hole.z > hole.x) {
+        // The middle within the quad as narrowed, so the five quads partition what it draws.
+        var hole = split_hole(i);
+        hole = vec4<f32>(max(hole.xy, lo), min(hole.zw, hi));
+        if (hole.z > hole.x && hole.w > hole.y) {
             switch sub {
                 case 1u: { lo = hole.xy; hi = hole.zw; whole = 1u; }
                 case 2u: { hi = vec2<f32>(hi.x, hole.y); }
@@ -434,6 +440,15 @@ fn layer_texel(t: vec2<i32>, size: vec2<f32>, clamp_unit: bool) -> vec4<f32> {
 // and a fragment no longer pays for shapes it isn't. -1 is the shader every kind can draw with.
 const PINNED_KIND: f32 = -1.0;
 
+// The pipeline a shape's middle draws with (render/variant.rs `middle_wgsl`) sets this: every fragment it
+// shades is in a middle (`split_hole`), so the compiler drops the coverage and clip a middle skips.
+const MIDDLE: bool = false;
+
+// The fragment is in its shape's middle (`split_hole`): covered whole, its clip too.
+fn in_middle(i: Out) -> bool {
+    return MIDDLE || i.whole != 0u;
+}
+
 fn fragment_kind(i: Out) -> f32 {
     if (PINNED_KIND >= 0.0) { return PINNED_KIND; }
     return i.params.y;
@@ -484,7 +499,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     if (kind > 11.5) { discard; }
     // A box's middle (`split_hole`): its fill, whole, as the rest of this shader works it out there,
     // rounded as it rounds a flat fill below. A radial segment's middle works out its colour below.
-    if (i.whole != 0u && kind < 0.5) {
+    if (in_middle(i) && kind < 0.5) {
         if (projection.z == 0.0 && g.flags.y > 0.5 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0) {
             return round(clamp(i.fill, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
         }
@@ -543,7 +558,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             // interior stop boundary so adjacent segments partition the quad without overlap.
             let soft = max(i.params.z, 0.5);
             // Its middle (`split_hole`) is covered whole.
-            let cov = select(clamp(0.5 - d / (soft * 2.0), 0.0, 1.0), 1.0, i.whole != 0u);
+            let cov = select(clamp(0.5 - d / (soft * 2.0), 0.0, 1.0), 1.0, in_middle(i));
             let t0_raw = i.params.x;
             let t1_raw = i.params.w;
             let lower_open = t0_raw >= 1.5;
@@ -581,9 +596,16 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let t0 = clamp(lo + vec2<i32>(base), lo, hi);
             let t1 = clamp(lo + vec2<i32>(base) + vec2<i32>(1, 1), lo, hi);
             let premultiplied = i.params.z > 0.5;
-            let c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
+            var c: vec4<f32>;
+            if (all(f == vec2<f32>(0.0))) {
+                // Drawn at its own size on whole pixels: each pixel is one texel, which the four-tap mix
+                // returns exactly with weights of zero, for a quarter of the loads and encodes.
+                c = image_texel(t0, premultiplied);
+            } else {
+                c = mix(mix(image_texel(t0, premultiplied), image_texel(vec2<i32>(t1.x, t0.y), premultiplied), f.x),
                         mix(image_texel(vec2<i32>(t0.x, t1.y), premultiplied), image_texel(t1, premultiplied), f.x), f.y);
-            col = c * (i.fill.a * clamp(0.5 - d, 0.0, 1.0));
+            }
+            col = c * (i.fill.a * select(clamp(0.5 - d, 0.0, 1.0), 1.0, in_middle(i)));
         }
     } else if (kind > 4.5 && kind < 5.5) {
         col = i.fill * segment(screen, i.radii.xy, i.radii.zw, i.params.x, i.params.z > 0.5);
@@ -645,7 +667,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     }
     // A middle's clip covers it whole (`split_hole`).
     var source = col;
-    if (i.whole == 0u) {
+    if (!in_middle(i)) {
         source = col * clip_alpha_stops(screen, i.clip, i.fade, g.flags.zw);
     }
     // On a direct byte surface cpu_boot::blend converts the source *after* mask gamma,

@@ -33,25 +33,25 @@ impl Timer {
     fn new(gpu: &Gpu) -> Option<Self> {
         let wanted = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         if !gpu.device.features().contains(wanted) { return None; }
-        let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("frame-log"), ty: wgpu::QueryType::Timestamp, count: 2 });
-        let buffer = |usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame-log"), size: 16, usage, mapped_at_creation: false });
+        let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("frame-log"), ty: wgpu::QueryType::Timestamp, count: 3 });
+        let buffer = |usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame-log"), size: 24, usage, mapped_at_creation: false });
         let resolved = buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
         let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         Some(Self { queries, resolved, read, period: f64::from(gpu.queue.get_timestamp_period()) })
     }
 
-    /// The milliseconds between the two timestamps, once the frame's work is done.
-    fn read(&self, gpu: &Gpu) -> Option<f64> {
+    /// The milliseconds from the frame's start to the end of its layer passes and to its end, once its work is done.
+    fn read(&self, gpu: &Gpu) -> Option<(f64, f64)> {
         let slice = self.read.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok()?;
         let ticks = {
             let bytes = slice.get_mapped_range().ok()?;
             let at = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-            at(1).wrapping_sub(at(0))
+            (at(1).wrapping_sub(at(0)), at(2).wrapping_sub(at(0)))
         };
         self.read.unmap();
-        Some(ticks as f64 * self.period / 1e6)
+        Some((ticks.0 as f64 * self.period / 1e6, ticks.1 as f64 * self.period / 1e6))
     }
 }
 
@@ -95,12 +95,16 @@ impl FrameLog {
         crate::frame::host_step::prepare_gpu_resources(renderer, gpu, core, size, false);
         stage(0, &mut since);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        if let Some(t) = &self.timer { encoder.write_timestamp(&t.queries, 0); }
-        crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &self.target.view, core, size, [0.0; 4]);
         if let Some(t) = &self.timer {
-            encoder.write_timestamp(&t.queries, 1);
-            encoder.resolve_query_set(&t.queries, 0..2, &t.resolved, 0);
-            encoder.copy_buffer_to_buffer(&t.resolved, 0, &t.read, 0, 16);
+            encoder.write_timestamp(&t.queries, 0);
+            renderer.pass_mark = Some((t.queries.clone(), 1));
+        }
+        crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &self.target.view, core, size, [0.0; 4]);
+        renderer.pass_mark = None;
+        if let Some(t) = &self.timer {
+            encoder.write_timestamp(&t.queries, 2);
+            encoder.resolve_query_set(&t.queries, 0..3, &t.resolved, 0);
+            encoder.copy_buffer_to_buffer(&t.resolved, 0, &t.read, 0, 24);
         }
         stage(2, &mut since);
         renderer.submit(&gpu.queue, encoder);
@@ -132,7 +136,8 @@ impl FrameLog {
             animating,
             cpu_ms: self.cpu0.map(|start| cpu_ms().unwrap_or(start) - start - excluded),
             gpu_wait_ms,
-            gpu_time_ms,
+            gpu_time_ms: gpu_time_ms.map(|(_, all)| all),
+            gpu_layers_ms: gpu_time_ms.map(|(layers, _)| layers),
             gpu_mhz: mhz,
         });
         self.events = 0;
