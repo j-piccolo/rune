@@ -54,15 +54,16 @@ fn fs(i: Out) -> DualOut {
 /// The kinds the frame pass has a pipeline of its own for (`KIND_RECT`, `KIND_SHADOW`, `KIND_GLYPH`):
 /// what most of a frame's fragments draw.
 pub(crate) const PINNED: [u32; 3] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32()];
-/// The kinds pinned where the pipelines compile from WGSL: `PINNED`'s, in its order, then the gradient kinds,
+/// The kinds pinned where the pipelines compile from WGSL: `PINNED`'s, in its order, then the gradient kinds and images,
 /// which have no shipped bytecode. `Renderer::pinned` is in this order, as long as it has pipelines for.
-pub(crate) const PINNED_FROM_WGSL: [u32; 5] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32(), Kind::Radial.as_u32(), Kind::Gradient.as_u32()];
+pub(crate) const PINNED_FROM_WGSL: [u32; 6] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32(), Kind::Radial.as_u32(), Kind::Gradient.as_u32(), Kind::Image.as_u32()];
 
 /// shader.wgsl's marker for the kind a fragment draws: -1, every kind.
 const PINNED_OFF: &str = shader_consts::PINNED_KIND_OFF_DECL;
 
-/// `base_vs`'s line that picks a quad's corner: the banded variant narrows the quad ahead of it.
-const CORNER: &str = "    let p = select(lo, hi, corner > vec2<f32>(0.5));";
+/// `base_vs`'s line ahead of a box's split (and of the line that picks a quad's corner): the banded variant
+/// narrows the quad there, so a segment's middle is taken within the band it draws in.
+const CORNER: &str = "    // The banded variant narrows a gradient segment's quad here (render/variant.rs `BAND`), before a split.";
 
 /// What the banded variant adds to `base_vs`. A linear gradient's stop segment (kind 11) covers its
 /// whole element, and its fragments are zero wherever another segment draws: past an open stop
@@ -122,23 +123,27 @@ pub(crate) fn pinned_wgsl(kind: u32) -> Option<String> {
     (windfoil.matches(PINNED_OFF).count() == 1).then(|| windfoil.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
 }
 
-/// The fragment a box's middle draws with (render.rs `SPLIT_VERTICES`): its fill, as the uber shader works it out
-/// there (`split_hole`), rounded as it rounds a flat fill. Windfoil's WGSL with this entry in place of its own, so
-/// the compiler keeps nothing else: a GPU runs a small shader for most of a big panel's pixels, not the uber shader
-/// that every kind's code sizes.
-const SOLID_ENTRY: &str = r#"
-@fragment
-fn fs(i: Out) -> @location(0) vec4<f32> {
-    if (projection.z == 0.0 && g.flags.y > 0.5 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0) {
-        return round(clamp(i.fill, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
-    }
-    return i.fill;
+/// `pinned_wgsl` with the banded variant's vertex stage (`banded_wgsl`), for the pinned pipelines made from WGSL here:
+/// a gradient stop segment they draw rasterizes only its band, as it does with the frame's own pipeline.
+pub(crate) fn pinned_banded_wgsl(kind: u32) -> Option<String> {
+    let banded = banded_wgsl();
+    (banded.matches(PINNED_OFF).count() == 1).then(|| banded.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
 }
-"#;
 
-pub(super) fn solid_wgsl() -> Option<String> {
-    let windfoil = windfoil_wgsl();
-    (windfoil.matches(FS_ENTRY).count() == 1).then(|| format!("{}\n{SOLID_ENTRY}", windfoil.replacen(FS_ENTRY, "fn fs_general(i: Out) -> vec4<f32> {", 1)))
+/// The kinds whose middle (shader.wgsl `split_hole`) draws with a pipeline of its own (`middle_wgsl`): boxes,
+/// pictures and gradient segments, in the order `Renderer`'s middle pipelines are in.
+pub(super) const MIDDLE_KINDS: [u32; 3] = [Kind::Rect.as_u32(), Kind::Image.as_u32(), Kind::Radial.as_u32()];
+
+/// shader.wgsl's switch for a pipeline that draws middles only.
+const MIDDLE_OFF: &str = "const MIDDLE: bool = false;";
+
+/// The pipeline a `kind` shape's middle draws with: Windfoil pinned to that kind (`pinned_wgsl`), and every
+/// fragment in a middle, so the compiler keeps only what a middle works out (a box's fill, a picture's texel, a
+/// gradient's colour) and none of the coverage and clip around it. A small or software GPU runs that at its full
+/// rate, where the uber shader's size holds it down, and it's the same code on the same inputs: the same pixels.
+pub(super) fn middle_wgsl(kind: u32) -> Option<String> {
+    let pinned = pinned_banded_wgsl(kind)?;
+    (pinned.matches(MIDDLE_OFF).count() == 1).then(|| pinned.replacen(MIDDLE_OFF, "const MIDDLE: bool = true;", 1))
 }
 
 /// outline.wgsl's switch for subpixel outline glyphs, off but in the subpixel variant.
@@ -570,7 +575,7 @@ impl Renderer {
             let (device, layout, format) = (device.clone(), self.layout.clone(), self.format);
             let spawned = std::thread::Builder::new().name("rune-pinned-pipelines".into()).spawn(move || {
                 let pinned: Vec<_> = PINNED_FROM_WGSL.iter().map(|&kind| {
-                    let wgsl = pinned_wgsl(kind)?;
+                    let wgsl = pinned_banded_wgsl(kind)?;
                     compile(&device, &wgsl, |shader| Renderer::pipeline(&device, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p)
                 }).collect();
                 sent.send(if pinned.iter().any(Option::is_some) { pinned } else { Vec::new() }).ok();
@@ -584,9 +589,9 @@ impl Renderer {
         self.pinned = Some(Vec::new());
     }
 
-    /// The pipeline a box's middle draws with (`solid_wgsl`) for the renderer's format, made on a thread the first
-    /// frame that has none (where the uber shader compiles from WGSL here) and taken once it's made. Meanwhile, and
-    /// where it can't be made, a middle draws with the uber shader, which works out the same fill there (`i.whole`).
+    /// The pipelines shapes' middles draw with (`middle_wgsl`) for the renderer's format, made on a thread the first
+    /// frame that has none (where the uber shader compiles from WGSL here) and taken once they're made. Meanwhile,
+    /// and where one can't be made, a middle draws with the uber shader, which works out the same there (`i.whole`).
     pub(super) fn solid_for_format(&mut self, device: &wgpu::Device) {
         if self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
         if let Some((format, done)) = &self.solid_building {
@@ -601,7 +606,7 @@ impl Renderer {
                     self.solid_building = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.solid = Some((*format, None));
+                    self.solid = Some((*format, Vec::new()));
                     self.solid_building = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -609,14 +614,20 @@ impl Renderer {
             if self.solid_building.is_some() || self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
         }
         // Asked for once per format: where it can't be made, or isn't made from WGSL, the uber shader draws middles.
-        let Some(wgsl) = solid_wgsl().filter(|_| matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs") else {
-            self.solid = Some((self.format, None));
+        if !matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) || self.vertex_entry != "vs" {
+            self.solid = Some((self.format, Vec::new()));
             return;
-        };
+        }
         let (sent, done) = std::sync::mpsc::channel();
         let (made_on, layout, format) = (device.clone(), self.layout.clone(), self.format);
-        let spawned = std::thread::Builder::new().name("rune-solid-pipeline".into()).spawn(move || {
-            let made = compile(&made_on, &wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p);
+        let spawned = std::thread::Builder::new().name("rune-middle-pipelines".into()).spawn(move || {
+            // For the window's format, then for its layers' (`layers::FORMAT`), where a fading page draws.
+            let made: Vec<_> = MIDDLE_KINDS.iter().map(|&kind| {
+                let wgsl = middle_wgsl(kind)?;
+                compile(&made_on, &wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok()
+            }).collect();
+            let layer = made.iter().map(|m| m.as_ref().map(|(shader, _)| Renderer::pipeline(&made_on, &layout, shader, super::layers::FORMAT, "vs", Blend::SourceOver))).collect::<Vec<_>>();
+            let made = made.into_iter().map(|m| m.map(|(_, p)| p)).chain(layer).collect::<Vec<_>>();
             sent.send(made).ok();
         });
         if spawned.is_ok() {
