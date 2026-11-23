@@ -140,6 +140,7 @@ impl Renderer {
             pinned: None,
             pinned_extra: Vec::new(),
             pinned_building: None,
+            reordered: Vec::new(),
             kinds: Vec::new(),
             quad_mode: Vec::new(),
             together: Vec::new(),

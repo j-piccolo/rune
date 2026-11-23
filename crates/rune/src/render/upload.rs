@@ -13,6 +13,16 @@ use rune_staging::Staging;
 
 use super::*;
 
+/// Reusable scratch buffers for `wave_batch`, avoiding 5 heap allocations per frame.
+#[derive(Default)]
+struct WaveScratch {
+    split_rects: Vec<Instance>,
+    whole_rects: Vec<Instance>,
+    whole_bbs: Vec<(u64, [f32; 4])>,
+    glyphs: Vec<Instance>,
+    glyph_bbs: Vec<(u64, [f32; 4])>,
+}
+
 /// Upload state: the staging, and what the instance and globals buffers hold.
 pub(super) struct Uploads {
     /// Made on the first upload, which brings the queue.
@@ -22,6 +32,8 @@ pub(super) struct Uploads {
     frame_writes: Option<Staging>,
     /// The instance buffer's contents, so a frame writes only the span that changed.
     instances: Vec<Instance>,
+    /// Reusable scratch for `wave_batch`.
+    wave: WaveScratch,
     /// Whether `image_batches`, `effects` and `has_layers` were made from `instances`: false
     /// once the list's length or an instance's `params` change, which can move a batch.
     batched: bool,
@@ -48,7 +60,7 @@ pub(super) struct Uploads {
 
 impl Default for Uploads {
     fn default() -> Uploads {
-        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false,
+        Uploads { staging: None, frame_writes: None, instances: Vec::new(), wave: WaveScratch::default(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false,
             #[cfg(test)] globals_writes: 0, #[cfg(test)] batch_runs: 0 }
     }
 }
@@ -316,10 +328,20 @@ impl Renderer {
         if atlas_changed { self.images_changed(); }
         self.upload_outlines(device, &staging, atlas);
         self.fill_atlas(device, queue, &staging, atlas);
-        if self.instances.ensure(device, instances.len()) {
+        let can_reorder = self.springs.is_none()
+            && self.surfaces.as_ref().is_none_or(|s| s.is_empty())
+            && self.uploads.next.as_ref().is_none_or(|(_, p)| p.is_none())
+            && instances.len() >= 16;
+        let mut reordered_buf = std::mem::take(&mut self.reordered);
+        let did_reorder = can_reorder && wave_batch(instances, (self.under as usize).min(instances.len()), viewport, &mut self.uploads.wave, &mut reordered_buf);
+        let drawn: &[Instance] = if did_reorder { &reordered_buf } else { instances };
+        if did_reorder {
+            self.uploads.next = None;
+        }
+        if self.instances.ensure(device, drawn.len()) {
             self.uploads.forget_instances();
         }
-        self.write_instances(&staging, instances);
+        self.write_instances(&staging, drawn);
         // Geometry uploads must preserve a presentation timestamp already latched this frame.
         if self.uploads.viewport.swap(pack(viewport), Ordering::Relaxed) != pack(viewport) {
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, viewport) as u64, bytemuck::cast_slice(&[viewport.0 as f32, viewport.1 as f32]));
@@ -331,14 +353,14 @@ impl Renderer {
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, flags) as u64, bytemuck::cast_slice(&flags));
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }
-        self.count = instances.len() as u32;
+        self.count = drawn.len() as u32;
         // GPU springs move instances in the vertex stage, off the pixels `Cleared` checks.
-        self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(instances, viewport) };
+        self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(drawn, viewport) };
         if !self.uploads.batched {
-            self.batch(instances);
+            self.batch(drawn);
         } else {
             // Same batches: only the effects' copies of their instances can be out of date.
-            for (at, effect) in &mut self.effects { *effect = instances[*at as usize]; }
+            for (at, effect) in &mut self.effects { *effect = drawn[*at as usize]; }
         }
         self.solid_for_format(device);
         let has_layers = self.uploads.has_layers;
@@ -347,7 +369,8 @@ impl Renderer {
         let layers_kept = self.uploads.patched && self.cycle_leaves_layers();
         #[cfg(target_os = "macos")]
         let layers_kept = false;
-        if !layers_kept { self.prepare_layers(device, queue, if has_layers { instances } else { &[] }, viewport); }
+        if !layers_kept { self.prepare_layers(device, queue, if has_layers { drawn } else { &[] }, viewport); }
+        self.reordered = reordered_buf;
         self.sync_resident_caches(&mut atlas.resident_caches);
         self.backdrop_used = self.effects.iter().any(|(_, i)| i.params[0] != 0.0 || i.kind() == Some(Kind::BackdropBlur));
         if self.backdrop_used {
@@ -600,6 +623,109 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests;
+
+/// Paint-order-preserving 3-bucket wave batching: within each flat run of rects and unrotated page-0
+/// glyphs (between layers, effects, images, gradients, or shadows), groups split rects, then whole
+/// rects, then non-overlapping glyphs so grids and lists (e.g. 35 calendar cells + pills/dots + labels)
+/// draw in ~3 batched draws instead of alternating per-cell pipeline switches.
+fn wave_batch(instances: &[Instance], under: usize, viewport: (u32, u32), w: &mut WaveScratch, out: &mut Vec<Instance>) -> bool {
+    out.clear();
+    out.reserve(instances.len());
+    out.extend_from_slice(&instances[..under]);
+    let inv_w = 8.0 / (viewport.0.max(1) as f32);
+    let inv_h = 8.0 / (viewport.1.max(1) as f32);
+    let tile_mask = |bb: [f32; 4]| -> u64 {
+        if bb[2] <= bb[0] || bb[3] <= bb[1] { return 0; }
+        let cx0 = (bb[0] * inv_w).floor().clamp(0.0, 7.0) as u32;
+        let cx1 = (bb[2] * inv_w).floor().clamp(0.0, 7.0) as u32;
+        let cy0 = (bb[1] * inv_h).floor().clamp(0.0, 7.0) as u32;
+        let cy1 = (bb[3] * inv_h).floor().clamp(0.0, 7.0) as u32;
+        let row = ((1u64 << (cx1 - cx0 + 1)) - 1) << cx0;
+        let mut m = 0u64;
+        for r in cy0..=cy1 { m |= row << (r * 8); }
+        m
+    };
+    let hits_any = |m: u64, bb: [f32; 4], occ: u64, bbs: &[(u64, [f32; 4])]| -> bool {
+        (m & occ) != 0 && bbs.iter().any(|&(om, obb)| {
+            (om & m) != 0 && bb[0] < obb[2] && obb[0] < bb[2] && bb[1] < obb[3] && obb[1] < bb[3]
+        })
+    };
+    w.split_rects.clear();
+    w.whole_rects.clear();
+    w.whole_bbs.clear();
+    let mut whole_occ = 0u64;
+    w.glyphs.clear();
+    w.glyph_bbs.clear();
+    let mut glyph_occ = 0u64;
+    let mut moved = false;
+    let flush = |out: &mut Vec<Instance>, w: &mut WaveScratch, whole_occ: &mut u64, glyph_occ: &mut u64| {
+        out.extend_from_slice(&w.split_rects);
+        out.extend_from_slice(&w.whole_rects);
+        out.extend_from_slice(&w.glyphs);
+        w.split_rects.clear();
+        w.whole_rects.clear();
+        w.whole_bbs.clear();
+        *whole_occ = 0;
+        w.glyphs.clear();
+        w.glyph_bbs.clear();
+        *glyph_occ = 0;
+    };
+    for &inst in &instances[under..] {
+        match inst.kind() {
+            Some(Kind::Rect) => {
+                let is_split = super::classify_quad(&inst).is_split();
+                let g = 1.5 + inst.params[2].max(0.0) * 2.0;
+                let bb = [
+                    (inst.rect[0] - g).max(inst.clip[0] - 1.0),
+                    (inst.rect[1] - g).max(inst.clip[1] - 1.0),
+                    (inst.rect[0] + inst.rect[2] + g).min(inst.clip[2] + 1.0),
+                    (inst.rect[1] + inst.rect[3] + g).min(inst.clip[3] + 1.0),
+                ];
+                if is_split {
+                    if !w.whole_rects.is_empty() || !w.glyphs.is_empty() {
+                        let m = tile_mask(bb);
+                        if hits_any(m, bb, whole_occ, &w.whole_bbs) || hits_any(m, bb, glyph_occ, &w.glyph_bbs) {
+                            flush(out, w, &mut whole_occ, &mut glyph_occ);
+                        } else {
+                            moved = true;
+                        }
+                    }
+                    w.split_rects.push(inst);
+                } else {
+                    let m = tile_mask(bb);
+                    if !w.glyphs.is_empty() {
+                        if hits_any(m, bb, glyph_occ, &w.glyph_bbs) {
+                            flush(out, w, &mut whole_occ, &mut glyph_occ);
+                        } else {
+                            moved = true;
+                        }
+                    }
+                    whole_occ |= m;
+                    w.whole_bbs.push((m, bb));
+                    w.whole_rects.push(inst);
+                }
+            }
+            Some(Kind::Glyph) if inst.params[0] == 0.0 && inst.params[2] == 0.0 => {
+                let bb = [
+                    inst.rect[0].max(inst.clip[0] - 1.0),
+                    inst.rect[1].max(inst.clip[1] - 1.0),
+                    (inst.rect[0] + inst.rect[2]).min(inst.clip[2] + 1.0),
+                    (inst.rect[1] + inst.rect[3]).min(inst.clip[3] + 1.0),
+                ];
+                let m = tile_mask(bb);
+                glyph_occ |= m;
+                w.glyph_bbs.push((m, bb));
+                w.glyphs.push(inst);
+            }
+            _ => {
+                flush(out, w, &mut whole_occ, &mut glyph_occ);
+                out.push(inst);
+            }
+        }
+    }
+    flush(out, w, &mut whole_occ, &mut glyph_occ);
+    moved
+}
 
 /// Whether each split instance can draw with the one before it, middles then bands (`Renderer::draw_quads`): it is
 /// split, of the same kind, and its quad, soft edge and all, overlaps none in its group (at most `GROUP` long).
