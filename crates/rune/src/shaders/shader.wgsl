@@ -121,11 +121,11 @@ fn erf2(x: vec2<f32>) -> vec2<f32> {
     return s - s / (r * r);
 }
 
-fn shadow_x(x: f32, y: f32, sigma: f32, radii: vec4<f32>, half: vec2<f32>) -> f32 {
+fn shadow_x(x: f32, y: f32, inv_sigma_sqrt2: f32, radii: vec4<f32>, half: vec2<f32>) -> f32 {
     let corner = select(radii.xy, radii.wz, y > 0.0);
     let delta = min(vec2<f32>(half.y) - corner - vec2<f32>(abs(y)), vec2<f32>(0.0));
     let curved = vec2<f32>(half.x) - corner + sqrt(max(vec2<f32>(0.0), corner * corner - delta * delta));
-    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved.y, curved.x)) * (sqrt(0.5) / sigma));
+    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved.y, curved.x)) * inv_sigma_sqrt2);
     return integral.y - integral.x;
 }
 
@@ -145,13 +145,17 @@ fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, radii: vec4<f32>) -> f32 {
     let start = clamp(-3.0 * sigma, lo, hi);
     let end = clamp(3.0 * sigma, lo, hi);
     let step = (end - start) / 4.0;
+    if (step <= 0.0) { return 0.0; }
+    let inv_sigma_sqrt2 = 0.70710678 / sigma;
+    let inv_two_sigma2 = 0.5 / (sigma * sigma);
+    let norm = step / (2.50662827 * sigma);
     var y = start + step * 0.5;
     var v = 0.0;
     for (var i = 0; i < 4; i = i + 1) {
-        v = v + shadow_x(p.x, p.y - y, sigma, radii, half) * gaussian(y, sigma) * step;
+        v = v + shadow_x(p.x, p.y - y, inv_sigma_sqrt2, radii, half) * exp(-(y * y) * inv_two_sigma2);
         y = y + step;
     }
-    return v;
+    return v * norm;
 }
 
 // Coverage of a stroke segment from a to b, `hw` half width, round or butt caps. Strokes
@@ -463,8 +467,6 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             // Radial (`uv.z > 0`) or angled linear (`uv.z == 0`) gradient stop segment from
             // `fill` at t0 (`params.x`) to `border` at t1 (`params.w`); `+ 2.0` marks an open
             // interior stop boundary so adjacent segments partition the quad without overlap.
-            let soft = max(i.params.z, 0.5);
-            let cov = clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
             let t0_raw = i.params.x;
             let t1_raw = i.params.w;
             let lower_open = t0_raw >= 1.5;
@@ -478,11 +480,12 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
                 t = 0.5 + dot(screen - center, i.uv.xy);
             }
             if ((lower_open && t < t0) || (upper_open && t >= t1)) {
-                col = vec4<f32>(0.0);
-            } else {
-                let u = select(clamp((t - t0) / (t1 - t0), 0.0, 1.0), select(0.0, 1.0, t >= t0), t1 <= t0 + 1e-6);
-                col = mix(i.fill, i.border, u) * cov;
+                return vec4<f32>(0.0);
             }
+            let soft = max(i.params.z, 0.5);
+            let cov = clamp(0.5 - d / (soft * 2.0), 0.0, 1.0);
+            let u = select(clamp((t - t0) / (t1 - t0), 0.0, 1.0), select(0.0, 1.0, t >= t0), t1 <= t0 + 1e-6);
+            col = mix(i.fill, i.border, u) * cov;
         } else if (kind > 9.5) {
             // Dashed border: kind 0's ring, colour running from `fill` (top) to `border`
             // (bottom), masked by the dash pattern in `uv.xyz` along the ring's centre line.
@@ -560,6 +563,10 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             // ties to even, so the target stores it exactly. A GPU's own float-to-unorm rounding
             // differs between vendors; this is the rounding the CPU's fill uses (fill_texel).
             col = vec4<f32>(round(cov * 255.0) / 255.0);
+        } else if (cov <= 0.0) {
+            return vec4<f32>(0.0);
+        } else if (i.params.w == 1.0) {
+            col = i.fill * cov;
         } else {
             col = i.fill * pow(cov, i.params.w);
         }

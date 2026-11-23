@@ -51,6 +51,20 @@ pub(super) struct Retained {
     current: bool,
 }
 
+/// The rendered base scene (`0..split`) underneath a top-level fading/moving isolated layer, so
+/// consecutive frames of an overlay fade composite the layer over the unchanged base instead of
+/// re-shading the entire window underneath on every frame.
+pub(super) struct Underlay {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    clear: [f32; 4],
+    texels: u64,
+    images: u64,
+    prefix: Vec<Instance>,
+    valid: bool,
+}
+
 /// A viewport (`band`, `[x, y, width, height]`) whose pixels the kept frame holds rolled: the
 /// window's pixel (x, y) there is kept at `band.xy + ((x, y) - band.xy + off) mod band.wh`. A scroll
 /// then moves nothing in the kept frame: it changes `off`, and what scrolls in is drawn where what
@@ -149,6 +163,8 @@ fn extent(width: u32, height: u32) -> wgpu::Extent3d { wgpu::Extent3d { width, h
 #[derive(Default)]
 pub(super) struct DamageState {
     retained: Option<Retained>,
+    underlay: Option<Underlay>,
+    underlay_split: Option<(u32, bool)>,
     armed: Vec<[u32; 4]>,
     /// For each armed rectangle, the instances whose quads reach it (`arm_cycle`), when only
     /// those are drawn there; empty: every instance is.
@@ -356,6 +372,70 @@ impl Renderer {
         self.damage.lock().unwrap().behind = true;
     }
 
+    /// Called at the end of `prepare()` once `layers.plan` and `uploads.instances` are current:
+    /// if this frame is armed to draw whole (`behind`) and has a top-level isolated layer, splits
+    /// `0..split` into a reusable `Underlay` texture so consecutive frames of an overlay fade
+    /// composite over the unchanged base instead of re-shading the whole window underneath.
+    pub(super) fn prepare_underlay(&mut self, device: &wgpu::Device) {
+        let mut d = self.damage.lock().unwrap();
+        if !d.behind {
+            d.underlay_split = None;
+            return;
+        }
+        let split = self.layers.first_top_layer_begin().filter(|&s| s > 0 && (s as usize) <= self.uploads.instances.len());
+        let Some(split) = split else {
+            d.underlay_split = None;
+            return;
+        };
+        if self.redraws_in_place().is_err() {
+            d.underlay_split = None;
+            return;
+        }
+        let Some(kept) = &d.retained else {
+            d.underlay_split = None;
+            return;
+        };
+        let size = (kept.texture.width(), kept.texture.height());
+        let format = self.format;
+        let clear = d.clear;
+        let prefix = &self.uploads.instances[..split as usize];
+        let texels = self.layers.texels;
+        let images = self.layers.image_generation;
+        let reuse = d.underlay.as_ref().is_some_and(|u| {
+            u.texture.width() == size.0 && u.texture.height() == size.1 && u.format == format
+        });
+        if !reuse {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("underlay frame"),
+                size: extent(size.0, size.1),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            d.underlay = Some(Underlay { texture, view, format, clear, texels, images, prefix: Vec::new(), valid: false });
+        }
+        let u = d.underlay.as_mut().unwrap();
+        let hit = u.valid
+            && u.clear == clear
+            && u.texels == texels
+            && u.images == images
+            && u.prefix.len() == prefix.len()
+            && bytemuck::cast_slice::<Instance, u8>(&u.prefix) == bytemuck::cast_slice::<Instance, u8>(prefix);
+        if !hit {
+            u.prefix.clear();
+            u.prefix.extend_from_slice(prefix);
+            u.clear = clear;
+            u.texels = texels;
+            u.images = images;
+            u.valid = true;
+        }
+        d.underlay_split = Some((split, hit));
+    }
+
     /// After `arm_damage` or `arm_whole`: the texture the next `draw` draws into still holds what
     /// this renderer drew into it last frame, and nothing has drawn there since. The frame is then
     /// drawn on it as it stands, with no copy from the kept frame. For a target whose pixels last
@@ -394,6 +474,7 @@ impl Renderer {
         d.target_kept = false;
         d.target_age = 0;
         d.looped = false;
+        d.underlay_split = None;
         let redrew = d.redrew.take();
         if d.history.len() == HISTORY { d.history.pop_front(); }
         d.history.push_back(redrew);
@@ -481,7 +562,36 @@ impl Renderer {
             // The target holds the last frame: this one is drawn on it, and nothing is copied out.
             if behind || !d.target_drawn {
                 // All of it, or a target whose last frame was drawn another way.
-                self.draw_timed(encoder, view, clear, None);
+                if let (Some((split, hit)), Some(u)) = (d.underlay_split.take(), d.underlay.as_ref()) {
+                    uploads(encoder);
+                    let bg = wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 };
+                    if !hit {
+                        let start = self.cleared_start(wgpu::LoadOp::Clear(bg)).min(split);
+                        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("frame (underlay)"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &u.view, depth_slice: None, resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg), store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        }).forget_lifetime();
+                        let mut active = ActivePass::owned(pass, encoder, &u.view);
+                        self.draw_layer_range(&mut active, self.format, start..split, None, &mut |_, _| {});
+                    }
+                    copy(encoder, &u.texture, [0, 0], dst, [0, 0], size);
+                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("frame (overlay)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view, depth_slice: None, resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                    }).forget_lifetime();
+                    let mut active = ActivePass::owned(pass, encoder, view);
+                    self.draw_layer_range(&mut active, self.format, split..self.count, None, &mut |_, _| {});
+                } else {
+                    self.draw_timed(encoder, view, clear, None);
+                }
                 kept.current = false;
                 d.lag.clear();
                 d.roll = None;
@@ -595,7 +705,36 @@ impl Renderer {
             }
         } else {
             // Behind: this frame draws whole, into the kept frame.
-            self.draw_timed(encoder, &kept.view, clear, None);
+            if let (Some((split, hit)), Some(u)) = (d.underlay_split.take(), d.underlay.as_ref()) {
+                uploads(encoder);
+                let bg = wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 };
+                if !hit {
+                    let start = self.cleared_start(wgpu::LoadOp::Clear(bg)).min(split);
+                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("frame (underlay)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &u.view, depth_slice: None, resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                    }).forget_lifetime();
+                    let mut active = ActivePass::owned(pass, encoder, &u.view);
+                    self.draw_layer_range(&mut active, self.format, start..split, None, &mut |_, _| {});
+                }
+                copy(encoder, &u.texture, [0, 0], &kept.texture, [0, 0], size);
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("frame (overlay)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &kept.view, depth_slice: None, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                }).forget_lifetime();
+                let mut active = ActivePass::owned(pass, encoder, &kept.view);
+                self.draw_layer_range(&mut active, self.format, split..self.count, None, &mut |_, _| {});
+            } else {
+                self.draw_timed(encoder, &kept.view, clear, None);
+            }
             kept.current = true;
             d.roll = None;
         }

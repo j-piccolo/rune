@@ -11,6 +11,7 @@ mod damaged;
 mod device;
 mod dxbc;
 mod effect_warm;
+mod fast;
 mod fill;
 mod first_use;
 mod gpu_loss;
@@ -148,7 +149,7 @@ pub use warmup::warm_gpu_with;
 
 /// Rows the first glyph atlas page's texture starts with: a window that shows a few labels holds
 /// 512 KiB of it, not 4 MiB. It doubles as its shelves fill, up to `ATLAS_SIZE` (`prepare`).
-pub(crate) const ATLAS_START_ROWS: u32 = 256;
+pub(crate) const ATLAS_START_ROWS: u32 = 1024;
 
 /// `RUNE_LOOP_CHECK=2` found a picture that differed from the whole frame's (`pixel_check`), so the
 /// process's exit code is 3. Never on macOS and Linux, which have no loop-only frames.
@@ -323,6 +324,16 @@ pub struct Renderer {
     pinned_building: Option<(wgpu::TextureFormat, std::sync::mpsc::Receiver<Vec<Option<wgpu::RenderPipeline>>>)>,
     /// Each instance's kind (`params[1]`), as batched: where a run of one kind starts and ends.
     kinds: Vec<Option<Kind>>,
+    /// Each instance's fast-path classification, as batched (`fast.rs`).
+    fast_kinds: Vec<fast::FastKind>,
+    /// Fast-path pipelines per target format (`fast.rs`).
+    fast: Vec<(wgpu::TextureFormat, fast::FastPipelines)>,
+    /// Uniform buffer & bind group for fused multi-stop radial + vignette stacks (`fast.rs`).
+    fused_res: Option<fast::FusedGradResources>,
+    /// Detected fused gradient span + payload for the current frame (`fast.rs`).
+    fused_grad: Option<(std::ops::Range<u32>, fast::FusedGradUniform)>,
+    /// Instance skipped during a dominant-rect clear-swap pass (`cleared.rs`).
+    skip_instance: std::cell::Cell<Option<u32>>,
     lcd_frame: bool,
     /// The window's wake, for work a frame starts on another thread (set_frame_wake).
     frame_wake: Option<std::sync::Arc<crate::live::Wake>>,
@@ -608,6 +619,129 @@ impl Renderer {
             };
             pass.set_bind_group(0, bind, &[]);
             let span = batch.start.max(range.start)..batch.end.min(range.end);
+            // Fast-path pipelines (fast.rs): tiny specialized shaders (and unblended opaque draws)
+            // sharing `@group(0)`. Used whenever the frame pass is SourceOver without GPU springs
+            // or dual-source LCD blending.
+            let fast_pipes = if self.springs.is_none()
+                && self.layer_blend(target) == Blend::SourceOver
+                && (target.is_some() || !self.lcd_frame)
+            {
+                self.fast.iter().find(|(f, _)| *f == format).map(|(_, p)| p)
+            } else {
+                None
+            };
+            let skip_idx = if target.is_none() { self.skip_instance.get() } else { None };
+            if let Some(fp) = fast_pipes {
+                let mut at = span.start as usize;
+                let end = span.end as usize;
+                let fk = &self.fast_kinds[..end.min(self.fast_kinds.len())];
+                let mut general_start: Option<usize> = None;
+                while at < end {
+                    if skip_idx == Some(at as u32) {
+                        if let Some(s) = general_start.take() {
+                            if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
+                            pass.draw(0..4, s as u32..at as u32);
+                        }
+                        at += 1;
+                        continue;
+                    }
+                    if let (Some((fg_span, _)), Some(res)) = (&self.fused_grad, &self.fused_res)
+                        && fg_span.start as usize == at
+                        && fg_span.end as usize <= end
+                    {
+                        if let Some(s) = general_start.take() {
+                            if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
+                            pass.draw(0..4, s as u32..at as u32);
+                        }
+                        let p = &fp.fused_grad;
+                        if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                        pass.set_bind_group(1, &res.bind_group, &[]);
+                        pass.draw(0..4, 0..1);
+                        at = fg_span.end as usize;
+                        continue;
+                    }
+                    let kind = fk.get(at).copied().unwrap_or(fast::FastKind::General);
+                    let mut cur = at + 1;
+                    while fk.get(cur).copied() == Some(kind) && cur < end && skip_idx != Some(cur as u32) { cur += 1; }
+                    if matches!(kind, fast::FastKind::General) {
+                        general_start.get_or_insert(at);
+                        at = cur;
+                        continue;
+                    }
+                    if let Some(s) = general_start.take() {
+                        if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
+                        pass.draw(0..4, s as u32..at as u32);
+                    }
+                    let run = at as u32..cur as u32;
+                    match kind {
+                        fast::FastKind::OpaqueRoundedRect => {
+                            let p_in = &fp.opaque_rect_interior;
+                            if !std::ptr::eq(p_in, bound) { pass.set_pipeline(p_in); }
+                            pass.draw(0..4, run.clone());
+                            let p_ring = &fp.rounded_rect_ring;
+                            pass.set_pipeline(p_ring);
+                            bound = p_ring;
+                            pass.draw(0..24, run);
+                        }
+                        fast::FastKind::OpaqueRoundedLinear => {
+                            let p_in = &fp.opaque_linear_interior;
+                            if !std::ptr::eq(p_in, bound) { pass.set_pipeline(p_in); }
+                            pass.draw(0..4, run.clone());
+                            let p_ring = &fp.rounded_linear_ring;
+                            pass.set_pipeline(p_ring);
+                            bound = p_ring;
+                            pass.draw(0..24, run);
+                        }
+                        fast::FastKind::OpaqueRect => {
+                            let p = &fp.opaque_rect;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::OpaqueLinear => {
+                            let p = &fp.opaque_linear;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::RoundedLinear => {
+                            let p = &fp.rounded_linear;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::OpaqueRadial => {
+                            let p = &fp.opaque_radial;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::LinearBand => {
+                            let p = &fp.linear_band;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::Shadow => {
+                            let p = &fp.shadow;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::OpaqueImage => {
+                            let p = &fp.opaque_image;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::OpaqueImageBilinear => {
+                            let p = &fp.opaque_image_bilinear;
+                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            pass.draw(0..4, run);
+                        }
+                        fast::FastKind::General => unreachable!(),
+                    }
+                    at = cur;
+                }
+                if let Some(s) = general_start.take() {
+                    if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
+                    pass.draw(0..4, s as u32..end as u32);
+                }
+                continue;
+            }
             // A span whose kinds alternate (a chip behind each token, a terminal's cell backgrounds between its
             // glyphs) draws in one call with the general shader: a draw and a pipeline switch per run cost more
             // than the smaller shader saves.
@@ -686,7 +820,16 @@ impl Renderer {
             t
         });
         let blurs = self.has_backdrop_blur();
-        let start = self.cleared_start(load);
+        let (load, start, skip) = match (load, self.cleared.swap) {
+            (wgpu::LoadOp::Clear(c), Some((idx, c2)))
+                if [c.r, c.g, c.b, c.a] == self.cleared.color.map(f64::from)
+                    && self.surfaces.as_ref().is_none_or(|s| (0..s.len()).all(|i| s.before_instance(i) > idx)) =>
+            {
+                (wgpu::LoadOp::Clear(wgpu::Color { r: c2[0] as f64, g: c2[1] as f64, b: c2[2] as f64, a: c2[3] as f64 }), 1, Some(idx))
+            }
+            _ => (load, self.cleared_start(load), None),
+        };
+        self.skip_instance.set(skip);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -702,12 +845,14 @@ impl Renderer {
         });
         if !blurs {
             self.draw_range(&mut pass, self.format, start..self.count);
+            self.skip_instance.set(None);
             return;
         }
         // Backdrop blurs split the frame pass, which needs it owned along with the encoder.
         let pass = pass.forget_lifetime();
         let mut active = ActivePass::owned_timed(pass, encoder, view, timestamps);
         self.draw_layer_range(&mut active, self.format, start..self.count, None, &mut |_, _| {});
+        self.skip_instance.set(None);
     }
 }
 

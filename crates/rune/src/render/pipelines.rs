@@ -121,6 +121,22 @@ impl Renderer {
         );
         let spring_instances = properties.map_or(0, |(_, ids)| ids.len());
         let springs = properties.map(|(nodes, ids)| crate::gpu::springs::Bindings::new(device, spring_layout.as_ref().unwrap(), nodes, ids));
+        let mut fast = Vec::new();
+        let mut fused_res = None;
+        let mut extra = Vec::new();
+        let mut layers = super::layers::Layers::default();
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+        if properties.is_none() {
+            let res = super::fast::FusedGradResources::new(device);
+            fast.push((format, super::fast::FastPipelines::new(device, &layout, &bgl, &res.layout, format)));
+            layers.pipelines.push((format, super::fast::layer_composite_pipeline(device, &layout, format, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)));
+            if super::layers::FORMAT != format {
+                fast.push((super::layers::FORMAT, super::fast::FastPipelines::new(device, &layout, &bgl, &res.layout, super::layers::FORMAT)));
+                extra.push((super::layers::FORMAT, Self::pipeline(device, &layout, &shader, super::layers::FORMAT, vertex_entry, Blend::SourceOver)));
+                layers.pipelines.push((super::layers::FORMAT, super::fast::layer_composite_pipeline(device, &layout, super::layers::FORMAT, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)));
+            }
+            fused_res = Some(res);
+        }
         Ok(WarmRenderer {
             effect_warm: Default::default(),
             first_frame_submitted: std::sync::atomic::AtomicBool::new(false),
@@ -130,7 +146,7 @@ impl Renderer {
             shader,
             layout,
             vertex_entry,
-            extra: Vec::new(),
+            extra,
             bind_group,
             bind_layout: bgl,
             globals,
@@ -141,6 +157,9 @@ impl Renderer {
             pinned_extra: Vec::new(),
             pinned_building: None,
             kinds: Vec::new(),
+            fast_kinds: Vec::new(),
+            fast,
+            fused_res,
             lcd_frame: false,
             frame_wake: None,
             stand_in,
@@ -151,7 +170,7 @@ impl Renderer {
             count: 0,
             springs,
             spring_instances,
-            layers: Default::default(),
+            layers,
             srgb_blend: false,
             effects: Vec::new(),
             backdrops: Vec::new(),
@@ -213,7 +232,16 @@ impl Renderer {
     }
 
     pub(super) fn image_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-        Self::texture(device, "image atlas", wgpu::TextureFormat::Rgba8UnormSrgb, width, height)
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image atlas"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        })
     }
 
     /// A sampled texture the CPU fills with `write_rows`.
@@ -239,8 +267,30 @@ impl Renderer {
         images: &wgpu::Texture,
         target: Option<&wgpu::Buffer>,
     ) -> wgpu::BindGroup {
+        Self::bind_group_images(device, layout, globals, outlines, atlas, images, target, false)
+    }
+
+    /// Like [`bind_group`], optionally viewing an `Rgba8UnormSrgb` image atlas as `Rgba8Unorm`
+    /// so sRGB-blending frames read raw sRGB bytes directly without decoding and re-encoding.
+    pub(super) fn bind_group_images(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        globals: &wgpu::Buffer,
+        outlines: Option<&wgpu::Texture>,
+        atlas: &wgpu::Texture,
+        images: &wgpu::Texture,
+        target: Option<&wgpu::Buffer>,
+        raw_srgb_images: bool,
+    ) -> wgpu::BindGroup {
         let atlas_view = atlas.create_view(&Default::default());
-        let image_view = images.create_view(&Default::default());
+        let image_view = if raw_srgb_images && images.format() == wgpu::TextureFormat::Rgba8UnormSrgb {
+            images.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                ..Default::default()
+            })
+        } else {
+            images.create_view(&Default::default())
+        };
         let outline_view = outlines.map(|t| t.create_view(&Default::default()));
         let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
@@ -279,6 +329,10 @@ impl Renderer {
         if format != self.format && !self.extra.iter().any(|(f, _)| *f == format) {
             let p = Self::pipeline(device, &self.layout, &self.shader, format, self.vertex_entry, Blend::SourceOver);
             self.extra.push((format, p));
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+        if self.springs.is_none() && let Some(res) = &self.fused_res && !self.fast.iter().any(|(f, _)| *f == format) {
+            self.fast.push((format, super::fast::FastPipelines::new(device, &self.layout, &self.bind_layout, &res.layout, format)));
         }
         if self.layer_stats().targets > 0 { self.add_layer_format(device, format); }
         let [vw, vh] = self.target_frame(None).1;
@@ -332,7 +386,15 @@ impl Renderer {
             Some(i) => self.pinned = Some(self.pinned_extra.swap_remove(i).1),
             None => self.start_pinned(device),
         }
+        let was_srgb = self.srgb_blend;
         self.srgb_blend = !format.is_srgb();
+        if self.srgb_blend != was_srgb {
+            self.rebind_image_pages(device);
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+        if self.springs.is_none() && let Some(res) = &self.fused_res && !self.fast.iter().any(|(f, _)| *f == format) {
+            self.fast.push((format, super::fast::FastPipelines::new(device, &self.layout, &self.bind_layout, &res.layout, format)));
+        }
         if self.layer_stats().targets > 0 { self.add_layer_format(device, format); }
         let [vw, vh] = self.target_frame(None).1;
         if !self.backdrops.is_empty() && vw > 0 && vh > 0 {
@@ -362,5 +424,17 @@ impl Renderer {
             return Some(reason);
         }
         self.uber_check.failed_reason().map(str::to_owned)
+    }
+
+    /// Rebinds image atlas pages to match `self.srgb_blend` (viewing `Rgba8UnormSrgb` pages as
+    /// `Rgba8Unorm` in sRGB-blending frames to avoid per-texel sRGB decode+encode).
+    pub(super) fn rebind_image_pages(&mut self, device: &wgpu::Device) {
+        let raw = self.srgb_blend;
+        for slot in &mut self.images {
+            if let Some((texture, bind)) = slot {
+                *bind = Self::bind_group_images(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, texture, None, raw);
+            }
+        }
+        self.images_changed();
     }
 }

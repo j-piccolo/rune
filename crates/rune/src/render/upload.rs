@@ -21,7 +21,7 @@ pub(super) struct Uploads {
     /// sealed when it's submitted. Apart from `staging`, whose `submit` would seal them early.
     frame_writes: Option<Staging>,
     /// The instance buffer's contents, so a frame writes only the span that changed.
-    instances: Vec<Instance>,
+    pub(super) instances: Vec<Instance>,
     /// Whether `image_batches`, `effects` and `has_layers` were made from `instances`: false
     /// once the list's length or an instance's `params` change, which can move a batch.
     batched: bool,
@@ -40,6 +40,8 @@ pub(super) struct Uploads {
     held_paint: Option<u64>,
     /// The last `prepare` wrote only a loop-only frame's slots.
     patched: bool,
+    /// Whether `fast::warm_draw` has run once to pre-compile fast-path fragment shaders.
+    fast_warmed: bool,
     #[cfg(test)]
     pub(super) globals_writes: u64,
     #[cfg(test)]
@@ -48,7 +50,7 @@ pub(super) struct Uploads {
 
 impl Default for Uploads {
     fn default() -> Uploads {
-        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false,
+        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false, fast_warmed: false,
             #[cfg(test)] globals_writes: 0, #[cfg(test)] batch_runs: 0 }
     }
 }
@@ -168,7 +170,7 @@ impl Renderer {
             }
             if self.images[index].as_ref().is_none_or(|(t, _)| t.width() != page.width || t.height() != page.height) {
                 let texture = Self::image_texture(device, page.width, page.height);
-                let bind = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None);
+                let bind = Self::bind_group_images(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None, self.srgb_blend);
                 self.images[index] = Some((texture, bind));
                 changed = true;
                 page.dirty = Some((0, page.height));
@@ -316,6 +318,13 @@ impl Renderer {
         if atlas_changed { self.images_changed(); }
         self.upload_outlines(device, &staging, atlas);
         self.fill_atlas(device, queue, &staging, atlas);
+        let inlined;
+        let instances = if self.springs.is_none() && self.srgb_blend {
+            inlined = super::layers::inline_affine_layers(instances);
+            &inlined[..]
+        } else {
+            instances
+        };
         if self.instances.ensure(device, instances.len()) {
             self.uploads.forget_instances();
         }
@@ -325,17 +334,31 @@ impl Renderer {
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, viewport) as u64, bytemuck::cast_slice(&[viewport.0 as f32, viewport.1 as f32]));
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }
-        let mode = (self.srgb_blend, byte_source, [self.fade_stops[0].to_bits(), self.fade_stops[1].to_bits()]);
+        let mode = (false, byte_source, [self.fade_stops[0].to_bits(), self.fade_stops[1].to_bits()]);
         if self.uploads.srgb.replace(mode) != Some(mode) {
-            let flags: [f32; 4] = [self.srgb_blend as u8 as f32, byte_source as u8 as f32, self.fade_stops[0], self.fade_stops[1]];
+            // `Rgba8UnormSrgb` image pages are viewed as `Rgba8Unorm` when `self.srgb_blend` is
+            // true, so shaders read sRGB bytes directly and never need `srgb_encode` (`flags.x`).
+            let flags: [f32; 4] = [0.0, byte_source as u8 as f32, self.fade_stops[0], self.fade_stops[1]];
             staging.write_buffer(&self.globals, std::mem::offset_of!(Globals, flags) as u64, bytemuck::cast_slice(&flags));
             #[cfg(test)] { self.uploads.globals_writes += 1; }
         }
         self.count = instances.len() as u32;
+        if !self.uploads.fast_warmed && let Some(res) = &self.fused_res && !self.fast.is_empty() {
+            self.uploads.fast_warmed = true;
+            staging.submit();
+            for (fmt, fp) in &self.fast {
+                let layer_pipe = self.layers.pipelines.iter().find(|(f, _)| f == fmt).map(|(_, p)| p);
+                let extra_pipe = self.extra.iter().find(|(f, _)| f == fmt).map(|(_, p)| p);
+                super::fast::warm_draw(device, queue, &self.bind_group, &res.buffer, &res.bind_group, *fmt, fp, layer_pipe, extra_pipe);
+            }
+        }
         // GPU springs move instances in the vertex stage, off the pixels `Cleared` checks.
         self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(instances) };
         if !self.uploads.batched {
             self.batch(instances);
+            if let (Some((_, u)), Some(res)) = (&self.fused_grad, &self.fused_res) {
+                staging.write_buffer(&res.buffer, 0, bytemuck::bytes_of(u));
+            }
         } else {
             // Same batches: only the effects' copies of their instances can be out of date.
             for (at, effect) in &mut self.effects { *effect = instances[*at as usize]; }
@@ -354,14 +377,17 @@ impl Renderer {
             for index in 0..self.extra.len() {
                 self.ensure_backdrop(device, self.extra[index].0, viewport);
             }
+            let lfmt = self.layer_format();
             if self.layers.targets.iter().any(Option::is_some) {
-                self.ensure_backdrop(device, layers::FORMAT, viewport);
+                self.ensure_backdrop(device, lfmt, viewport);
             }
         }
         self.prepare_backdrop_blur(device, queue, viewport);
         if self.first_frame_submitted.load(Ordering::Acquire) {
             self.warm_effects(device);
         }
+        #[cfg(not(target_os = "macos"))]
+        self.prepare_underlay(device);
         #[cfg(all(feature = "alloc-sites", not(target_arch = "wasm32")))]
         self.report_pools();
     }
@@ -416,9 +442,10 @@ impl Renderer {
             for (format, _) in &self.extra { surfaces.add_format(device, *format); }
             self.surfaces = Some(surfaces);
         }
+        let lfmt = self.layer_format();
         if let Some(s) = &mut self.surfaces {
             s.set_srgb_blend(self.srgb_blend);
-            if self.layers.additive.is_some() { s.add_plus_lighter(device, layers::FORMAT); }
+            if self.layers.additive.is_some() { s.add_plus_lighter(device, lfmt); }
             s.prepare(device,queue,draws,viewport);
         }
         if self.layer_stats().targets > 0 { self.position_layer_surfaces(queue); }
@@ -456,6 +483,9 @@ impl Renderer {
         self.image_batches.clear();
         self.kinds.clear();
         self.kinds.extend(instances.iter().map(Instance::kind));
+        self.fast_kinds.clear();
+        self.fast_kinds.extend(instances.iter().map(super::fast::classify));
+        self.fused_grad = if self.fused_res.is_some() { super::fast::detect_fused_grad(instances, &self.fast_kinds) } else { None };
         let (mut start, mut bind) = (0, BatchBind::Image(0));
         let mut has_layers = false;
         self.effects.clear();
