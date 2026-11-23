@@ -1111,12 +1111,17 @@ pub(super) fn classify_quad(instance: &Instance) -> QuadMode {
                 let t0 = if lower_open { instance.params[0] - 2.0 } else { instance.params[0] };
                 let t1 = if upper_open { instance.params[3] - 2.0 } else { instance.params[3] };
                 if t1 > t0 + 1e-5 {
+                    // The middle (`split_hole`) lies on whole pixels inside the box less `e`: its colour can be
+                    // interpolated from its corners when `t` there stays between the stops.
                     let reach = instance.radii.into_iter().map(corner_extent).fold(0.0f32, f32::max);
                     let e = reach + instance.params[2].max(0.5) + 1.0;
-                    let hw = (instance.rect[2] * 0.5 - e).max(0.0);
-                    let hh = (instance.rect[3] * 0.5 - e).max(0.0);
-                    let span = hw * instance.uv[0].abs() + hh * instance.uv[1].abs();
-                    if 0.5 - span >= t0 && 0.5 + span <= t1 {
+                    let [x, y, w, h] = instance.rect;
+                    let (x0, x1) = ((x + e).ceil(), (x + w - e).floor());
+                    let (y0, y1) = ((y + e).ceil(), (y + h - e).floor());
+                    let [cx, cy] = [x + w * 0.5, y + h * 0.5];
+                    let t = |px: f32, py: f32| 0.5 + (px - cx) * instance.uv[0] + (py - cy) * instance.uv[1];
+                    let ts = [t(x0, y0), t(x1, y0), t(x0, y1), t(x1, y1)];
+                    if x1 > x0 && y1 > y0 && ts.iter().all(|&v| v >= t0 + 1e-5 && v <= t1 - 1e-5) {
                         return QuadMode::SplitLinear;
                     }
                 }
