@@ -299,6 +299,9 @@ pub struct Renderer {
     kinds: Vec<Option<Kind>>,
     /// Each instance, as batched: whether it draws apart (`SPLIT_VERTICES`).
     split: Vec<bool>,
+    /// Each instance, as batched: whether it draws apart with the one before it in one draw, middles then bands
+    /// (`together`): the same kind, both split, and clear of every other in their group.
+    together: Vec<bool>,
     /// Each instance, as batched: whether it's big enough to draw alone with its kind's pipeline (`BIG`).
     big: Vec<bool>,
     /// Frame-profile builds: a timestamp written between a frame's layer passes and its own (`tooling::FrameLog`).
@@ -650,17 +653,24 @@ impl Renderer {
                 (false, _) => pass.draw(0..4, at..end),
                 (true, None) => pass.draw(SPLIT_VERTICES, at..end),
                 (true, Some(middles)) => {
-                    for i in at..end {
+                    // Shapes of one kind clear of each other draw their middles in one draw and their bands in
+                    // another: with none over another, the order between them changes no pixel.
+                    let mut i = at;
+                    while i < end {
+                        let mut j = i + 1;
+                        while j < end && !skip(j) && self.together.get(j as usize).copied().unwrap_or(false) { j += 1; }
                         let kind = self.kinds.get(i as usize).copied().flatten().map(Kind::as_u32);
                         let middle = variant::MIDDLE_KINDS.iter().position(|&k| Some(k) == kind).and_then(|at| middles.get(at)?.as_ref());
-                        let Some(middle) = middle else {
-                            pass.draw(SPLIT_VERTICES, i..i + 1);
-                            continue;
-                        };
-                        pass.set_pipeline(middle);
-                        pass.draw(SPLIT_MIDDLE, i..i + 1);
-                        pass.set_pipeline(bound);
-                        pass.draw(SPLIT_BANDS, i..i + 1);
+                        match middle {
+                            Some(middle) => {
+                                pass.set_pipeline(middle);
+                                pass.draw(SPLIT_MIDDLE, i..j);
+                                pass.set_pipeline(bound);
+                                pass.draw(SPLIT_BANDS, i..j);
+                            }
+                            None => pass.draw(SPLIT_VERTICES, i..j),
+                        }
+                        i = j;
                     }
                 }
             }
