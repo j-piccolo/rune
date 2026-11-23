@@ -1241,7 +1241,7 @@ impl Renderer {
                 let plain_pipe = plain_layer.then(|| {
                     self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * super::variant::SOLID_COUNT).and_then(|(_, p)| {
                         let (window, layer) = p.split_at(super::variant::SOLID_COUNT);
-                        let slice = if target.is_none() && format == self.format { Some(window) } else if target.is_some() && format == FORMAT { Some(layer) } else { None };
+                        let slice = if format == self.format { Some(window) } else if target.is_some() && format == FORMAT { Some(layer) } else { None };
                         slice?.get(super::variant::PLAIN_LAYER_SLOT)?.as_ref()
                     })
                 }).flatten();
