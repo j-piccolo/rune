@@ -66,6 +66,10 @@ impl Default for Uploads {
 }
 
 impl Uploads {
+    /// The uploaded instance at `i`, for frame-profile tooling.
+    #[cfg(feature = "frame-profile")]
+    pub(super) fn instance(&self, i: u32) -> Option<&Instance> { self.instances.get(i as usize) }
+
     /// Forgets what the instance buffer holds, so the next frame writes and batches it all.
     pub(super) fn forget_instances(&mut self) {
         self.instances.clear();
