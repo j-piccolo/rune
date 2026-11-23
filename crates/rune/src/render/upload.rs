@@ -49,6 +49,8 @@ pub(super) struct Uploads {
     images_srgb: Option<bool>,
     /// Last seen `atlas.overwritten` generation.
     atlas_overwritten: u64,
+    /// Whether any instance in the current frame uses a specialized fast-path pipeline or `fused_grad`.
+    pub(super) has_fast: bool,
     #[cfg(test)]
     pub(super) globals_writes: u64,
     #[cfg(test)]
@@ -57,7 +59,7 @@ pub(super) struct Uploads {
 
 impl Default for Uploads {
     fn default() -> Uploads {
-        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false, fast_warmed: false, fused_dirty: false, images_srgb: None, atlas_overwritten: 0,
+        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false, fast_warmed: false, fused_dirty: false, images_srgb: None, atlas_overwritten: 0, has_fast: false,
             #[cfg(test)] globals_writes: 0, #[cfg(test)] batch_runs: 0 }
     }
 }
@@ -362,7 +364,15 @@ impl Renderer {
             }
         }
         // GPU springs move instances in the vertex stage, off the pixels `Cleared` checks.
+        let prev_cleared = self.cleared.len;
         self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(instances) };
+        if self.uploads.batched && self.cleared.len < prev_cleared && !self.uploads.has_fast {
+            let lo = (self.cleared.len as usize).min(self.fast_kinds.len());
+            let hi = (prev_cleared as usize).min(self.fast_kinds.len());
+            if self.fast_kinds[lo..hi].iter().any(|&fk| fk != super::fast::FastKind::General) {
+                self.uploads.has_fast = true;
+            }
+        }
         if self.uploads.images_srgb != Some(self.srgb_blend) {
             self.uploads.images_srgb = Some(self.srgb_blend);
             if !self.images.is_empty() {
@@ -509,8 +519,19 @@ impl Renderer {
         self.kinds.clear();
         self.kinds.extend(instances.iter().map(Instance::kind));
         self.fast_kinds.clear();
-        self.fast_kinds.extend(instances.iter().map(super::fast::classify));
-        self.fused_grad = if self.fused_res.is_some() { super::fast::detect_fused_grad(instances, &self.fast_kinds) } else { None };
+        let cleared_len = self.cleared.len as usize;
+        let mut any_fast = false;
+        let mut any_fast_any = false;
+        self.fast_kinds.extend(instances.iter().enumerate().map(|(idx, i)| {
+            let fk = super::fast::classify(i);
+            if fk != super::fast::FastKind::General {
+                any_fast_any = true;
+                if idx >= cleared_len { any_fast = true; }
+            }
+            fk
+        }));
+        self.fused_grad = if self.fused_res.is_some() && any_fast_any { super::fast::detect_fused_grad(instances, &self.fast_kinds) } else { None };
+        self.uploads.has_fast = any_fast || self.fused_grad.is_some();
         let (mut start, mut bind) = (0, BatchBind::Image(0));
         let mut has_layers = false;
         self.effects.clear();
@@ -562,12 +583,16 @@ impl Renderer {
         let shared = instances.len().min(held.len());
         let mut rebatch = instances.len() != held.len();
         let mut fused_dirty = false;
+        let mut gained_fast = false;
         let fused_range = self.fused_grad.as_ref().map(|(r, _)| r.start as usize..r.end as usize);
+        let cleared_len = self.cleared.len as usize;
         let fast_kinds = &mut self.fast_kinds;
-        let update_fast = |fk: &mut Vec<super::fast::FastKind>, dirty: &mut bool, span: &std::ops::Range<usize>| {
+        let update_fast = |fk: &mut Vec<super::fast::FastKind>, dirty: &mut bool, gained: &mut bool, span: &std::ops::Range<usize>| {
             if fk.len() == instances.len() {
                 for i in span.clone() {
-                    fk[i] = super::fast::classify(&instances[i]);
+                    let k = super::fast::classify(&instances[i]);
+                    fk[i] = k;
+                    if i >= cleared_len && k != super::fast::FastKind::General { *gained = true; }
                     if instances[i].kind() == Some(Kind::Radial) {
                         *dirty = true;
                     }
@@ -588,20 +613,21 @@ impl Renderer {
             };
             let last = (first..end).rfind(differs).map_or(end, |i| i + 1);
             if let Some(written) = Self::join(self.instances.buffer(), held, staging, instances, &mut open, first..last, &mut rebatch) {
-                update_fast(fast_kinds, &mut fused_dirty, &written);
+                update_fast(fast_kinds, &mut fused_dirty, &mut gained_fast, &written);
             }
         }
         if instances.len() > shared {
             if let Some(written) = Self::join(self.instances.buffer(), held, staging, instances, &mut open, shared..instances.len(), &mut rebatch) {
-                update_fast(fast_kinds, &mut fused_dirty, &written);
+                update_fast(fast_kinds, &mut fused_dirty, &mut gained_fast, &written);
             }
         }
         if let Some(span) = open {
             rebatch |= Self::write_span(self.instances.buffer(), held, staging, instances, span.clone());
-            update_fast(fast_kinds, &mut fused_dirty, &span);
+            update_fast(fast_kinds, &mut fused_dirty, &mut gained_fast, &span);
         }
         self.uploads.batched &= !rebatch;
         self.uploads.fused_dirty |= fused_dirty;
+        self.uploads.has_fast |= gained_fast;
     }
 
     /// Writes only `patched` (ascending): the instances a loop-only frame changed (a dot's colour,
@@ -625,8 +651,11 @@ impl Renderer {
             rebatch |= held[start..end].iter().zip(&instances[start..end]).any(|(h, i)| h.params[..3] != i.params[..3]);
             held[start..end].copy_from_slice(&instances[start..end]);
             if self.fast_kinds.len() == instances.len() {
+                let cleared_len = self.cleared.len as usize;
                 for i in start..end {
-                    self.fast_kinds[i] = super::fast::classify(&instances[i]);
+                    let fk = super::fast::classify(&instances[i]);
+                    self.fast_kinds[i] = fk;
+                    if i >= cleared_len && fk != super::fast::FastKind::General { self.uploads.has_fast = true; }
                     if instances[i].kind() == Some(Kind::Radial) {
                         fused_dirty = true;
                     }
