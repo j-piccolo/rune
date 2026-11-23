@@ -133,7 +133,7 @@ impl AnimationStore {
     pub(super) fn apply_due(&mut self, t: usize, now: f64) {
         let l0 = self.t_lane0[t] as usize;
         let n = self.t_n[t] as usize;
-        let eps = self.t_meta[t].class.eps(self.pixel_scale);
+        let eps = self.track_eps(t);
         for l in l0..l0 + n {
             loop {
                 let p = self.l_pending[l];

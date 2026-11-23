@@ -60,6 +60,15 @@ impl AnimationStore {
         }
     }
 
+    /// `animate_changed` settling within `eps` (a position threshold, velocity ten times it) instead of the
+    /// prop class's: for an owner that knows how far a value still to move can show.
+    pub(crate) fn animate_changed_eps<T: Animatable>(&mut self, node: NodeId, prop: Prop<T>, target: T, anim: Anim, eps: f32) -> (TrackId, bool) {
+        if let Some(t) = self.index.get(&(node.0, prop.id.0)).copied() {
+            self.t_meta[t as usize].eps = eps;
+        }
+        self.animate_changed(node, prop, target, anim)
+    }
+
     /// Animates with an explicit per-lane starting velocity (gesture handoff).
     pub fn animate_with_velocity<T: Animatable>(
         &mut self,
@@ -96,7 +105,7 @@ impl AnimationStore {
                 let k = decay.k();
                 let l0 = self.t_lane0[t] as usize;
                 let now = self.time_of(t);
-                let eps = self.t_meta[t].class.eps(self.pixel_scale);
+                let eps = self.track_eps(t);
                 for i in 0..n {
                     let l = l0 + i;
                     let (x, v) = (cur[i], vel[i]);
@@ -269,7 +278,7 @@ impl AnimationStore {
             let t = self.active[i] as usize;
             let now = self.time_of(t);
             let (l0, n) = (self.t_lane0[t] as usize, self.t_n[t] as usize);
-            let eps = self.t_meta[t].class.eps(self.pixel_scale);
+            let eps = self.track_eps(t);
             let mut hit = false;
             for l in l0..l0 + n {
                 if self.l_curve[l] == Curve::Spring(old) {
