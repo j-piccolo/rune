@@ -10,8 +10,9 @@
 use super::{CLIP_WGSL, Instance, Kind, metallib};
 
 /// Minimum pixel area for an instance to take a dedicated fast-path pipeline (avoids pipeline
-/// switches for tiny chips, dots, and icons that batch cheaply in the general shader).
-const MIN_AREA: f32 = 4096.0;
+/// switches and driver submit overhead for small/medium cards, chips, dots, and icons that batch
+/// cheaply in a single draw call).
+const MIN_AREA: f32 = 120_000.0;
 /// Minimum pixel area for the 2-pass interior+ring split (avoids doubling draw calls for medium
 /// cards while eliminating alpha blending on large panels).
 const SPLIT_AREA: f32 = 120_000.0;
@@ -1552,24 +1553,24 @@ mod tests {
         let gpu = Gpu::headless_wgpu();
         let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
         let mut atlas = Atlas::new();
-        let mut list = vec![solid_rect([0.0, 0.0, 200.0, 200.0], [0.2, 0.4, 0.8, 1.0])];
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        let mut list = vec![solid_rect([0.0, 0.0, 600.0, 300.0], [0.2, 0.4, 0.8, 1.0])];
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         assert_eq!(renderer.fast_kinds, vec![FastKind::OpaqueRect]);
 
         // Fade fill alpha below 1 without changing count or params.
         list[0].fill = [0.1, 0.2, 0.4, 0.5];
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         assert_eq!(renderer.fast_kinds, vec![FastKind::General]);
 
         // Also test the loop-only `write_patched` path.
         list[0].fill = [0.2, 0.4, 0.8, 1.0];
         renderer.next_instances(1, None);
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         assert_eq!(renderer.fast_kinds, vec![FastKind::OpaqueRect]);
 
         list[0].fill = [0.1, 0.2, 0.4, 0.5];
         renderer.next_instances(1, Some(vec![0]));
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         assert_eq!(renderer.fast_kinds, vec![FastKind::General]);
     }
 
@@ -1578,12 +1579,12 @@ mod tests {
         let gpu = Gpu::headless_wgpu();
         let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
         let mut atlas = Atlas::new();
-        let rect = [0.0, 0.0, 400.0, 200.0];
+        let rect = [0.0, 0.0, 600.0, 300.0];
         let mut list = vec![
-            radial_seg(rect, [200.0, 100.0, 200.0, 100.0], [1.0, 0.0, 0.0, 1.0], [0.5, 0.0, 0.0, 1.0], 0.0, 2.5),
-            radial_seg(rect, [200.0, 100.0, 200.0, 100.0], [0.5, 0.0, 0.0, 1.0], [0.1, 0.1, 0.1, 1.0], 2.5, 1.0),
+            radial_seg(rect, [300.0, 150.0, 300.0, 150.0], [1.0, 0.0, 0.0, 1.0], [0.5, 0.0, 0.0, 1.0], 0.0, 2.5),
+            radial_seg(rect, [300.0, 150.0, 300.0, 150.0], [0.5, 0.0, 0.0, 1.0], [0.1, 0.1, 0.1, 1.0], 2.5, 1.0),
         ];
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 200));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         let (span, u0) = renderer.fused_grad.as_ref().expect("fused grad detected");
         assert_eq!(*span, 0..2);
         assert_eq!(u0.rad_c0, [1.0, 0.0, 0.0, 1.0]);
@@ -1592,7 +1593,7 @@ mod tests {
         list[0].fill = [0.0, 0.0, 1.0, 1.0];
         list[0].border = [0.0, 0.0, 0.5, 1.0];
         list[1].fill = [0.0, 0.0, 0.5, 1.0];
-        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 200));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (600, 300));
         let (span2, u1) = renderer.fused_grad.as_ref().expect("fused grad still detected");
         assert_eq!(*span2, 0..2);
         assert_eq!(u1.rad_c0, [0.0, 0.0, 1.0, 1.0]);

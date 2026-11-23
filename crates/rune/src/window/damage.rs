@@ -192,7 +192,7 @@ impl Damage {
                 let most = |r: &[[u32; 4]]| r.iter().map(|r| area(*r)).sum::<u32>() as f32 > MOST * (size.0 * size.1) as f32;
                 // A scroll moves most of the list: asked first where a sample of it says so, since
                 // finding what changed in such a list hashes all of it only to say most did.
-                let first = if scroll && moved_mostly(&self.last, instances) { scrolled(&self.last, instances, size) } else { None };
+                let first = if scroll && moved_mostly(&self.last, instances) { scrolled_within(&self.last, instances, size, 256, &mut self.scratch) } else { None };
                 let mut now = match first {
                     Some((shift, rects)) => Area::Scroll(shift, rects),
                     None => changed(&self.last, instances, size, &mut self.scratch),
@@ -212,7 +212,7 @@ impl Damage {
                 // looks near, where a rail's cards are, since most such frames are no scroll at all.
                 let reach = if much == Some(u32::MAX) || much.is_some_and(|a| a as f32 > MOST * (size.0 * size.1) as f32) { 256 } else { 24 };
                 if scroll && many && let Some(redrawn) = much && !moved_mostly(&self.last, instances)
-                    && let Some((shift, rects)) = scrolled_within(&self.last, instances, size, reach) && sum(&rects) < redrawn {
+                    && let Some((shift, rects)) = scrolled_within(&self.last, instances, size, reach, &mut self.scratch) && sum(&rects) < redrawn {
                     now = Area::Scroll(shift, rects);
                 }
                 self.seen = match &now { Area::Rects(r) | Area::Scroll(_, r) => r.iter().copied().reduce(join), Area::All | Area::Many => None };
@@ -327,8 +327,11 @@ impl Hasher for Hashed {
 /// branch. A `memcmp` call for each of a frame's instances cost as much as the rest of its plan.
 #[inline(always)]
 fn same(a: &Instance, b: &Instance) -> bool {
-    let (a, b): ([u64; INSTANCE_WORDS / 2], [u64; INSTANCE_WORDS / 2]) = (bytemuck::cast(*a), bytemuck::cast(*b));
-    a.iter().zip(&b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
+    let a: &[u32; INSTANCE_WORDS] = bytemuck::cast_ref(a);
+    let b: &[u32; INSTANCE_WORDS] = bytemuck::cast_ref(b);
+    let mut d = 0u32;
+    for k in 0..INSTANCE_WORDS { d |= a[k] ^ b[k]; }
+    d == 0
 }
 
 /// An instance's 16 double words, xor-multiplied in four lanes that the CPU runs side by side
@@ -357,6 +360,8 @@ pub(super) struct Scratch {
     /// (`changed` found them all): `plan` then brings its copy of the list up to date from these.
     differ: Vec<u32>,
     differ_all: bool,
+    all_offers: Vec<(i32, i32)>,
+    offers: Vec<(i32, i32)>,
 }
 
 fn changed(old: &[Instance], new: &[Instance], size: (u32, u32), s: &mut Scratch) -> Area {
@@ -513,10 +518,11 @@ fn join(a: [u32; 4], b: [u32; 4]) -> [u32; 4] { [a[0].min(b[0]), a[1].min(b[1]),
 /// `i` shades the pixels of its rect inside its clip and no others: a plain rect (no border,
 /// softened edge or rounded corner) on whole pixels, inside a clip on whole pixels that fades
 /// nothing. The shader's coverage and clip ramps are exactly 0 at every pixel centre outside.
+#[inline(always)]
 fn crisp(i: &Instance) -> bool {
     let [x, y, w, h] = i.rect;
     i.kind() == Some(crate::render::Kind::Rect) && i.params[0] == 0.0 && i.params[2] <= 0.5 && i.radii == [0.0; 4] && i.fade == [0; 4]
-        && [x, y, x + w, y + h].iter().chain(&i.clip).all(|v| v.fract() == 0.0)
+        && [x, y, x + w, y + h].iter().chain(&i.clip).all(|&v| is_whole(v))
 }
 
 /// The pixels an instance can touch: its quad as the shader grows it, inside its clip.
@@ -530,8 +536,12 @@ fn bounds(i: &Instance, size: (u32, u32)) -> Option<[u32; 4]> {
     let (x0, y0, x1, y1) = i.damage_quad_bounds()?;
     if x1 <= x0 || y1 <= y0 { return None; }
     let c = i.clip;
-    let (x0, y0) = ((x0.max(c[0]) - 1.0).floor().max(0.0), (y0.max(c[1]) - 1.0).floor().max(0.0));
-    let (x1, y1) = ((x1.min(c[2]) + 1.0).ceil().min(size.0 as f32), (y1.min(c[3]) + 1.0).ceil().min(size.1 as f32));
+    let cx0 = if is_whole(c[0]) { c[0] } else { (c[0] - 0.5).floor() };
+    let cy0 = if is_whole(c[1]) { c[1] } else { (c[1] - 0.5).floor() };
+    let cx1 = if is_whole(c[2]) { c[2] } else { (c[2] + 0.5).ceil() };
+    let cy1 = if is_whole(c[3]) { c[3] } else { (c[3] + 0.5).ceil() };
+    let (x0, y0) = ((x0 - 1.0).floor().max(cx0).max(0.0), (y0 - 1.0).floor().max(cy0).max(0.0));
+    let (x1, y1) = ((x1 + 1.0).ceil().min(cx1).min(size.0 as f32), (y1 + 1.0).ceil().min(cy1).min(size.1 as f32));
     (x1 > x0 && y1 > y0).then(|| [x0 as u32, y0 as u32, x1 as u32, y1 as u32])
 }
 
@@ -556,13 +566,14 @@ fn moved_mostly(old: &[Instance], new: &[Instance]) -> bool {
 /// copied pixel is exactly what the frame would shade there when every instance under it moved
 /// by the shift (`moved`) or lies under all of them and shades it uniformly (`uniform_below`).
 /// The rest redraws: what came into the viewport, what changed, and what moved otherwise.
+#[cfg(test)]
 fn scrolled(old: &[Instance], new: &[Instance], size: (u32, u32)) -> Option<(Shift, Vec<[u32; 4]>)> {
-    scrolled_within(old, new, size, 256)
+    scrolled_within(old, new, size, 256, &mut Scratch::default())
 }
 
 /// `scrolled`, looking no further than `reach` instances from a probe's place for the old one it
 /// was: far for a frame that is a scroll or draws whole otherwise, near for one that only might be.
-fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: usize) -> Option<(Shift, Vec<[u32; 4]>)> {
+fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: usize, s: &mut Scratch) -> Option<(Shift, Vec<[u32; 4]>)> {
     let start = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
     let end = old[start..].iter().rev().zip(new[start..].iter().rev()).take_while(|(a, b)| same(a, b)).count();
     let (om, nm) = (&old[start..old.len() - end], &new[start..new.len() - end]);
@@ -570,39 +581,83 @@ fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: 
     // takes an old one near its place to it: a glyph or a card like it elsewhere offers a wrong
     // one, which few agree on. (The first instances are often a row the viewport's edge cuts,
     // whose clip changed as it moved.) Then how far ahead the old middle runs there.
-    let probes: Vec<usize> = (1..8).map(|k| k * nm.len() / 8).filter(|&j| j < nm.len()).collect();
+    let mut probe_buf = [0usize; 7];
+    let mut probe_len = 0usize;
+    for k in 1..8 {
+        let j = k * nm.len() / 8;
+        if j < nm.len() {
+            probe_buf[probe_len] = j;
+            probe_len += 1;
+        }
+    }
+    let probes = &probe_buf[..probe_len];
     // Near its place first (a scroll alone leaves the list as long as it was), then further (rows
     // came into the list or left it): a wide look at every probe costs a frame thousands of
     // comparisons.
     // Every shift most probes agree on, the best supported first, with how far ahead the old middle
     // runs there. A card or a glyph like it elsewhere can win the near look when rows came into the
     // list or left it (what was near each probe is then another row's), so more than one is tried.
-    let voted = |reach: usize| {
+    let voted = |reach: usize, s: &mut Scratch| -> [Option<([f32; 2], isize)>; 2] {
         let window = |j: usize| j.saturating_sub(reach)..(j + reach + 1).min(om.len());
-        let mut votes: Vec<([f32; 2], usize)> = Vec::new();
-        for &j in &probes {
-            let mut offers: Vec<[f32; 2]> = Vec::new();
+        s.all_offers.clear();
+        for &j in probes {
+            s.offers.clear();
+            let nj = &nm[j];
+            let nw = nj.rect[2].to_bits();
+            let nh = nj.rect[3].to_bits();
+            let nk = nj.params[1].to_bits();
             for i in window(j) {
-                if let Some(d) = moved(&om[i], &nm[j])
-                    && d[0].fract() == 0.0 && d[1].fract() == 0.0 && on_grid(d[0]) && on_grid(d[1])
-                    && !offers.contains(&d)
-                {
-                    offers.push(d);
+                let oi = &om[i];
+                if oi.rect[2].to_bits() != nw || oi.rect[3].to_bits() != nh || oi.params[1].to_bits() != nk {
+                    continue;
+                }
+                let dx = nj.rect[0] - oi.rect[0];
+                let dy = nj.rect[1] - oi.rect[1];
+                if (dx == 0.0 && dy == 0.0) || !is_whole_on_grid(dx) || !is_whole_on_grid(dy) {
+                    continue;
+                }
+                if same_body(oi, nj) {
+                    s.offers.push((dx as i32, dy as i32));
                 }
             }
-            for d in offers {
-                match votes.iter_mut().find(|(v, _)| *v == d) { Some(e) => e.1 += 1, None => votes.push((d, 1)) }
+            if s.offers.len() > 1 {
+                s.offers.sort_unstable();
+                s.offers.dedup();
+            }
+            s.all_offers.extend_from_slice(&s.offers);
+        }
+        if s.all_offers.is_empty() { return [None, None]; }
+        s.all_offers.sort_unstable();
+        let mut top: [([f32; 2], usize); 2] = [([0.0; 2], 0); 2];
+        let mut idx = 0;
+        while idx < s.all_offers.len() {
+            let key = s.all_offers[idx];
+            let mut end = idx + 1;
+            while end < s.all_offers.len() && s.all_offers[end] == key { end += 1; }
+            let support = end - idx;
+            if support * 2 > probes.len() {
+                let d = [key.0 as f32, key.1 as f32];
+                if support > top[0].1 {
+                    top[1] = top[0];
+                    top[0] = (d, support);
+                } else if support > top[1].1 {
+                    top[1] = (d, support);
+                }
+            }
+            idx = end;
+        }
+        let mut out = [None, None];
+        let mut out_len = 0;
+        for (d, support) in top {
+            if support == 0 { continue; }
+            if let Some(ahead) = probes.iter().find_map(|&j| {
+                window(j).filter(|&i| fits_shift(&om[i], &nm[j], d) && om[i].rect != nm[j].rect).min_by_key(|&i| i.abs_diff(j)).map(|i| i as isize - j as isize)
+            }) {
+                out[out_len] = Some((d, ahead));
+                out_len += 1;
             }
         }
-        votes.retain(|(_, support)| support * 2 > probes.len());
-        votes.sort_by_key(|(_, support)| std::cmp::Reverse(*support));
-        votes.truncate(2);
-        votes.into_iter().filter_map(|(d, _)| {
-            let ahead = probes.iter().find_map(|&j| {
-                window(j).filter(|&i| moved(&om[i], &nm[j]) == Some(d)).min_by_key(|&i| i.abs_diff(j)).map(|i| i as isize - j as isize)
-            })?;
-            Some((d, ahead))
-        }).collect::<Vec<_>>()
+        out
     };
     // The first shift that leaves under half the window to redraw, or of those tried the one that
     // leaves least: a wrong one copies pixels that are right only where its few pairs lie, and
@@ -610,15 +665,18 @@ fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: 
     // further try is a walk of both lists, so a frame that scrolled as it seems pays for one.
     let little = (size.0 * size.1) / 2;
     let mut best: Option<(u32, (Shift, Vec<[u32; 4]>))> = None;
-    let mut tried: Vec<[f32; 2]> = Vec::new();
+    let mut tried = [[0.0f32; 2]; 4];
+    let mut tried_len = 0usize;
     // Rows that came into the list or left it put what a probe was beside far from it, where the
     // near look finds only look-alikes: then the far look goes first, and its shift is tried
     // before theirs.
     let looks = if old.len().abs_diff(new.len()) > 24 { [256, 24] } else { [24, 256] };
     for reach in looks.into_iter().filter(|r| *r <= reach) {
-        for (d, ahead) in voted(reach) {
-            if tried.contains(&d) { continue; }
-            tried.push(d);
+        for item in voted(reach, s) {
+            let Some((d, ahead)) = item else { continue };
+            if tried[..tried_len].contains(&d) { continue; }
+            tried[tried_len] = d;
+            tried_len += 1;
             let Some(plan) = scrolled_by(old, new, start, end, size, d, ahead) else { continue };
             let redrawn = plan.1.iter().map(|r| area(*r)).sum::<u32>();
             if redrawn <= little { return Some(plan); }
@@ -630,10 +688,9 @@ fn scrolled_within(old: &[Instance], new: &[Instance], size: (u32, u32), reach: 
 
 /// `scrolled` for one shift `d`, with the old middle running `ahead` of the new at the probes.
 fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, size: (u32, u32), d: [f32; 2], mut ahead: isize) -> Option<(Shift, Vec<[u32; 4]>)> {
-    if d[0].fract() != 0.0 || d[1].fract() != 0.0 || !on_grid(d[0]) || !on_grid(d[1]) { return None; }
+    if !is_whole_on_grid(d[0]) || !is_whole_on_grid(d[1]) { return None; }
     let (om, nm) = (&old[start..old.len() - end], &new[start..new.len() - end]);
-    // Moved first: it tells most pairs apart by their size and kind alone.
-    let fits = |o: &Instance, n: &Instance| moved(o, n) == Some(d) || bytemuck::bytes_of(o) == bytemuck::bytes_of(n);
+    let fits = |o: &Instance, n: &Instance| fits_shift(o, n, d);
     let mut paired = vec![false; om.len()];
     let (mut un_new, mut stayed, mut fixed, mut along) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut first_moved = None;
@@ -703,7 +760,7 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
     }
     let (w, h) = (size.0 as f32, size.1 as f32);
     let v = [v[0].max(0.0), v[1].max(0.0), v[2].min(w), v[3].min(h)];
-    if v.iter().any(|c| c.fract() != 0.0) || v[2] <= v[0] || v[3] <= v[1] { return None; }
+    if v.iter().any(|&c| !is_whole(c)) || v[2] <= v[0] || v[3] <= v[1] { return None; }
     let inside = |c: [f32; 4]| c[0] >= v[0] && c[1] >= v[1] && c[2] <= v[2] && c[3] <= v[3];
     let r = [v[0].max(v[0] + d[0]), v[1].max(v[1] + d[1]), v[2].min(v[2] + d[0]), v[3].min(v[3] + d[1])];
     if r[2] <= r[0] || r[3] <= r[1] { return None; }
@@ -717,7 +774,7 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
     };
     for &(o, j) in &along {
         let (was, is) = (om[o].clip, nm[j].clip);
-        let whole = was.map(f32::fract) == [0.0; 4] && is.map(f32::fract) == [0.0; 4];
+        let whole = was.iter().all(|&c| is_whole(c)) && is.iter().all(|&c| is_whole(c));
         let same_copied = meet([was[0] + d[0], was[1] + d[1], was[2] + d[0], was[3] + d[1]]) == meet(is);
         if !whole || !same_copied || !inside(was) || !inside(is) { paired[o] = false; un_new.push(j); }
     }
@@ -755,16 +812,35 @@ fn scrolled_by(old: &[Instance], new: &[Instance], start: usize, end: usize, siz
     Some((shift, rects))
 }
 
-/// `n` is `o` moved: every byte the same but the rect's place and the clip (which `scrolled`
-/// checks once it knows what the copy fills). The move, or `None`. Compared where they lie: a
-/// frame asks this of thousands of pairs.
-fn moved(o: &Instance, n: &Instance) -> Option<[f32; 2]> {
-    // Most pairs asked about differ in size or in what they are: told apart before the rest.
-    if o.rect[2].to_bits() != n.rect[2].to_bits() || o.rect[3].to_bits() != n.rect[3].to_bits() || o.params[1].to_bits() != n.params[1].to_bits() { return None; }
-    let (a, b) = (bytemuck::bytes_of(o), bytemuck::bytes_of(n));
-    // Bytes: 0..8 the rect's place, 8..16 its size, 96..112 the clip; the rest must match.
-    if a[8..96] != b[8..96] || a[112..] != b[112..] || a[..8] == b[..8] { return None; }
-    Some([n.rect[0] - o.rect[0], n.rect[1] - o.rect[1]])
+/// Whether `o` and `n` match in every byte outside `rect.xy` (words 0..2) and `clip` (words 24..28).
+#[inline(always)]
+fn same_body(o: &Instance, n: &Instance) -> bool {
+    let a: &[u32; INSTANCE_WORDS] = bytemuck::cast_ref(o);
+    let b: &[u32; INSTANCE_WORDS] = bytemuck::cast_ref(n);
+    let mut diff = (a[28] ^ b[28]) | (a[29] ^ b[29]) | (a[30] ^ b[30]) | (a[31] ^ b[31]);
+    for k in 2..24 { diff |= a[k] ^ b[k]; }
+    diff == 0
+}
+
+/// Fast inline check for `moved(o, n) == Some(d) || same(o, n)`: rejects mismatched size, kind,
+/// or position delta in a handful of instructions before comparing the remaining 104 bytes.
+#[inline(always)]
+fn fits_shift(o: &Instance, n: &Instance, d: [f32; 2]) -> bool {
+    if o.rect[2].to_bits() != n.rect[2].to_bits()
+        || o.rect[3].to_bits() != n.rect[3].to_bits()
+        || o.params[1].to_bits() != n.params[1].to_bits()
+    {
+        return false;
+    }
+    let dx = n.rect[0] - o.rect[0];
+    let dy = n.rect[1] - o.rect[1];
+    if dx == d[0] && dy == d[1] {
+        same_body(o, n)
+    } else if o.rect[0].to_bits() == n.rect[0].to_bits() && o.rect[1].to_bits() == n.rect[1].to_bits() {
+        same(o, n)
+    } else {
+        false
+    }
 }
 
 /// A moved instance whose pixels move with it exactly: its kind shades a pixel from where it lies
@@ -775,13 +851,29 @@ fn moves_exactly(o: &Instance, n: &Instance) -> bool {
     use crate::render::Kind;
     let kind = matches!(n.kind(), Some(Kind::Rect | Kind::Shadow | Kind::Inset | Kind::Gradient | Kind::Image | Kind::Dashed | Kind::Radial))
         || (n.kind() == Some(Kind::Glyph) && n.params[0] == 0.0);
-    let grid = |v: [f32; 4]| v.map(on_grid) == [true; 4];
+    let grid = |v: [f32; 4]| on_grid(v[0]) && on_grid(v[1]) && on_grid(v[2]) && on_grid(v[3]);
     let clip_ok = |c: [f32; 4]| c == crate::render::NO_CLIP || grid(c);
     kind && n.fade == [0; 4] && grid(o.rect) && grid(n.rect) && clip_ok(o.clip) && (o.clip == n.clip || clip_ok(n.clip))
 }
 
+/// Exact whole-number check without calling `libm::truncf` (`f32::fract`).
+#[inline(always)]
+fn is_whole(v: f32) -> bool {
+    v.abs() < 16_777_216.0 && (v as i32) as f32 == v
+}
+
+/// Exact whole-number check within `on_grid`'s range (`< 2^19`).
+#[inline(always)]
+fn is_whole_on_grid(v: f32) -> bool {
+    v.abs() < 524_288.0 && (v as i32) as f32 == v
+}
+
 /// On the quarter-pixel grid, under 2^19: sums of two such values and their halves are exact in f32.
-fn on_grid(v: f32) -> bool { (v * 4.0).fract() == 0.0 && v.abs() < 524_288.0 }
+#[inline(always)]
+fn on_grid(v: f32) -> bool {
+    let q = v * 4.0;
+    v.abs() < 524_288.0 && (q as i32) as f32 == q
+}
 
 /// `i`, drawn under everything that moved, shades every pixel of `region` (`[x0, y0, x1, y1]`)
 /// alike: a plain rect on whole pixels with nothing but its fill, covering it, inside its clip.
@@ -791,7 +883,7 @@ fn uniform_below(i: &Instance, region: [u32; 4]) -> bool {
     let c = i.clip;
     let [x0, y0, x1, y1] = region.map(|v| v as f32);
     i.kind() == Some(crate::render::Kind::Rect) && i.params[0] == 0.0 && i.params[2] <= 0.5 && i.radii == [0.0; 4] && i.fade == [0; 4]
-        && [x, y, x + w, y + h].iter().all(|v| v.fract() == 0.0)
+        && [x, y, x + w, y + h].iter().all(|&v| is_whole(v))
         && x <= x0 && y <= y0 && x + w >= x1 && y + h >= y1
         && c[0] <= x0 && c[1] <= y0 && c[2] >= x1 && c[3] >= y1
 }

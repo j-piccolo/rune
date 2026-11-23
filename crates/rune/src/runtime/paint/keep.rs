@@ -54,11 +54,13 @@ pub(in crate::runtime) struct PaintRec {
     cut: bool,
     /// It or a node under it draws a picture, whose place in the atlas a copy has to check.
     pictures: bool,
+    /// It or a node under it recorded a `text_cut` box (`keep_shift.rs`).
+    has_text_cut: bool,
 }
 
 impl Default for PaintRec {
     fn default() -> Self {
-        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false, pictures: false }
+        PaintRec { id: NodeId(u64::MAX), epoch: 0, up: 0, own: 0, end: 0, inst: [0; 2], hits: [0; 2], wheel: [0; 2], overlay: [0; 2], help: [0; 2], drop: [0; 2], pages: [0; 2], glyphs: [0; 2], fits: false, keep: false, cut: false, pictures: false, has_text_cut: false }
     }
 }
 
@@ -122,6 +124,9 @@ pub(in crate::runtime) struct PaintKeep {
     /// This paint copies what it can, and records what it paints (in tree order only).
     on: bool,
     recording: bool,
+    /// When the tree's node IDs and order match last paint's (`o == i` for every node), per-node
+    /// arrays stay in place instead of swapping and `memcpy`ing ~1 KB/node back on every frame.
+    pub(super) in_place: bool,
     /// Frames stepped, and the one the last paint ran in: a second paint in a frame paints all.
     pub(in crate::runtime) frame: u64,
     painted: u64,
@@ -227,9 +232,27 @@ pub(in crate::runtime) fn inh_key(p: &Inh) -> u64 {
 impl RuntimeCore {
     /// Before a paint clears them: last paint's output and side tables become the record copies
     /// come from.
-    pub(in crate::runtime) fn keep_swap(&mut self) {
+    pub(in crate::runtime) fn keep_swap(&mut self, tree_order: bool) {
+        let n = self.tree.nodes.len();
         let k = &mut self.paint.keep;
         k.cycles.begin(self.commit.commits);
+        let same_tree = (!cfg!(debug_assertions) || real_copies(k))
+            && !tree_order
+            && n > 0
+            && k.recs.len() == n
+            && self.paint.drawn.len() == n
+            && self.paint.drawn_scale.len() == n
+            && self.paint.seen.len() == n
+            && self.paint.inh_scratch.len() == n
+            && k.pinh.len() == n
+            && k.hit_raw.len() == n
+            && k.own_opacity.len() == n
+            && k.shown.len() == n
+            && k.picture.len() == n
+            && k.text_cut.len() == n
+            && (!self.tree.has_sticky || self.scroll.sticky_frame.len() == n)
+            && self.tree.nodes.iter().zip(&k.recs).all(|(node, rec)| node.id == rec.id);
+        k.in_place = same_tree;
         std::mem::swap(&mut self.instances, &mut k.instances);
         // Both sides of the swap retain the warmed paint budget, even if a reveal
         // temporarily emits fewer glyphs on the frames painted into one of them.
@@ -241,26 +264,28 @@ impl RuntimeCore {
         std::mem::swap(&mut self.hit.overlay_hits, &mut k.overlay);
         std::mem::swap(&mut self.hit.help_hits, &mut k.help);
         std::mem::swap(&mut self.hit.drop_hits, &mut k.drop);
-        std::mem::swap(&mut self.paint.drawn, &mut k.drawn);
-        std::mem::swap(&mut self.paint.drawn_scale, &mut k.drawn_scale);
-        std::mem::swap(&mut self.paint.seen, &mut k.seen);
-        std::mem::swap(&mut self.paint.inh_scratch, &mut k.inh);
-        std::mem::swap(&mut self.scroll.sticky_frame, &mut k.sticky_frame);
         std::mem::swap(&mut k.recs, &mut k.prev);
-        std::mem::swap(&mut k.pinh, &mut k.prev_pinh);
-        // Not cleared: a node reads last paint's only where its record says it was written.
-        k.pinh.resize(self.tree.nodes.len(), Inh::default());
-        std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
-        k.hit_raw.resize(self.tree.nodes.len(), [0.0; 4]);
-        std::mem::swap(&mut k.own_opacity, &mut k.prev_own_opacity);
-        k.own_opacity.resize(self.tree.nodes.len(), [f32::NAN; 2]);
-        std::mem::swap(&mut k.shown, &mut k.prev_shown);
-        k.shown.resize(self.tree.nodes.len(), None);
-        std::mem::swap(&mut k.picture, &mut k.prev_picture);
-        k.picture.resize(self.tree.nodes.len(), None);
-        std::mem::swap(&mut k.text_cut, &mut k.prev_text_cut);
-        k.text_cut.resize(self.tree.nodes.len(), None);
         std::mem::swap(&mut k.pages, &mut k.prev_pages);
+        if !same_tree {
+            std::mem::swap(&mut self.paint.drawn, &mut k.drawn);
+            std::mem::swap(&mut self.paint.drawn_scale, &mut k.drawn_scale);
+            std::mem::swap(&mut self.paint.seen, &mut k.seen);
+            std::mem::swap(&mut self.paint.inh_scratch, &mut k.inh);
+            std::mem::swap(&mut self.scroll.sticky_frame, &mut k.sticky_frame);
+            std::mem::swap(&mut k.pinh, &mut k.prev_pinh);
+            // Not cleared: a node reads last paint's only where its record says it was written.
+            k.pinh.resize(n, Inh::default());
+            std::mem::swap(&mut k.hit_raw, &mut k.prev_hit_raw);
+            k.hit_raw.resize(n, [0.0; 4]);
+            std::mem::swap(&mut k.own_opacity, &mut k.prev_own_opacity);
+            k.own_opacity.resize(n, [f32::NAN; 2]);
+            std::mem::swap(&mut k.shown, &mut k.prev_shown);
+            k.shown.resize(n, None);
+            std::mem::swap(&mut k.picture, &mut k.prev_picture);
+            k.picture.resize(n, None);
+            std::mem::swap(&mut k.text_cut, &mut k.prev_text_cut);
+            k.text_cut.resize(n, None);
+        }
         // The other pairs too, as the instances above: a paint that grows one buffer doesn't
         // leave the frame after it to grow the other.
         twin(&mut self.marks, &k.marks);
@@ -271,8 +296,7 @@ impl RuntimeCore {
         twin(&mut self.hit.drop_hits, &k.drop);
         twin(&mut k.pages, &k.prev_pages);
         k.pages.clear();
-        k.recs.clear();
-        k.recs.resize(self.tree.nodes.len(), PaintRec::default());
+        k.recs.resize(n, PaintRec::default());
         k.open.clear();
         k.kept = 0;
         k.shifted = 0;
@@ -317,26 +341,38 @@ impl RuntimeCore {
             k.verify_faded.clear();
             k.verify_faded.resize_with(n, || None);
         }
+        if k.in_place && (!k.on || tree_order) {
+            k.in_place = false;
+            self.paint.seen.fill(false);
+            if self.tree.has_sticky {
+                self.scroll.sticky_frame.fill(sticky::UNBOUNDED);
+            }
+        }
+        let k = &mut self.paint.keep;
         if !k.recording {
             return;
         }
         // Last paint's index of each node: in order, as kept regions leave them.
         k.old.clear();
-        k.old.resize(n, NONE);
-        // Scratch kept from paint to paint: a frame allocates nothing here.
-        k.by_id.clear();
-        let mut cursor = 0usize;
-        for i in 0..n {
-            let id = self.tree.nodes[i].id;
-            let o = if k.prev.get(cursor).is_some_and(|r| r.id == id) { Some(cursor) } else {
-                if k.by_id.is_empty() {
-                    k.by_id.extend(k.prev.iter().enumerate().map(|(o, r)| (r.id, o as u32)));
+        if k.in_place {
+            k.old.extend(0..n as u32);
+        } else {
+            k.old.resize(n, NONE);
+            // Scratch kept from paint to paint: a frame allocates nothing here.
+            k.by_id.clear();
+            let mut cursor = 0usize;
+            for i in 0..n {
+                let id = self.tree.nodes[i].id;
+                let o = if k.prev.get(cursor).is_some_and(|r| r.id == id) { Some(cursor) } else {
+                    if k.by_id.is_empty() {
+                        k.by_id.extend(k.prev.iter().enumerate().map(|(o, r)| (r.id, o as u32)));
+                    }
+                    k.by_id.get(&id).map(|&o| o as usize)
+                };
+                if let Some(o) = o {
+                    k.old[i] = o as u32;
+                    cursor = o + 1;
                 }
-                k.by_id.get(&id).map(|&o| o as usize)
-            };
-            if let Some(o) = o {
-                k.old[i] = o as u32;
-                cursor = o + 1;
             }
         }
         // What each node's own fields say, read again only for a node built again.
@@ -357,9 +393,10 @@ impl RuntimeCore {
         // The scene presents a whole subtree again when the node above it changes at all. One
         // presented with what it painted from last time, nothing of its own having changed,
         // hasn't moved; what it inherits is compared as it paints.
+        let prev_shown = if k.in_place { &k.shown } else { &k.prev_shown };
         for id in &k.carried {
             if let Some(&i) = self.tree.node_index.get(id) && i < n {
-                let was = k.prev_shown.get(k.old[i] as usize).copied().flatten();
+                let was = prev_shown.get(k.old[i] as usize).copied().flatten();
                 k.moved_at[i] = was.is_none() || was != shown(&self.scene, *id);
                 #[cfg(test)]
                 { k.carried_checks.0 += !k.moved_at[i] as usize; }
@@ -378,7 +415,6 @@ impl RuntimeCore {
         k.open.clear();
         for i in 0..n {
             let parent = self.tree.nodes[i].parent;
-            let (own, fit) = (own_key(self, i), self.paint.keep.fits[i] && dynamic_ok(self, i, sel, marks));
             let k = &mut self.paint.keep;
             while let Some(&r) = k.open.last() && parent.is_none_or(|p| r > p) {
                 k.end[r] = i as u32;
@@ -386,6 +422,16 @@ impl RuntimeCore {
             }
             k.open.push(i);
             let o = k.old[i];
+            let fit = k.fits[i] && dynamic_ok(self, i, sel, marks);
+            let k = &mut self.paint.keep;
+            let base_ok = fit && o != NONE && !k.moved_at[i] && {
+                let r = &k.prev[o as usize];
+                let up = parent.map_or(0, |p| (i - p) as u32);
+                r.epoch == self.tree.nodes[i].epoch && r.up == up
+                    && parent.is_none_or(|p| k.old[p] != NONE && k.old[p] + up == o)
+            };
+            let own = if base_ok || logging() { own_key(self, i) } else { 0 };
+            let k = &mut self.paint.keep;
             if logging() {
                 let why = if !fit { 0 } else if o == NONE { 1 } else if k.moved_at[i] { 2 } else if k.prev[o as usize].epoch != self.tree.nodes[i].epoch { 3 } else if k.prev[o as usize].own != own { 4 } else { 5 };
                 k.why[why] += 1;
@@ -393,12 +439,7 @@ impl RuntimeCore {
                     eprintln!("rune: paint keep:   {} {}", if why == 2 { "moved" } else { "rebuilt" }, self.tree.nodes[i].path);
                 }
             }
-            k.clean[i] = fit && o != NONE && !k.moved_at[i] && {
-                let r = &k.prev[o as usize];
-                let up = parent.map_or(0, |p| (i - p) as u32);
-                r.epoch == self.tree.nodes[i].epoch && r.up == up && r.own == own
-                    && parent.is_none_or(|p| k.old[p] != NONE && k.old[p] + up == o)
-            };
+            k.clean[i] = base_ok && k.prev[o as usize].own == own;
         }
         let k = &mut self.paint.keep;
         k.open.clear();
@@ -431,14 +472,32 @@ impl RuntimeCore {
             keep: self.paint.keep.fits[i] && dynamic_ok(self, i, sel, marks),
             cut: false,
             pictures: false,
+            has_text_cut: false,
         };
         self.paint.keep.glyph_out = false;
+        if !self.paint.keep.in_place {
+            self.paint.keep.picture[i] = None;
+            self.paint.keep.text_cut[i] = None;
+            self.paint.keep.shown[i] = shown(&self.scene, self.tree.nodes[i].id);
+            self.paint.keep.own_opacity[i] = [f32::NAN; 2];
+        }
+        self.paint.keep.recs[i] = rec;
+        self.paint.keep.open.push(i);
+    }
+
+    /// Resets node `i`'s per-node slots before it paints itself when `in_place` kept last paint's
+    /// arrays intact.
+    #[inline]
+    pub(in crate::runtime) fn keep_will_paint(&mut self, i: usize) {
+        if !self.paint.keep.in_place { return; }
         self.paint.keep.picture[i] = None;
         self.paint.keep.text_cut[i] = None;
         self.paint.keep.shown[i] = shown(&self.scene, self.tree.nodes[i].id);
         self.paint.keep.own_opacity[i] = [f32::NAN; 2];
-        self.paint.keep.recs[i] = rec;
-        self.paint.keep.open.push(i);
+        self.paint.seen[i] = false;
+        if self.tree.has_sticky {
+            self.scroll.sticky_frame[i] = sticky::UNBOUNDED;
+        }
     }
 
     /// Node `i` inherits `pinh`: copies its subtree from the last paint when that's what it would
@@ -446,12 +505,20 @@ impl RuntimeCore {
     pub(in crate::runtime) fn keep_or_paint(&mut self, i: usize, pinh: &Inh, glyph_count: &mut usize) -> Option<usize> {
         // Only a node that can be copied needs what it inherits.
         if !self.paint.keep.recording || !self.paint.keep.recs[i].keep { return None; }
-        self.paint.keep.pinh[i] = *pinh;
+        let in_place = self.paint.keep.in_place;
+        let o = if in_place { i } else { self.paint.keep.old[i] as usize };
+        let was_pinh = if in_place {
+            let w = self.paint.keep.pinh[i];
+            self.paint.keep.pinh[i] = *pinh;
+            w
+        } else {
+            self.paint.keep.pinh[i] = *pinh;
+            if self.paint.keep.on && self.paint.keep.clean[i] { self.paint.keep.prev_pinh[o] } else { Inh::default() }
+        };
         let k = &self.paint.keep;
         if !k.on || !k.clean[i] {
             return None;
         }
-        let o = k.old[i] as usize;
         let r = k.prev[o];
         let end = k.end[i] as usize;
         if !r.keep || r.end as usize - o != end - i {
@@ -463,10 +530,10 @@ impl RuntimeCore {
         // ancestor has faded, as it was but for the opacities it hands down; but for a move,
         // where it is now. What each node inherited is held for it, painted or copied, as the
         // paint left it: one copied where a scroll took it holds what it inherited there.
-        let same = inh_key(&self.paint.keep.prev_pinh[o]) == inh_key(pinh);
+        let same = inh_key(&was_pinh) == inh_key(pinh);
         let starts = self.keep_starts();
-        let fade = !same && self.keep_fade(o, end - i, pinh);
-        let shift = if same || fade { None } else { Some(self.keep_move(i, o, end - i, pinh)?) };
+        let fade = !same && self.keep_fade(o, end - i, &was_pinh, pinh);
+        let shift = if same || fade { None } else { Some(self.keep_move(i, o, end - i, &was_pinh, pinh)?) };
         if cfg!(debug_assertions) && !real_copies(&self.paint.keep) {
             // The move was only tried: the subtree paints, and is checked against it.
             let moved = shift.map(|_| Box::new(self.keep_take_moved(i, end, starts)));
@@ -495,20 +562,24 @@ impl RuntimeCore {
     /// layer a node draws at full strength, and the opacity it inherits only says whether it
     /// draws and takes hits at all. Leaves in `faded` what each node hands down now, worked
     /// out as paint does.
-    fn keep_fade(&mut self, o: usize, len: usize, pinh: &Inh) -> bool {
+    fn keep_fade(&mut self, o: usize, len: usize, was: &Inh, pinh: &Inh) -> bool {
         if fade_off() { return false; }
         let k = &mut self.paint.keep;
-        let was = k.prev_pinh[o];
         if was.opacity == pinh.opacity && was.hit_opacity == pinh.hit_opacity { return false; }
-        if inh_key(&Inh { opacity: pinh.opacity, hit_opacity: pinh.hit_opacity, ..was }) != inh_key(pinh) { return false; }
+        if inh_key(&Inh { opacity: pinh.opacity, hit_opacity: pinh.hit_opacity, ..*was }) != inh_key(pinh) { return false; }
         k.faded.clear();
+        let (inh_src, own_src, pinh_src) = if k.in_place {
+            (&self.paint.inh_scratch, &k.own_opacity, &k.pinh)
+        } else {
+            (&k.inh, &k.prev_own_opacity, &k.prev_pinh)
+        };
         for j in 0..len {
-            let (down, own) = (k.inh[o + j], k.prev_own_opacity[o + j]);
+            let (down, own) = (inh_src[o + j], own_src[o + j]);
             let (then, now) = if j == 0 { ([was.opacity, was.hit_opacity], [pinh.opacity, pinh.hit_opacity]) } else {
                 let up = k.prev[o + j].up as usize;
                 if up == 0 || up > j { return false; }
                 // It inherited what its parent handed down, untouched on the way.
-                let (given, held) = (k.prev_pinh[o + j], k.inh[o + j - up]);
+                let (given, held) = (pinh_src[o + j], inh_src[o + j - up]);
                 if given.opacity != held.opacity || given.hit_opacity != held.hit_opacity { return false; }
                 ([given.opacity, given.hit_opacity], k.faded[j - up])
             };
@@ -544,12 +615,21 @@ impl RuntimeCore {
     /// `i`) would be given the place in the image atlas it was drawn from: the same pixels, at
     /// the same level, where they were. Asking keeps them there, as painting them does.
     fn keep_pictures_hold(&mut self, i: usize, o: usize, len: usize) -> bool {
-        for j in 0..len {
-            let Some(was) = self.paint.keep.prev_picture[o + j] else { continue };
-            let Some(pixels) = &self.tree.nodes[i + j].vis.pixels else { return false };
-            if was.plays || pixels.signature() != was.signature { return false; }
-            let now = self.images.place_at(pixels, was.drawn, Some(self.t));
-            if now.is_some_and(|(_, next)| next.is_some()) || now.map(|(placed, _)| placed) != was.placed { return false; }
+        let in_place = self.paint.keep.in_place;
+        let mut j = 0;
+        while j < len {
+            let r = self.paint.keep.prev[o + j];
+            if !r.pictures {
+                j = (r.end as usize - o).max(j + 1);
+                continue;
+            }
+            if let Some(was) = if in_place { self.paint.keep.picture[o + j] } else { self.paint.keep.prev_picture[o + j] } {
+                let Some(pixels) = &self.tree.nodes[i + j].vis.pixels else { return false };
+                if was.plays || pixels.signature() != was.signature { return false; }
+                let now = self.images.place_at(pixels, was.drawn, Some(self.t));
+                if now.is_some_and(|(_, next)| next.is_some()) || now.map(|(placed, _)| placed) != was.placed { return false; }
+            }
+            j += 1;
         }
         true
     }
@@ -578,16 +658,22 @@ impl RuntimeCore {
                 let seq = |s: usize| s + at[1] - r.hits[0] as usize;
                 self.hit.help_hits.extend(k.help[range(r.help)].iter().map(|&(id, rect, s, l)| (id, rect, seq(s), l)));
                 self.hit.drop_hits.extend(k.drop[range(r.drop)].iter().map(|&(id, rect, s)| (id, rect, seq(s))));
-                self.paint.drawn[i..end].copy_from_slice(&k.drawn[o..o + len]);
-                self.paint.drawn_scale[i..end].copy_from_slice(&k.drawn_scale[o..o + len]);
-                self.paint.seen[i..end].copy_from_slice(&k.seen[o..o + len]);
-                self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
-                k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
-                k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
-                k.own_opacity[i..end].copy_from_slice(&k.prev_own_opacity[o..o + len]);
-                k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
-                k.picture[i..end].copy_from_slice(&k.prev_picture[o..o + len]);
-                k.shown[i..end].copy_from_slice(&k.prev_shown[o..o + len]);
+                if !k.in_place {
+                    self.paint.drawn[i..end].copy_from_slice(&k.drawn[o..o + len]);
+                    self.paint.drawn_scale[i..end].copy_from_slice(&k.drawn_scale[o..o + len]);
+                    self.paint.seen[i..end].copy_from_slice(&k.seen[o..o + len]);
+                    self.paint.inh_scratch[i..end].copy_from_slice(&k.inh[o..o + len]);
+                    k.pinh[i + 1..end].copy_from_slice(&k.prev_pinh[o + 1..o + len]);
+                    k.hit_raw[i..end].copy_from_slice(&k.prev_hit_raw[o..o + len]);
+                    k.own_opacity[i..end].copy_from_slice(&k.prev_own_opacity[o..o + len]);
+                    if r.has_text_cut {
+                        k.text_cut[i..end].copy_from_slice(&k.prev_text_cut[o..o + len]);
+                    }
+                    if r.pictures {
+                        k.picture[i..end].copy_from_slice(&k.prev_picture[o..o + len]);
+                    }
+                    k.shown[i..end].copy_from_slice(&k.prev_shown[o..o + len]);
+                }
             }
         }
         let k = &mut self.paint.keep;
@@ -597,7 +683,7 @@ impl RuntimeCore {
             self.text.touch_quad(page, texels);
         }
         *glyph_count += (r.glyphs[1] - r.glyphs[0]) as usize;
-        if self.tree.has_sticky {
+        if self.tree.has_sticky && !k.in_place {
             self.scroll.sticky_frame[i..end].copy_from_slice(&k.sticky_frame[o..o + len]);
         }
         // Records for the next paint, as if it had painted them here.
@@ -622,8 +708,9 @@ impl RuntimeCore {
         // node above, painted around it, records none, and when that node is copied next it is
         // copied without asking the atlas for them: their pages go untouched, the atlas reuses
         // the space, and the copy shows whatever image lands there.
-        if r.pictures && let Some(p) = self.tree.nodes[i].parent {
-            k.recs[p].pictures = true;
+        if (r.pictures || r.has_text_cut) && let Some(p) = self.tree.nodes[i].parent {
+            k.recs[p].pictures |= r.pictures;
+            k.recs[p].has_text_cut |= r.has_text_cut;
         }
         k.kept += len;
     }
@@ -639,6 +726,7 @@ impl RuntimeCore {
         let picture = k.picture[i].is_some_and(|p| !p.plays);
         let mut ok = painted_ok && k.picture[i].is_none_or(|p| !p.plays);
         k.recs[i].pictures = k.picture[i].is_some();
+        k.recs[i].has_text_cut = k.text_cut[i].is_some();
         for q in &self.instances[start..] {
             let kind = q.params[1];
             if (kind == KIND_IMAGE && !picture) || kind == KIND_EFFECT || kind == crate::render::KIND_BACKDROP_BLUR || (kind == KIND_GLYPH && q.radii[3] > 0.0) {
@@ -701,10 +789,11 @@ impl RuntimeCore {
             rec.overlay[1] = self.hit.overlay_hits.len() as u32;
             rec.pages[1] = k.pages.len() as u32;
             rec.glyphs[1] = *glyph_count as u32;
-            let (keep, pictures) = (rec.keep, rec.pictures);
+            let (keep, pictures, has_text_cut) = (rec.keep, rec.pictures, rec.has_text_cut);
             if let Some(p) = self.tree.nodes[r].parent {
                 k.recs[p].keep &= keep;
                 k.recs[p].pictures |= pictures;
+                k.recs[p].has_text_cut |= has_text_cut;
             }
             if cfg!(debug_assertions) && self.paint.keep.verify.get(r).is_some_and(|&o| o != NONE) {
                 self.keep_check(r);
@@ -843,11 +932,23 @@ fn real_copies(k: &PaintKeep) -> bool {
 }
 
 /// The per-node rows paint reads besides the node.
+#[inline]
 fn own_key(rt: &RuntimeCore, i: usize) -> u64 {
-    let mut h = rune_motion::Fx::default();
-    bits(&mut h, &[rt.paint.row_dy[i], rt.paint.row_h[i], rt.paint.row_mask[i]]);
-    h.write_u8((rt.tree.has_dissolve && rt.paint.dissolve_scratch.get(i).copied().unwrap_or(false)) as u8);
-    h.finish()
+    let (dy, h, mask) = (rt.paint.row_dy[i], rt.paint.row_h[i], rt.paint.row_mask[i]);
+    let dissolve = rt.tree.has_dissolve && rt.paint.dissolve_scratch.get(i).copied().unwrap_or(false);
+    if dy.to_bits() == 0 && h.to_bits() == 0 && mask.to_bits() == (-1.0f32).to_bits() && !dissolve {
+        static DEFAULT_KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        return *DEFAULT_KEY.get_or_init(|| {
+            let mut h = rune_motion::Fx::default();
+            bits(&mut h, &[0.0, 0.0, -1.0]);
+            h.write_u8(0);
+            h.finish()
+        });
+    }
+    let mut hasher = rune_motion::Fx::default();
+    bits(&mut hasher, &[dy, h, mask]);
+    hasher.write_u8(dissolve as u8);
+    hasher.finish()
 }
 
 /// `RUNE_PAINT_FADE=0`: paint what an ancestor's fade is all that changed for, again.
