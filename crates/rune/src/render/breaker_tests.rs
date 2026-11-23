@@ -91,7 +91,7 @@ fn a_refused_layer_pipeline_draws_the_group_in_its_parent() {
     let Some((renderer, pixel)) = draw_refusing(Feature::Isolation, &group(LayerSpec { opacity: 0.5, ..Default::default() })) else { return };
     assert_eq!(pixel, [255; 4]);
     assert_eq!(renderer.layer_stats().targets, 0);
-    assert!(!renderer.extra.iter().any(|(f, _)| *f == FORMAT), "the refused pipeline isn't kept");
+    assert!(!renderer.extra.iter().any(|(f, _)| *f == super::super::layers::FORMAT), "the refused pipeline isn't kept");
 }
 
 #[test]
