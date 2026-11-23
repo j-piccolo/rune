@@ -12,7 +12,9 @@ impl RuntimeCore {
         let snap_px = |v: f32| grid(v, s) * s;
         // Every scroll viewport asks for its children (`bottom_offset`).
         self.prepare_viewports();
-        self.keep_swap();
+        let flying = !self.motion.flying.is_empty();
+        let tree_order = self.paint.needs_tree_order(&self.tree, &self.scene, flying);
+        self.keep_swap(tree_order);
         self.instances.clear();
         self.paint.quads_frame += 1;
         // Quads a text hasn't drawn with for a while go, with the layouts they hold.
@@ -55,22 +57,25 @@ impl RuntimeCore {
         self.motion.clear_loop_wake();
         self.hit.overlay_hits.clear();
         let n_nodes = self.tree.nodes.len();
-        self.paint.inh_scratch.clear();
         self.paint.turn_scratch.clear();
         self.paint.unturned_drawn.clear();
-        self.paint.inh_scratch.resize(n_nodes, Inh::default());
-        self.paint.drawn.clear();
-        self.paint.drawn.resize(n_nodes, [0.0; 4]);
-        self.paint.drawn_scale.clear();
-        self.paint.drawn_scale.resize(n_nodes, 1.0);
-        self.paint.seen.clear();
-        self.paint.seen.resize(n_nodes, false);
         self.scroll.stuck.clear();
         self.scroll.sticky_bands.clear();
-        self.scroll.sticky_frame.clear();
         if self.tree.has_sticky {
             self.scroll.stuck.resize(n_nodes, 0.0);
-            self.scroll.sticky_frame.resize(n_nodes, sticky::UNBOUNDED);
+        }
+        if !self.paint.keep.in_place {
+            // Every node writes its own `inh_scratch[i]` before any child reads it, and `seen[i]`
+            // gates reads of `drawn[i]` / `drawn_scale[i]`: skip zeroing ~110 KB of scratch per frame.
+            self.paint.inh_scratch.resize(n_nodes, Inh::default());
+            self.paint.drawn.resize(n_nodes, [0.0; 4]);
+            self.paint.drawn_scale.resize(n_nodes, 1.0);
+            self.paint.seen.clear();
+            self.paint.seen.resize(n_nodes, false);
+            self.scroll.sticky_frame.clear();
+            if self.tree.has_sticky {
+                self.scroll.sticky_frame.resize(n_nodes, sticky::UNBOUNDED);
+            }
         }
         let sel_ranges = self.selection_ranges();
         let mark_ranges = self.mark_ranges();
@@ -92,8 +97,6 @@ impl RuntimeCore {
 
         self.place_growth_rows();
 
-        let flying = !self.motion.flying.is_empty();
-        let tree_order = self.paint.needs_tree_order(&self.tree, &self.scene, flying);
         let default_ring = self.default_ring_owner();
         self.keep_begin(tree_order, vp, default_ring, &sel_ranges, &mark_ranges);
         let mut active_cache: Option<ActiveCache> = None;
@@ -119,9 +122,16 @@ impl RuntimeCore {
             self.paint.close_layers_to_parent(&self.tree.nodes, &mut self.instances, &mut self.surfaces, &mut self.marks, self.track_marks, &mut self.text, self.commit.commit_gen(), node_parent, &mut layers, &mut active_cache, &mut glyph_count);
             self.keep_open(i, glyph_count, &sel_ranges, &mark_ranges);
             let n = &self.tree.nodes[i];
-            let Some(p) = self.scene.presented(n.id) else { continue };
+            let Some(p) = self.scene.presented(n.id) else {
+                if self.paint.keep.in_place {
+                    self.paint.seen[i] = false;
+                    self.paint.drawn[i] = [0.0; 4];
+                }
+                continue;
+            };
             let mut pinh = n.parent.map_or_else(|| self.root_inh(), |pr| self.paint.inh_scratch[pr]);
             if pinh.anchor_hidden {
+                self.keep_will_paint(i);
                 self.paint.inh_scratch[i] = pinh;
                 self.paint.drawn[i] = [0.0; 4];
                 self.paint.seen[i] = false;
@@ -170,6 +180,7 @@ impl RuntimeCore {
                     pinh.opacity = 0.0;
                     pinh.paint_opacity = 0.0;
                     pinh.hit_opacity = 0.0;
+                    self.keep_will_paint(i);
                     self.paint.inh_scratch[i] = pinh;
                     self.paint.drawn[i] = [0.0; 4];
                     self.paint.seen[i] = false;
@@ -186,6 +197,7 @@ impl RuntimeCore {
                 skip_to = paint_index + len;
                 continue;
             }
+            self.keep_will_paint(i);
             if raised {
                 self.paint.reopen_raised_layers(&self.tree.nodes, &self.scene, &mut self.instances, self.surfaces.len(), node_parent, &mut pinh, &mut layers, s);
             }

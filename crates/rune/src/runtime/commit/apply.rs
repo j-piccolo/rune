@@ -64,12 +64,14 @@ impl RuntimeCore {
         self.stats.commits = self.commit.commits;
         // Concealing is a security boundary: old geometry must not disclose the revealed
         // line count through a height spring, displaced siblings, or a lingering scroll glide.
-        let revealed: HashSet<_> = self.tree.nodes.iter()
-            .filter(|n| {
-                n.input.as_ref().is_some_and(|input| input.edit.masking() == crate::edit::Masking::Shown)
-                    || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && t.cold.secure_revealed))
-            })
-            .map(|n| n.id).collect();
+        let mut revealed: Vec<NodeId> = Vec::new();
+        for n in &self.tree.nodes {
+            if n.input.as_ref().is_some_and(|input| input.edit.masking() == crate::edit::Masking::Shown)
+                || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && t.cold.secure_revealed))
+            {
+                revealed.push(n.id);
+            }
+        }
         let mut concealed = std::mem::take(&mut scratch.concealed);
         concealed.clear();
         let concealing = if !revealed.is_empty() {
@@ -100,7 +102,8 @@ impl RuntimeCore {
         let holds = self.motion.landing_holds(&nodes, &self.tree.nodes, self.paint.seen(), &self.scene, !instant && !tx.relayout && !tx.window_step, self.reduced_motion, &mut held);
 
         // What drew nothing last frame has no exit to show (`unseen_presence.rs`).
-        let any_gone = self.tree.nodes.iter().any(|o| !self.tree.node_index.contains_key(&o.id));
+        let any_gone = self.tree.nodes.len() > nodes.len()
+            || self.tree.nodes.iter().any(|o| !self.tree.node_index.contains_key(&o.id));
         let any_replaced = self.commit.virtuals.values().any(crate::el::virtual_list::VirtualList::replaced_view);
         let drew_nothing = if any_gone || any_replaced { self.drew_nothing() } else { Vec::new() };
         let unseen_ids: HashSet<NodeId> = if self.commit.virtuals.is_empty() || drew_nothing.is_empty() { HashSet::default() } else {

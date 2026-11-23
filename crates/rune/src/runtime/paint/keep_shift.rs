@@ -179,7 +179,8 @@ impl Shift {
         // where its line's box put it.
         for axis in 0..2 {
             // A picture fitted inside its box sits a fraction off the box's snapped edge, and moves with it.
-            let exact = if glyph { text.is_none() } else { !image && (q.rect[axis].fract() != 0.0 || q.rect[axis + 2].fract() != 0.0) };
+            let whole = |v: f32| v.abs() < 16_777_216.0 && (v as i32) as f32 == v;
+            let exact = if glyph { text.is_none() } else { !image && (!whole(q.rect[axis]) || !whole(q.rect[axis + 2])) };
             if exact && !self.exact[axis] { return None; }
         }
         let rect = [q.rect[0] + self.px[0], q.rect[1] + self.px[1], q.rect[2], q.rect[3]];
@@ -340,15 +341,94 @@ impl RuntimeCore {
     /// painted to where it is under `pinh`, when a move is all that changed for it: its
     /// instances, hits, drawn rects and inherited state, as `keep_copy` copies them for a
     /// subtree that stayed. The move, or None with nothing added.
-    pub(super) fn keep_move(&mut self, i: usize, o: usize, len: usize, pinh: &Inh) -> Option<Shift> {
+    pub(super) fn keep_move(&mut self, i: usize, o: usize, len: usize, was: &Inh, pinh: &Inh) -> Option<Shift> {
         if shift_off() { return None; }
-        let sh = Shift::between(&self.paint.keep.prev_pinh[o], pinh, self.env.scale)?;
+        let sh = Shift::between(was, pinh, self.env.scale)?;
         let starts = self.keep_starts();
-        if self.keep_move_into(i, o, len, &sh).is_none() {
+        let ok = if self.paint.keep.in_place {
+            self.keep_move_in_place(i, len, &sh)
+        } else {
+            self.keep_move_into(i, o, len, &sh)
+        };
+        if ok.is_none() {
             self.keep_unwind(starts);
             return None;
         }
         Some(sh)
+    }
+
+    /// In-place variant of `keep_move_into` when `i == o` and per-node arrays were not swapped:
+    /// validates and emits shifted instances/hits first (which `keep_unwind` truncates on failure),
+    /// then updates only the moved per-node fields in-place once success is guaranteed.
+    fn keep_move_in_place(&mut self, i: usize, len: usize, sh: &Shift) -> Option<()> {
+        let k = &mut self.paint.keep;
+        let r = k.prev[i];
+        let range = |a: [u32; 2]| a[0] as usize..a[1] as usize;
+        if self.track_marks {
+            self.marks.resize(self.instances.len(), 0);
+            self.marks.extend_from_slice(&k.marks[range(r.inst)]);
+        }
+        let first = self.instances.len();
+        self.instances.reserve(range(r.inst).len());
+        let seq = self.hit.hits.len().wrapping_sub(r.hits[0] as usize);
+        let sticky = self.tree.has_sticky.then(|| self.tree.nodes[i].parent.map(|p| self.scroll.sticky_frame[p])).flatten();
+        if self.tree.has_sticky && sticky.is_none() { return None; }
+        for j in 0..len {
+            let p = k.prev[i + j];
+            let n = &self.tree.nodes[i + j];
+            if p.cut || (n.vis_flags.no_pixel_snap() && sh.exact != [true; 2]) || n.parent.is_none() { return None; }
+            if sh.visible(self.paint.drawn[i + j], k.vp) != self.paint.seen[i + j] { return None; }
+            if !sh.passes(&self.paint.inh_scratch[i + j]) || (j > 0 && !sh.passes(&k.pinh[i + j])) { return None; }
+            let child = if j + 1 < len && ((i + j + 1) as u32) < p.end { Some(k.prev[i + j + 1]) } else { None };
+            let own = |all: [u32; 2], first: fn(&PaintRec) -> u32| all[0] as usize..child.as_ref().map_or(all[1], first) as usize;
+            let text = if p.has_text_cut { k.text_cut[i + j] } else { None };
+            let of_text = n.text.as_ref().map(|_| text.as_ref());
+            for q in &k.instances[own(p.inst, |c| c.inst[0])] { self.instances.push(sh.instance(q, of_text)?); }
+            let raw = k.hit_raw[i + j];
+            let [from, to] = sh.hit_clips(j == 0);
+            let (was, now) = (cut(raw, from), cut(sh.raw(raw), to));
+            if empty(was) != empty(now) { return None; }
+            for at in own(p.hits, |c| c.hits[0]) {
+                if k.hits[at].1 != was { return None; }
+                self.hit.hits.push((k.hits[at].0, now));
+            }
+            for at in own(p.wheel, |c| c.wheel[0]) {
+                if k.wheel[at].1 != was { return None; }
+                self.hit.wheel_hits.push((k.wheel[at].0, now));
+            }
+            for at in own(p.overlay, |c| c.overlay[0]) {
+                if k.overlay[at] != was { return None; }
+                self.hit.overlay_hits.push(now);
+            }
+            for at in own(p.help, |c| c.help[0]) {
+                let (id, rect, s, l) = k.help[at];
+                if rect != was { return None; }
+                self.hit.help_hits.push((id, now, s.wrapping_add(seq), l));
+            }
+            for at in own(p.drop, |c| c.drop[0]) {
+                let (id, rect, s) = k.drop[at];
+                if rect != was { return None; }
+                self.hit.drop_hits.push((id, now, s.wrapping_add(seq)));
+            }
+        }
+        if self.instances.len() - first != range(r.inst).len() { return None; }
+        // Committed: update only the moved per-node fields in place. `picture`, `shown`,
+        // `own_opacity`, `drawn_scale`, and `seen` are already in place.
+        for j in 0..len {
+            sh.carry(&mut self.paint.inh_scratch[i + j]);
+            if j > 0 { sh.carry(&mut k.pinh[i + j]); }
+            self.paint.drawn[i + j] = sh.drawn(self.paint.drawn[i + j]);
+            if let Some(up) = sticky {
+                let f = self.scroll.sticky_frame[i + j];
+                self.scroll.sticky_frame[i + j] = [up[0], up[1], f[2] + sh.d[1], f[3] + sh.d[1], up[4], up[5], f[6] + sh.d[0], f[7] + sh.d[0]];
+            }
+            if k.prev[i + j].has_text_cut && let Some(t) = k.text_cut[i + j] {
+                k.text_cut[i + j] = Some(sh.text_cut(&t));
+            }
+            k.hit_raw[i + j] = sh.raw(k.hit_raw[i + j]);
+        }
+        k.shifted += len;
+        Some(())
     }
 
     fn keep_move_into(&mut self, i: usize, o: usize, len: usize, sh: &Shift) -> Option<()> {
@@ -394,8 +474,10 @@ impl RuntimeCore {
             let child = if j + 1 < len && ((o + j + 1) as u32) < p.end { Some(k.prev[o + j + 1]) } else { None };
             let own = |all: [u32; 2], first: fn(&PaintRec) -> u32| all[0] as usize..child.as_ref().map_or(all[1], first) as usize;
             // Its text's own box, where the move puts it.
-            let text = k.prev_text_cut[o + j];
-            k.text_cut[i + j] = text.map(|t| sh.text_cut(&t));
+            let text = if p.has_text_cut { k.prev_text_cut[o + j] } else { None };
+            if p.has_text_cut {
+                k.text_cut[i + j] = text.map(|t| sh.text_cut(&t));
+            }
             let of_text = n.text.as_ref().map(|_| text.as_ref());
             for q in &k.instances[own(p.inst, |c| c.inst[0])] { self.instances.push(sh.instance(q, of_text)?); }
             // Its hit rects: its box, moved, cut by the clip where that is now. Cut away whole
@@ -405,7 +487,9 @@ impl RuntimeCore {
             let (was, now) = (cut(raw, from), cut(sh.raw(raw), to));
             if empty(was) != empty(now) { return None; }
             k.hit_raw[i + j] = sh.raw(raw);
-            k.picture[i + j] = k.prev_picture[o + j];
+            if p.pictures {
+                k.picture[i + j] = k.prev_picture[o + j];
+            }
             k.shown[i + j] = k.prev_shown[o + j];
             k.own_opacity[i + j] = k.prev_own_opacity[o + j];
             for at in own(p.hits, |c| c.hits[0]) {

@@ -249,7 +249,7 @@ impl MotionState {
 
     #[inline]
     pub(in crate::runtime) fn reveal_fading(&self, id: NodeId) -> bool {
-        self.reveals.get(&id).is_some_and(RevealPhase::fading)
+        !self.reveals.is_empty() && self.reveals.get(&id).is_some_and(RevealPhase::fading)
     }
 
     #[inline]

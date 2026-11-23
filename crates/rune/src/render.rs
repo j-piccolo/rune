@@ -560,7 +560,8 @@ impl Renderer {
             // Fast-path pipelines (fast.rs): tiny specialized shaders (and unblended opaque draws)
             // sharing `@group(0)`. Used whenever the frame pass is SourceOver without GPU springs
             // or dual-source LCD blending.
-            let fast_pipes = if self.springs.is_none()
+            let fast_pipes = if self.uploads.has_fast
+                && self.springs.is_none()
                 && self.layer_blend(target) == Blend::SourceOver
                 && (target.is_some() || !self.lcd_frame)
             {
@@ -686,10 +687,12 @@ impl Renderer {
                 if let Some(s) = general_start.take() {
                     cur_bound = draw_general(pass, cur_bound, s as u32..end as u32);
                 }
-                // Sync `bound` for subsequent batches if the last pipeline differed from `frame_pipeline`.
                 if !std::ptr::eq(cur_bound, bound) {
-                    pass.set_pipeline(frame_pipeline);
-                    bound = frame_pipeline;
+                    // Only re-sync `bound` if there are more batches in this range.
+                    if batch.end < range.end {
+                        pass.set_pipeline(frame_pipeline);
+                        bound = frame_pipeline;
+                    }
                 }
                 continue;
             }
