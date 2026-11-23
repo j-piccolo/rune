@@ -504,6 +504,16 @@ impl RuntimeCore {
             let base_d_origin = if scale_motion == ScaleMotion::Still && tk == 1.0 { base_rest } else { [0.0, 0.0] };
             let reveal = if spec.cold.advance_in.is_none() { self.motion.reveal_fade(n.id) } else { None };
             let drawn_len = n.elided.map_or(spec.content.len(), |e| e.drawn_len(spec.content.len()));
+            let has_decos = !spec.spans.is_empty()
+                || !spec.cold.pills.is_empty()
+                || !spec.cold.rings.is_empty()
+                || !spec.cold.highlights.is_empty()
+                || !spec.cold.strikes.is_empty()
+                || !spec.cold.overlines.is_empty()
+                || !spec.cold.span_boxes.is_empty()
+                || !link_fx.is_empty();
+            let mut inline_image_wake: Option<f64> = None;
+            if has_decos {
             self.paint.deco_scratch.clear();
             let mut pill_icons = Vec::new();
             let mut pill_images = Vec::new();
@@ -628,7 +638,6 @@ impl RuntimeCore {
                     fade,
                 );
             }
-            let mut inline_image_wake: Option<f64> = None;
             for (pixels, px, at) in pill_images {
                 let at = [
                     base_rest[0] + (at[0] - base_d_origin[0]) * tk + glide[0],
@@ -726,6 +735,7 @@ impl RuntimeCore {
                     clip,
                     fade,
                 );
+            }
             }
             if spec.selectable && n.input.is_none() {
                 // A mark keeps the active selection's highlight, whatever the window's focus, and
@@ -845,6 +855,7 @@ impl RuntimeCore {
                 };
                 self.text.set_glide([0.0; 2]);
                 let base = premul(color, o, srgb);
+                let base_exp = self.text.coverage_exponent(base);
                 let lands = self.motion.flights().iter().any(|f| f.lands(&n.path, n.key.as_deref()));
                 for q in if lands { &[][..] } else { &self.paint.glyph_scratch[..] } {
                     let [x0, y0] = if zoom == 1.0 && origin == r_origin { [q.rect[0], q.rect[1]] } else {
@@ -886,7 +897,8 @@ impl RuntimeCore {
                         }
                         f = f.map(|v| v * a);
                     }
-                    self.instances.extend(glyph_or_image(q, &self.text, &mut self.images, f, clip, fade)
+                    let exp = if f == base { base_exp } else { self.text.coverage_exponent(f) };
+                    self.instances.extend(glyph_or_image_exp(q, &self.text, &mut self.images, f, exp, clip, fade)
                         .map(|g| zoom_glyph(g, origin, r_origin, zoom)));
                     *glyph_count += 1;
                     // A colour or outline glyph draws per frame, from another atlas or a record.

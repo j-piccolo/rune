@@ -214,7 +214,7 @@ impl RuntimeCore {
                 None => (pinh.pressed, pinh.press_to),
             };
             // Loops and reveals run on the node's clock (`El::time_scale`).
-            let track = self.motion.loop_track(n.id);
+            let track = if n.looping.is_some() { self.motion.loop_track(n.id) } else { None };
             let lnow = if track.is_some() { self.scene.store().node_time(n.id) } else { self.t };
             let loop_value = track.map(|l| l.sample_at(lnow, self.clock, self.reduced_motion));
             if fades(n.looping.as_deref().copied()) && let Some(v) = loop_value {
@@ -273,16 +273,18 @@ impl RuntimeCore {
             let scale_settling = if let Some(target) = p_scale_target {
                 self.paint.static_scales.insert(n.id, ScaleSettle::Still(target));
                 false
-            } else if tracked_scale != 1.0 || has_live_scale || self.paint.static_scales.contains_key(&n.id) {
+            } else if tracked_scale != 1.0 || has_live_scale || (!self.paint.static_scales.is_empty() && self.paint.static_scales.contains_key(&n.id)) {
                 pose::step_static_scale(&mut self.paint.static_scales, &mut self.paint.scale_frame, n.id, tracked_scale, self.t, self.settled, has_live_scale)
             } else { false };
             let own_scale_anim = (has_press_scale && store.is_animating(n.id, P_PRESS_SCALE))
                 || p_scale_anim
                 || sequence.is_some_and(|l| !self.reduced_motion && l.active(lnow));
-            let presence_anim = store.is_animating(n.id, prop::PRESENCE);
+            // Only a node the scene marks animated has anything of these moving.
+            let animated = p.flags & rune_motion::flags::ANIMATED != 0;
+            let presence_anim = animated && store.is_animating(n.id, prop::PRESENCE);
             // A presence that only fades or slides scales nothing: text under it draws as it
             // rests, not from its outlines.
-            let scale_animating = store.is_animating(n.id, prop::SCALE) || (presence_anim && self.scene.presence_scales(n.id)) || own_scale_anim;
+            let scale_animating = (animated && store.is_animating(n.id, prop::SCALE)) || (presence_anim && self.scene.presence_scales(n.id)) || own_scale_anim;
             let presence_scales = presence_anim
                 && n.transition.as_deref().is_some_and(|t| t.insertion.scale != 1.0 || t.removal.scale != 1.0);
             let own_scale_moving = presence_scales || own_scale_anim;
@@ -632,20 +634,24 @@ impl RuntimeCore {
             } else {
                 None
             };
-            let packed_fade = crate::render::pack_fade(fade, fade_origin, clip);
-            for instance in &mut self.instances[first_instance..] {
-                instance.fade = if instance.clip == clip {
-                    packed_fade
-                } else {
-                    crate::render::pack_fade(fade, fade_origin, instance.clip)
-                };
+            if first_instance < self.instances.len() {
+                let packed_fade = crate::render::pack_fade(fade, fade_origin, clip);
+                for instance in &mut self.instances[first_instance..] {
+                    instance.fade = if instance.clip == clip {
+                        packed_fade
+                    } else {
+                        crate::render::pack_fade(fade, fade_origin, instance.clip)
+                    };
+                }
+                if self.tree.nodes[i].text.is_some() {
+                    let text_clip = if self.tree.nodes[i].collapsing && self.tree.nodes[i].vis.clip.is_none() && self.tree.nodes[i].scroll.is_none() {
+                        intersect(clip, r)
+                    } else {
+                        clip
+                    };
+                    self.clip_text_instances(i, first_instance, (r, r_exact), sc, text_clip, fade, fade_origin);
+                }
             }
-            let text_clip = if self.tree.nodes[i].collapsing && self.tree.nodes[i].vis.clip.is_none() && self.tree.nodes[i].scroll.is_none() {
-                intersect(clip, r)
-            } else {
-                clip
-            };
-            self.clip_text_instances(i, first_instance, (r, r_exact), sc, text_clip, fade, fade_origin);
             let n = &self.tree.nodes[i];
             if let Some((_, radii)) = rounded {
                 for instance in &mut self.instances[primitive_start..] {
