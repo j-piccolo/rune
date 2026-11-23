@@ -648,7 +648,8 @@ impl Renderer {
         // Made from WGSL they come for the window's format and then the layers' (`layers::FORMAT`).
         let n = variant::PINNED_FROM_WGSL.len();
         let pinned = self.pinned.as_deref().filter(|p| p.iter().any(Option::is_some)).and_then(|p| {
-            if target.is_none() && format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
+            // A layer in the window's own format (8-bit, where the frame blends sRGB-encoded) draws as the window does.
+            if format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
                 Some(&p[..p.len().min(n)])
             } else if p.len() == 2 * n && target.is_some() && format == layers::FORMAT && self.layer_blend(target) != Blend::PlusLighter
                 && self.extra.iter().any(|(f, e)| *f == format && std::ptr::eq(frame_pipeline, e)) {
@@ -666,7 +667,8 @@ impl Renderer {
         // would draw it: the window's, or a layer's (`layers::FORMAT`) drawn over as the window is (not additively).
         let middles = self.solid.as_ref().filter(|(f, p)| *f == self.format && p.len() == 2 * variant::SOLID_COUNT).and_then(|(_, p)| {
             let (window, layer) = p.split_at(variant::SOLID_COUNT);
-            if target.is_none() && format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
+            // A layer in the window's own format (8-bit, where the frame blends sRGB-encoded) draws as the window does.
+            if format == self.format && std::ptr::eq(frame_pipeline, &self.pipeline) {
                 Some(window)
             } else if target.is_some() && format == layers::FORMAT && self.layer_blend(target) != Blend::PlusLighter
                 && self.extra.iter().any(|(f, p)| *f == format && std::ptr::eq(frame_pipeline, p)) {
