@@ -28,8 +28,6 @@ pub(super) enum FastKind {
     OpaqueRadial,
     LinearBand,
     Shadow,
-    OpaqueImage,
-    OpaqueImageBilinear,
 }
 
 #[inline]
@@ -123,22 +121,7 @@ pub(super) fn classify(i: &Instance) -> FastKind {
                 FastKind::General
             }
         }
-        Kind::Glyph => FastKind::General,
-        Kind::Image => {
-            if area < MIN_AREA
-                || i.fill[3] < 1.0
-                || i.radii != [0.0; 4]
-                || !int_rect(i.rect)
-                || !int_or_no_clip(i.clip)
-            {
-                return FastKind::General;
-            }
-            if (i.uv[2] - i.rect[2]).abs() <= 1e-3 && (i.uv[3] - i.rect[3]).abs() <= 1e-3 {
-                FastKind::OpaqueImage
-            } else {
-                FastKind::OpaqueImageBilinear
-            }
-        }
+        Kind::Glyph | Kind::Image => FastKind::General,
         _ => FastKind::General,
     }
 }
@@ -299,8 +282,6 @@ pub(super) struct FastPipelines {
     pub(super) opaque_radial: wgpu::RenderPipeline,
     pub(super) linear_band: wgpu::RenderPipeline,
     pub(super) shadow: wgpu::RenderPipeline,
-    pub(super) opaque_image: wgpu::RenderPipeline,
-    pub(super) opaque_image_bilinear: wgpu::RenderPipeline,
     pub(super) fused_grad: wgpu::RenderPipeline,
     pub(super) fast_layer: wgpu::RenderPipeline,
     pub(super) fast_layer_over_clear: wgpu::RenderPipeline,
@@ -392,8 +373,6 @@ impl FastPipelines {
             opaque_radial: make("fast_opaque_radial", OPAQUE_RADIAL_WGSL, strip, None),
             linear_band: make("fast_linear_band", LINEAR_BAND_WGSL, strip, premul),
             shadow: make("fast_shadow", SHADOW_WGSL, strip, premul),
-            opaque_image: make("fast_opaque_image", OPAQUE_IMAGE_WGSL, strip, None),
-            opaque_image_bilinear: make("fast_opaque_image_bilinear", OPAQUE_IMAGE_BILINEAR_WGSL, strip, None),
             fused_grad,
             fast_layer: fast_layer_composite_pipeline(device, layout, format),
             fast_layer_over_clear: make("fast_layer_over_clear", FAST_LAYER_OVER_CLEAR_WGSL, strip, None),
@@ -1119,119 +1098,6 @@ struct Out {
 }
 "#;
 
-const OPAQUE_IMAGE_WGSL: &str = r#"
-struct Globals { viewport: vec2<f32>, pad: vec2<f32>, flags: vec4<f32> };
-@group(0) @binding(0) var<uniform> g: Globals;
-@group(0) @binding(2) var images: texture_2d<f32>;
-@group(0) @binding(3) var<uniform> projection: vec4<f32>;
-
-struct In {
-    @builtin(vertex_index) vi: u32,
-    @location(0) rect: vec4<f32>,
-    @location(4) params: vec4<f32>,
-    @location(5) uv: vec4<f32>,
-    @location(6) clip: vec4<f32>,
-};
-struct Out {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) @interpolate(flat) origin_delta: vec2<f32>,
-    @location(1) @interpolate(flat) lo: vec2<i32>,
-    @location(2) @interpolate(flat) hi: vec2<i32>,
-    @location(3) @interpolate(flat) premul: f32,
-};
-
-fn srgb_encode(x: vec3<f32>) -> vec3<f32> {
-    let v = clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
-    return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v * 12.92, v <= vec3<f32>(0.0031308));
-}
-
-@vertex fn vs(i: In) -> Out {
-    let corner = vec2<f32>(f32(i.vi & 1u), f32(i.vi >> 1u));
-    let lo = max(i.rect.xy, i.clip.xy);
-    let hi = max(min(i.rect.xy + i.rect.zw, i.clip.zw), lo);
-    let p = select(lo, hi, corner > vec2<f32>(0.5));
-    let size_px = select(g.viewport, projection.zw, projection.z > 0.0);
-    let local = p - projection.xy;
-    var o: Out;
-    o.pos = vec4<f32>(local.x / size_px.x * 2.0 - 1.0, 1.0 - local.y / size_px.y * 2.0, 0.0, 1.0);
-    o.origin_delta = i.uv.xy - i.rect.xy;
-    o.lo = vec2<i32>(i.uv.xy);
-    o.hi = o.lo + vec2<i32>(i.uv.zw) - vec2<i32>(1);
-    o.premul = i.params.z;
-    return o;
-}
-
-@fragment fn fs(i: Out) -> @location(0) vec4<f32> {
-    let screen = i.pos.xy + projection.xy;
-    let t = clamp(vec2<i32>(floor(screen + i.origin_delta)), i.lo, i.hi);
-    let c = textureLoad(images, t, 0);
-    if (g.flags.x > 0.5) {
-        if (c.a <= 0.0) { return vec4<f32>(0.0); }
-        let lin = select(c.rgb, c.rgb / c.a, i.premul > 0.5);
-        return vec4<f32>(srgb_encode(lin) * c.a, c.a);
-    }
-    if (i.premul > 0.5) { return c; }
-    return vec4<f32>(c.rgb * c.a, c.a);
-}
-"#;
-
-const OPAQUE_IMAGE_BILINEAR_WGSL: &str = r#"
-struct Globals { viewport: vec2<f32>, pad: vec2<f32>, flags: vec4<f32> };
-@group(0) @binding(0) var<uniform> g: Globals;
-@group(0) @binding(2) var images: texture_2d<f32>;
-@group(0) @binding(3) var<uniform> projection: vec4<f32>;
-
-struct In {
-    @builtin(vertex_index) vi: u32,
-    @location(0) rect: vec4<f32>,
-    @location(4) params: vec4<f32>,
-    @location(5) uv: vec4<f32>,
-    @location(6) clip: vec4<f32>,
-};
-struct Out {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) lo: vec2<i32>,
-    @location(2) @interpolate(flat) hi: vec2<i32>,
-};
-
-fn srgb_encode(x: vec3<f32>) -> vec3<f32> {
-    let v = clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
-    return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - 0.055, v * 12.92, v <= vec3<f32>(0.0031308));
-}
-
-@vertex fn vs(i: In) -> Out {
-    let corner = vec2<f32>(f32(i.vi & 1u), f32(i.vi >> 1u));
-    let lo = max(i.rect.xy, i.clip.xy);
-    let hi = max(min(i.rect.xy + i.rect.zw, i.clip.zw), lo);
-    let p = select(lo, hi, corner > vec2<f32>(0.5));
-    let size_px = select(g.viewport, projection.zw, projection.z > 0.0);
-    let pos_local = p - projection.xy;
-    var o: Out;
-    o.pos = vec4<f32>(pos_local.x / size_px.x * 2.0 - 1.0, 1.0 - pos_local.y / size_px.y * 2.0, 0.0, 1.0);
-    o.local = (p - i.rect.xy) * i.uv.zw / i.rect.zw - vec2<f32>(0.5);
-    o.lo = vec2<i32>(i.uv.xy);
-    o.hi = o.lo + vec2<i32>(i.uv.zw) - vec2<i32>(1);
-    return o;
-}
-
-@fragment fn fs(i: Out) -> @location(0) vec4<f32> {
-    let base = floor(i.local);
-    let f = i.local - base;
-    let t0 = clamp(i.lo + vec2<i32>(base), i.lo, i.hi);
-    let t1 = clamp(i.lo + vec2<i32>(base) + vec2<i32>(1, 1), i.lo, i.hi);
-    let c00 = textureLoad(images, t0, 0);
-    let c10 = textureLoad(images, vec2<i32>(t1.x, t0.y), 0);
-    let c01 = textureLoad(images, vec2<i32>(t0.x, t1.y), 0);
-    let c11 = textureLoad(images, t1, 0);
-    let c = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
-    if (g.flags.x > 0.5) {
-        return vec4<f32>(srgb_encode(c.rgb), 1.0);
-    }
-    return vec4<f32>(c.rgb, 1.0);
-}
-"#;
-
 const LAYER_COMPOSITE_WGSL: &str = r#"
 struct Globals { viewport: vec2<f32>, pad: vec2<f32>, flags: vec4<f32> };
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -1565,7 +1431,7 @@ pub(super) fn warm_draw(
     });
     let view = tex.create_view(&Default::default());
     let mut inst: Instance = bytemuck::Zeroable::zeroed();
-    inst.rect = [0.0, 0.0, 8.0, 8.0];
+    inst.rect = [0.0, 0.0, 4096.0, 4096.0];
     inst.fill = [1.0, 1.0, 1.0, 1.0];
     inst.border = [1.0, 1.0, 1.0, 1.0];
     inst.params = [0.0, 0.0, 1.0, 1.0];
@@ -1582,9 +1448,9 @@ pub(super) fn warm_draw(
     }
     vbuf.unmap();
     let mut dummy_fg: FusedGradUniform = bytemuck::Zeroable::zeroed();
-    dummy_fg.rect = [0.0, 0.0, 8.0, 8.0];
+    dummy_fg.rect = [0.0, 0.0, 4096.0, 4096.0];
     dummy_fg.clip = super::NO_CLIP;
-    dummy_fg.rad_center_inv = [4.0, 4.0, 0.25, 0.25];
+    dummy_fg.rad_center_inv = [2048.0, 2048.0, 1.0 / 2048.0, 1.0 / 2048.0];
     dummy_fg.rad_stops = [0.0, 0.5, 1.0, 1.0];
     dummy_fg.rad_c0 = [1.0; 4];
     dummy_fg.rad_c1 = [0.5; 4];
@@ -1598,7 +1464,7 @@ pub(super) fn warm_draw(
                 view: &view,
                 depth_slice: None,
                 resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Discard },
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -1616,8 +1482,6 @@ pub(super) fn warm_draw(
             &fp.opaque_radial,
             &fp.linear_band,
             &fp.shadow,
-            &fp.opaque_image,
-            &fp.opaque_image_bilinear,
             &fp.fast_layer,
             &fp.fast_layer_over_clear,
         ] {
@@ -1641,4 +1505,94 @@ pub(super) fn warm_draw(
         pass.draw(0..4, 0..1);
     }
     queue.submit([enc.finish()]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::{Gpu, Renderer};
+    use crate::text::Atlas;
+
+    fn solid_rect(rect: [f32; 4], fill: [f32; 4]) -> Instance {
+        let mut i: Instance = bytemuck::Zeroable::zeroed();
+        i.rect = rect;
+        i.fill = fill;
+        i.params = [0.0, Kind::Rect.as_f32(), 0.0, 1.0];
+        i.clip = super::super::NO_CLIP;
+        i
+    }
+
+    fn radial_seg(rect: [f32; 4], center_r: [f32; 4], fill: [f32; 4], border: [f32; 4], s0: f32, s1: f32) -> Instance {
+        let mut i: Instance = bytemuck::Zeroable::zeroed();
+        i.rect = rect;
+        i.fill = fill;
+        i.border = border;
+        i.params = [s0, Kind::Radial.as_f32(), 0.0, s1];
+        i.uv = center_r;
+        i.clip = super::super::NO_CLIP;
+        i
+    }
+
+    #[test]
+    fn transparent_image_uses_general_pipeline() {
+        let mut img: Instance = bytemuck::Zeroable::zeroed();
+        img.rect = [0.0, 0.0, 352.0, 160.0];
+        img.fill = [1.0, 1.0, 1.0, 1.0];
+        img.params = [0.0, Kind::Image.as_f32(), 0.0, 1.0];
+        img.uv = [0.0, 0.0, 352.0, 160.0];
+        img.clip = super::super::NO_CLIP;
+        assert_eq!(classify(&img), FastKind::General);
+    }
+
+    #[test]
+    fn opaque_rect_fading_updates_fast_kind_without_params_change() {
+        let gpu = Gpu::headless_wgpu();
+        let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+        let mut atlas = Atlas::new();
+        let mut list = vec![solid_rect([0.0, 0.0, 200.0, 200.0], [0.2, 0.4, 0.8, 1.0])];
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        assert_eq!(renderer.fast_kinds, vec![FastKind::OpaqueRect]);
+
+        // Fade fill alpha below 1 without changing count or params.
+        list[0].fill = [0.1, 0.2, 0.4, 0.5];
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        assert_eq!(renderer.fast_kinds, vec![FastKind::General]);
+
+        // Also test the loop-only `write_patched` path.
+        list[0].fill = [0.2, 0.4, 0.8, 1.0];
+        renderer.next_instances(1, None);
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        assert_eq!(renderer.fast_kinds, vec![FastKind::OpaqueRect]);
+
+        list[0].fill = [0.1, 0.2, 0.4, 0.5];
+        renderer.next_instances(1, Some(vec![0]));
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 400));
+        assert_eq!(renderer.fast_kinds, vec![FastKind::General]);
+    }
+
+    #[test]
+    fn fused_grad_color_change_updates_uniform_without_params_change() {
+        let gpu = Gpu::headless_wgpu();
+        let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+        let mut atlas = Atlas::new();
+        let rect = [0.0, 0.0, 400.0, 200.0];
+        let mut list = vec![
+            radial_seg(rect, [200.0, 100.0, 200.0, 100.0], [1.0, 0.0, 0.0, 1.0], [0.5, 0.0, 0.0, 1.0], 0.0, 2.5),
+            radial_seg(rect, [200.0, 100.0, 200.0, 100.0], [0.5, 0.0, 0.0, 1.0], [0.1, 0.1, 0.1, 1.0], 2.5, 1.0),
+        ];
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 200));
+        let (span, u0) = renderer.fused_grad.as_ref().expect("fused grad detected");
+        assert_eq!(*span, 0..2);
+        assert_eq!(u0.rad_c0, [1.0, 0.0, 0.0, 1.0]);
+
+        // Change only slide colours (same count, same params).
+        list[0].fill = [0.0, 0.0, 1.0, 1.0];
+        list[0].border = [0.0, 0.0, 0.5, 1.0];
+        list[1].fill = [0.0, 0.0, 0.5, 1.0];
+        renderer.prepare(&gpu.device, &gpu.queue, &mut atlas, &list, (400, 200));
+        let (span2, u1) = renderer.fused_grad.as_ref().expect("fused grad still detected");
+        assert_eq!(*span2, 0..2);
+        assert_eq!(u1.rad_c0, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(u1.rad_c1, [0.0, 0.0, 0.5, 1.0]);
+    }
 }

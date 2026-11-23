@@ -23,8 +23,8 @@ pub(super) struct Cleared {
     pub(super) len: u32,
     /// When the viewport is partitioned into `[0, 0, W, y0]` (`instances[1]`, `color`) and a
     /// dominant opaque rect `[0, y0, W, H - y0]` (`instances[skip]`, `swap_color`) disjoint from
-    /// everything in `2..skip`, clearing to `swap_color` and starting at `1` lets us skip the
-    /// dominant rect (`1.94 MP`) and only draw the small top strip (`0.13 MP`).
+    /// everything in `2..skip`, clearing to `swap_color` and starting at `1` skips shading the
+    /// dominant rect and draws only the smaller top strip.
     pub(super) swap: Option<(u32, [f32; 4])>,
 }
 

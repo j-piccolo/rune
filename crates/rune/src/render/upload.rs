@@ -42,6 +42,13 @@ pub(super) struct Uploads {
     patched: bool,
     /// Whether `fast::warm_draw` has run once to pre-compile fast-path fragment shaders.
     fast_warmed: bool,
+    /// Whether an in-place instance write touched `fused_grad` or a `Kind::Radial`, requiring
+    /// `fused_grad` and its uniform buffer to be refreshed without a full rebatch.
+    fused_dirty: bool,
+    /// The `srgb_blend` mode last bound onto `self.images` pages.
+    images_srgb: Option<bool>,
+    /// Last seen `atlas.overwritten` generation.
+    atlas_overwritten: u64,
     #[cfg(test)]
     pub(super) globals_writes: u64,
     #[cfg(test)]
@@ -50,7 +57,7 @@ pub(super) struct Uploads {
 
 impl Default for Uploads {
     fn default() -> Uploads {
-        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false, fast_warmed: false,
+        Uploads { staging: None, frame_writes: None, instances: Vec::new(), batched: false, has_layers: false, viewport: AtomicU64::new(u64::MAX), srgb: None, lost: (0, 0), next: None, held_paint: None, patched: false, fast_warmed: false, fused_dirty: false, images_srgb: None, atlas_overwritten: 0,
             #[cfg(test)] globals_writes: 0, #[cfg(test)] batch_runs: 0 }
     }
 }
@@ -256,10 +263,13 @@ impl Renderer {
         }
         atlas.outlines.set_support(self.uber.support());
         self.lcd_frame = self.lcd_ready(device, atlas.lcd_wanted) && atlas.lcd;
+        if atlas.overwritten != self.uploads.atlas_overwritten {
+            self.uploads.atlas_overwritten = atlas.overwritten;
+            self.layers.texels += 1;
+        }
         if let Some(rows) = atlas.dirty.take() {
             atlas.rows_uploaded(0, rows);
             Self::write_rows(&staging, &self.atlas, &atlas.data, rows);
-            self.layers.texels += 1;
         }
         let mut atlas_changed = self.atlas_pages.len() > atlas.pages.len();
         self.atlas_pages.truncate(atlas.pages.len());
@@ -274,7 +284,6 @@ impl Renderer {
             if let Some(rows) = atlas.pages[index].dirty.take() {
                 atlas.rows_uploaded(index + 1, rows);
                 Self::write_rows(&staging, &self.atlas_pages[index].0, &atlas.pages[index].data, rows);
-                self.layers.texels += 1;
             }
         }
         if atlas_changed { self.images_changed(); }
@@ -316,12 +325,28 @@ impl Renderer {
         }
         // GPU springs move instances in the vertex stage, off the pixels `Cleared` checks.
         self.cleared = if self.springs.is_some() { Default::default() } else { super::cleared::Cleared::of(instances) };
+        if self.uploads.images_srgb != Some(self.srgb_blend) {
+            self.uploads.images_srgb = Some(self.srgb_blend);
+            if !self.images.is_empty() {
+                self.rebind_image_pages(device);
+            }
+        }
         if !self.uploads.batched {
             self.batch(instances);
+            self.uploads.fused_dirty = false;
             if let (Some((_, u)), Some(res)) = (&self.fused_grad, &self.fused_res) {
                 staging.write_buffer(&res.buffer, 0, bytemuck::bytes_of(u));
             }
         } else {
+            if self.uploads.fused_dirty {
+                self.uploads.fused_dirty = false;
+                if self.fused_res.is_some() {
+                    self.fused_grad = super::fast::detect_fused_grad(instances, &self.fast_kinds);
+                    if let (Some((_, u)), Some(res)) = (&self.fused_grad, &self.fused_res) {
+                        staging.write_buffer(&res.buffer, 0, bytemuck::bytes_of(u));
+                    }
+                }
+            }
             // Same batches: only the effects' copies of their instances can be out of date.
             for (at, effect) in &mut self.effects { *effect = instances[*at as usize]; }
         }
@@ -488,6 +513,22 @@ impl Renderer {
         let held = &mut self.uploads.instances;
         let shared = instances.len().min(held.len());
         let mut rebatch = instances.len() != held.len();
+        let mut fused_dirty = false;
+        let fused_range = self.fused_grad.as_ref().map(|(r, _)| r.start as usize..r.end as usize);
+        let fast_kinds = &mut self.fast_kinds;
+        let update_fast = |fk: &mut Vec<super::fast::FastKind>, dirty: &mut bool, span: &std::ops::Range<usize>| {
+            if fk.len() == instances.len() {
+                for i in span.clone() {
+                    fk[i] = super::fast::classify(&instances[i]);
+                    if instances[i].kind() == Some(Kind::Radial) {
+                        *dirty = true;
+                    }
+                }
+            }
+            if let Some(fg) = &fused_range && span.start < fg.end && span.end > fg.start {
+                *dirty = true;
+            }
+        };
         held.resize(instances.len(), Instance::zeroed());
         let mut open: Option<std::ops::Range<usize>> = None;
         for start in (0..shared).step_by(BLOCK) {
@@ -498,11 +539,21 @@ impl Renderer {
                 (start + 1..end).find(differs).unwrap_or(start)
             };
             let last = (first..end).rfind(differs).map_or(end, |i| i + 1);
-            rebatch |= Self::join(self.instances.buffer(), held, staging, instances, &mut open, first..last);
+            if let Some(written) = Self::join(self.instances.buffer(), held, staging, instances, &mut open, first..last, &mut rebatch) {
+                update_fast(fast_kinds, &mut fused_dirty, &written);
+            }
         }
-        if instances.len() > shared { rebatch |= Self::join(self.instances.buffer(), held, staging, instances, &mut open, shared..instances.len()); }
-        if let Some(span) = open { rebatch |= Self::write_span(self.instances.buffer(), held, staging, instances, span); }
+        if instances.len() > shared {
+            if let Some(written) = Self::join(self.instances.buffer(), held, staging, instances, &mut open, shared..instances.len(), &mut rebatch) {
+                update_fast(fast_kinds, &mut fused_dirty, &written);
+            }
+        }
+        if let Some(span) = open {
+            rebatch |= Self::write_span(self.instances.buffer(), held, staging, instances, span.clone());
+            update_fast(fast_kinds, &mut fused_dirty, &span);
+        }
         self.uploads.batched &= !rebatch;
+        self.uploads.fused_dirty |= fused_dirty;
     }
 
     /// Writes only `patched` (ascending): the instances a loop-only frame changed (a dot's colour,
@@ -514,6 +565,8 @@ impl Renderer {
         debug_assert!(held.iter().zip(instances).enumerate().all(|(n, (h, i))| patched.binary_search(&(n as u32)).is_ok() || same(std::slice::from_ref(h), std::slice::from_ref(i))),
             "a loop-only frame changed an instance that isn't one of its slots");
         let mut rebatch = false;
+        let mut fused_dirty = false;
+        let fused_range = self.fused_grad.as_ref().map(|(r, _)| r.start as usize..r.end as usize);
         let mut k = 0;
         while k < patched.len() {
             let start = patched[k] as usize;
@@ -523,10 +576,22 @@ impl Renderer {
             if end > instances.len() || same(&instances[start..end], &held[start..end]) { continue; }
             rebatch |= held[start..end].iter().zip(&instances[start..end]).any(|(h, i)| h.params[..3] != i.params[..3]);
             held[start..end].copy_from_slice(&instances[start..end]);
+            if self.fast_kinds.len() == instances.len() {
+                for i in start..end {
+                    self.fast_kinds[i] = super::fast::classify(&instances[i]);
+                    if instances[i].kind() == Some(Kind::Radial) {
+                        fused_dirty = true;
+                    }
+                }
+            }
+            if let Some(fg) = &fused_range && start < fg.end && end > fg.start {
+                fused_dirty = true;
+            }
             let offset = (start * std::mem::size_of::<Instance>()) as u64;
             staging.write_buffer(self.instances.buffer(), offset, bytemuck::cast_slice(&instances[start..end]));
         }
         self.uploads.batched &= !rebatch;
+        self.uploads.fused_dirty |= fused_dirty;
     }
 
     /// The instances the buffer holds, when they are paint `paint`'s and `len` of them.
@@ -542,12 +607,15 @@ impl Renderer {
     }
 
     /// Adds `span` to the open span if it is less than a block past it, or writes the open span
-    /// and opens `span`. True if it wrote a span whose `params` changed.
+    /// and opens `span`. Returns the span that was written, if any.
     fn join(buffer: &wgpu::Buffer, held: &mut [Instance], staging: &Staging, instances: &[Instance],
-        open: &mut Option<std::ops::Range<usize>>, span: std::ops::Range<usize>) -> bool {
+        open: &mut Option<std::ops::Range<usize>>, span: std::ops::Range<usize>, rebatch: &mut bool) -> Option<std::ops::Range<usize>> {
         match open {
-            Some(o) if span.start <= o.end + BLOCK => { o.end = span.end; false }
-            _ => open.replace(span).is_some_and(|o| Self::write_span(buffer, held, staging, instances, o)),
+            Some(o) if span.start <= o.end + BLOCK => { o.end = span.end; None }
+            _ => open.replace(span).map(|o| {
+                *rebatch |= Self::write_span(buffer, held, staging, instances, o.clone());
+                o
+            }),
         }
     }
 

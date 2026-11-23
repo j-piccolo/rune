@@ -293,6 +293,23 @@ fn opaque_base(first: Option<&Instance>, rect: [f32; 4]) -> Option<[f32; 4]> {
     covers.then_some(i.fill)
 }
 
+fn opaque_interior_covers(first: Option<&Instance>, rect: [f32; 4], dirty: [u32; 4]) -> bool {
+    let Some(i) = first else { return false };
+    if i.kind() != Some(Kind::Rect) || i.fill[3] != 1.0 || i.params[2] > 0.5 || i.fade != [0; 4] {
+        return false;
+    }
+    let inset = (i.radii.iter().copied().fold(0.0f32, f32::max).max(i.params[0]) + 1.0).ceil();
+    let ix0 = (i.rect[0] + inset).max(i.clip[0]);
+    let iy0 = (i.rect[1] + inset).max(i.clip[1]);
+    let ix1 = (i.rect[0] + i.rect[2] - inset).min(i.clip[2]);
+    let iy1 = (i.rect[1] + i.rect[3] - inset).min(i.clip[3]);
+    let dx0 = rect[0] + dirty[0] as f32;
+    let dy0 = rect[1] + dirty[1] as f32;
+    let dx1 = dx0 + dirty[2] as f32;
+    let dy1 = dy0 + dirty[3] as f32;
+    ix0 <= dx0 && iy0 <= dy0 && ix1 >= dx1 && iy1 >= dy1
+}
+
 fn partial_layer_dirty(holds: &Holds, rect: [f32; 4], viewport: (u32, u32), texels: u64, images: u64, binding: u64, instances: &[Instance]) -> Option<[u32; 4]> {
     if holds.rect != rect || holds.viewport != viewport || holds.texels != texels || holds.images != images || holds.binding != binding || holds.instances.len() != instances.len() {
         return None;
@@ -895,13 +912,27 @@ impl Renderer {
                     // its target holds already isn't drawn again: the frame composites the texture.
                     let content = instances.get(l.begin as usize + 1..l.end as usize).unwrap_or(&[]);
                     let plain = quiet && cache.is_none() && l.blur == 0.0 && !l.free && l.turn.is_none() && !content.is_empty()
-                        && !content.iter().any(|i| i.kind().is_none_or(|k| matches!(k, Kind::Layer | Kind::LayerEnd | Kind::Effect | Kind::BackdropBlur)));
+                        && content.iter().all(|i| match i.kind() {
+                            Some(Kind::Effect | Kind::BackdropBlur) | None => false,
+                            Some(Kind::Layer) => {
+                                i.fill[3] >= 1.0
+                                    && i.params[0] == 0.0
+                                    && i.params[2] == 0.0
+                                    && i.params[3] == 0.0
+                                    && i.border[1] == 0.0
+                                    && i.fade == [0; 4]
+                                    && i.radii[3] == 0.0
+                            }
+                            _ => true,
+                        });
                     let holds = t.holds.get_mut().unwrap_or_else(|e| e.into_inner());
                     let same = plain && holds.as_ref().is_some_and(|h| h.is(rect, viewport, texels, images, t.binding, content));
                     let ob = if l.blur == 0.0 && !l.free && l.turn.is_none() { opaque_base(content.first(), rect) } else { None };
                     t.opaque_clear = ob;
-                    t.dirty_rect = if !same && plain && ob.is_some() {
-                        holds.as_ref().and_then(|h| partial_layer_dirty(h, rect, viewport, texels, images, t.binding, content))
+                    t.dirty_rect = if !same && plain {
+                        holds.as_ref()
+                            .and_then(|h| partial_layer_dirty(h, rect, viewport, texels, images, t.binding, content))
+                            .filter(|&dirty| ob.is_some() || opaque_interior_covers(content.first(), rect, dirty))
                     } else {
                         None
                     };

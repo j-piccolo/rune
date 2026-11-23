@@ -74,18 +74,13 @@ impl Renderer {
         let springs = properties.map(|(nodes, ids)| crate::gpu::springs::Bindings::new(device, spring_layout.as_ref().unwrap(), nodes, ids));
         let mut fast = Vec::new();
         let mut fused_res = None;
-        let mut extra = Vec::new();
+        let extra = Vec::new();
         let mut layers = super::layers::Layers::default();
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
         if properties.is_none() {
             let res = super::fast::FusedGradResources::new(device);
             fast.push((format, super::fast::FastPipelines::new(device, &layout, &bgl, &res.layout, format)));
             layers.pipelines.push((format, super::fast::layer_composite_pipeline(device, &layout, format, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)));
-            if super::layers::FORMAT != format {
-                fast.push((super::layers::FORMAT, super::fast::FastPipelines::new(device, &layout, &bgl, &res.layout, super::layers::FORMAT)));
-                extra.push((super::layers::FORMAT, Self::pipeline(device, &layout, &shader, super::layers::FORMAT, vertex_entry, Blend::SourceOver)));
-                layers.pipelines.push((super::layers::FORMAT, super::fast::layer_composite_pipeline(device, &layout, super::layers::FORMAT, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)));
-            }
             fused_res = Some(res);
         }
         WarmRenderer {

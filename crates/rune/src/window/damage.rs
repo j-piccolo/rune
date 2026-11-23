@@ -372,6 +372,22 @@ fn gathered_apart(each: &mut [[u32; 4]]) -> Vec<[u32; 4]> {
             absorb(&mut rects, join(a, b));
         }
     }
+    // Merging two small rects that add <= 16K pixels (e.g. a row of 7 card titles clipping out at
+    // the top edge during a scroll) saves an entire scissor pass per rect (hundreds of us in
+    // lavapipe) at a negligible shading cost.
+    while rects.len() > 1 {
+        let mut best = (u64::MAX, 0, 1);
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                let grow = u64::from(area(join(rects[i], rects[j]))).saturating_sub(u64::from(area(rects[i])) + u64::from(area(rects[j])));
+                if grow < best.0 { best = (grow, i, j); }
+            }
+        }
+        if best.0 > 16_384 { break; }
+        let b = rects.swap_remove(best.2);
+        let a = rects.swap_remove(best.1);
+        absorb(&mut rects, join(a, b));
+    }
     rects
 }
 /// Adds `r` to `rects`: into one it touches, or as its own until there are `RECTS`, then into

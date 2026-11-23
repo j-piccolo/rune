@@ -246,6 +246,10 @@ pub struct Atlas {
     /// Glyph outlines drawn straight on the GPU, uploaded with the pages.
     #[doc(hidden)]
     pub outlines: super::outline::OutlineStore,
+    /// Bumped only when previously allocated glyph/icon texels are overwritten or evicted
+    /// (`evict_page`, `write_bordered`, `invalidate`), never on append-only shelf allocations.
+    #[doc(hidden)]
+    pub overwritten: u64,
 }
 
 impl Atlas {
@@ -254,6 +258,7 @@ impl Atlas {
         self.resend_rows();
         self.resident_caches.clear();
         self.outlines.invalidate();
+        self.overwritten += 1;
     }
 
     /// Marks the rows the shelves have placed glyphs in for upload, to a texture that's new or
@@ -325,6 +330,7 @@ impl Atlas {
             fills: Vec::new(),
             icons: HashMap::new(),
             outlines: super::outline::OutlineStore::empty(),
+            overwritten: 0,
         }
     }
 
@@ -357,6 +363,7 @@ impl Atlas {
         self.icons.retain(|_, v| v.is_none_or(|g| g.page != p16));
         self.clock += 1;
         self.resets += 1;
+        self.overwritten += 1;
         let age = self.clock;
         let next_gen = self.alloc_page_gen();
         if page == 0 {
@@ -541,6 +548,7 @@ impl Atlas {
             return false;
         }
         self.write_bordered_pixels(slot, px, cov);
+        self.overwritten += 1;
         self.touch(slot.page, slot.w * slot.h);
         true
     }

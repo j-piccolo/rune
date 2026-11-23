@@ -124,8 +124,9 @@ pub use rune_core::Blend;
 pub use warmup::warm_gpu;
 pub use warmup::warm_gpu_with;
 
-/// Rows the first glyph atlas page's texture starts with: a window that shows a few labels holds
-/// 512 KiB of it, not 4 MiB. It doubles as its shelves fill, up to `ATLAS_SIZE` (`prepare`).
+/// Rows the first glyph atlas page's texture starts with: a window starts with 2 MiB instead of
+/// 4 MiB and avoids mid-session atlas grows when browsing text-heavy views, doubling up to
+/// `ATLAS_SIZE` (`prepare`).
 pub(crate) const ATLAS_START_ROWS: u32 = 1024;
 
 /// `RUNE_LOOP_CHECK=2` found a picture that differed from the whole frame's (`pixel_check`), so the
@@ -569,6 +570,28 @@ impl Renderer {
             };
             let skip_idx = if target.is_none() { self.skip_instance.get() } else { None };
             if let Some(fp) = fast_pipes {
+                let draw_general = |pass: &mut wgpu::RenderPass<'_>, mut b: *const wgpu::RenderPipeline, range: std::ops::Range<u32>| -> *const wgpu::RenderPipeline {
+                    #[cfg(not(feature = "frame-profile"))]
+                    let split = pinned.filter(|_| few_runs(&self.kinds, range.clone()));
+                    #[cfg(feature = "frame-profile")]
+                    let split = pinned.filter(|_| pinned_forced() == Some(true) || few_runs(&self.kinds, range.clone()));
+                    if let Some(pinned) = split {
+                        for run in kind_runs(&self.kinds, range) {
+                            let kind = self.kinds[run.start as usize];
+                            let pipeline = kind
+                                .and_then(|k| variant::PINNED_FROM_WGSL.iter().position(|&p| p == k.as_u32()))
+                                .and_then(|at| pinned.get(at)?.as_ref())
+                                .unwrap_or(frame_pipeline);
+                            if !std::ptr::eq(pipeline, b) { pass.set_pipeline(pipeline); b = pipeline; }
+                            pass.draw(0..4, run);
+                        }
+                    } else {
+                        if !std::ptr::eq(frame_pipeline, b) { pass.set_pipeline(frame_pipeline); b = frame_pipeline; }
+                        pass.draw(0..4, range);
+                    }
+                    b
+                };
+                let mut cur_bound: *const wgpu::RenderPipeline = bound;
                 let mut at = span.start as usize;
                 let end = span.end as usize;
                 let fk = &self.fast_kinds[..end.min(self.fast_kinds.len())];
@@ -576,8 +599,7 @@ impl Renderer {
                 while at < end {
                     if skip_idx == Some(at as u32) {
                         if let Some(s) = general_start.take() {
-                            if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
-                            pass.draw(0..4, s as u32..at as u32);
+                            cur_bound = draw_general(pass, cur_bound, s as u32..at as u32);
                         }
                         at += 1;
                         continue;
@@ -587,11 +609,10 @@ impl Renderer {
                         && fg_span.end as usize <= end
                     {
                         if let Some(s) = general_start.take() {
-                            if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
-                            pass.draw(0..4, s as u32..at as u32);
+                            cur_bound = draw_general(pass, cur_bound, s as u32..at as u32);
                         }
                         let p = &fp.fused_grad;
-                        if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                        if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                         pass.set_bind_group(1, &res.bind_group, &[]);
                         pass.draw(0..4, 0..1);
                         at = fg_span.end as usize;
@@ -606,67 +627,56 @@ impl Renderer {
                         continue;
                     }
                     if let Some(s) = general_start.take() {
-                        if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
-                        pass.draw(0..4, s as u32..at as u32);
+                        cur_bound = draw_general(pass, cur_bound, s as u32..at as u32);
                     }
                     let run = at as u32..cur as u32;
                     match kind {
                         fast::FastKind::OpaqueRoundedRect => {
                             let p_in = &fp.opaque_rect_interior;
-                            if !std::ptr::eq(p_in, bound) { pass.set_pipeline(p_in); }
+                            if !std::ptr::eq(p_in, cur_bound) { pass.set_pipeline(p_in); }
                             pass.draw(0..4, run.clone());
                             let p_ring = &fp.rounded_rect_ring;
                             pass.set_pipeline(p_ring);
-                            bound = p_ring;
+                            cur_bound = p_ring;
                             pass.draw(0..24, run);
                         }
                         fast::FastKind::OpaqueRoundedLinear => {
                             let p_in = &fp.opaque_linear_interior;
-                            if !std::ptr::eq(p_in, bound) { pass.set_pipeline(p_in); }
+                            if !std::ptr::eq(p_in, cur_bound) { pass.set_pipeline(p_in); }
                             pass.draw(0..4, run.clone());
                             let p_ring = &fp.rounded_linear_ring;
                             pass.set_pipeline(p_ring);
-                            bound = p_ring;
+                            cur_bound = p_ring;
                             pass.draw(0..24, run);
                         }
                         fast::FastKind::OpaqueRect => {
                             let p = &fp.opaque_rect;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::OpaqueLinear => {
                             let p = &fp.opaque_linear;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::RoundedLinear => {
                             let p = &fp.rounded_linear;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::OpaqueRadial => {
                             let p = &fp.opaque_radial;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::LinearBand => {
                             let p = &fp.linear_band;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::Shadow => {
                             let p = &fp.shadow;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
-                            pass.draw(0..4, run);
-                        }
-                        fast::FastKind::OpaqueImage => {
-                            let p = &fp.opaque_image;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
-                            pass.draw(0..4, run);
-                        }
-                        fast::FastKind::OpaqueImageBilinear => {
-                            let p = &fp.opaque_image_bilinear;
-                            if !std::ptr::eq(p, bound) { pass.set_pipeline(p); bound = p; }
+                            if !std::ptr::eq(p, cur_bound) { pass.set_pipeline(p); cur_bound = p; }
                             pass.draw(0..4, run);
                         }
                         fast::FastKind::General => unreachable!(),
@@ -674,8 +684,12 @@ impl Renderer {
                     at = cur;
                 }
                 if let Some(s) = general_start.take() {
-                    if !std::ptr::eq(frame_pipeline, bound) { pass.set_pipeline(frame_pipeline); bound = frame_pipeline; }
-                    pass.draw(0..4, s as u32..end as u32);
+                    cur_bound = draw_general(pass, cur_bound, s as u32..end as u32);
+                }
+                // Sync `bound` for subsequent batches if the last pipeline differed from `frame_pipeline`.
+                if !std::ptr::eq(cur_bound, bound) {
+                    pass.set_pipeline(frame_pipeline);
+                    bound = frame_pipeline;
                 }
                 continue;
             }
