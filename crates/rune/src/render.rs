@@ -656,7 +656,7 @@ impl Renderer {
                 let fk = &self.fast_kinds[..end.min(self.fast_kinds.len())];
                 let mut general_start: Option<usize> = None;
                 while at < end {
-                    if skip_idx == Some(at as u32) {
+                    if skip_idx == Some(at as u32) || self.kind_skipped(at as u32) {
                         if let Some(s) = general_start.take() {
                             self.draw_span(pass, s as u32..at as u32, frame_pipeline, pinned, middles, &mut bound);
                         }
@@ -666,6 +666,7 @@ impl Renderer {
                     if let (Some((fg_span, _)), Some(res)) = (&self.fused_grad, &self.fused_res)
                         && fg_span.start as usize == at
                         && fg_span.end as usize <= end
+                        && !fg_span.clone().any(|i| self.kind_skipped(i))
                     {
                         if let Some(s) = general_start.take() {
                             self.draw_span(pass, s as u32..at as u32, frame_pipeline, pinned, middles, &mut bound);
@@ -679,7 +680,7 @@ impl Renderer {
                     }
                     let kind = fk.get(at).copied().unwrap_or(fast::FastKind::General);
                     let mut cur = at + 1;
-                    while fk.get(cur).copied() == Some(kind) && cur < end && skip_idx != Some(cur as u32) { cur += 1; }
+                    while fk.get(cur).copied() == Some(kind) && cur < end && skip_idx != Some(cur as u32) && !self.kind_skipped(cur as u32) { cur += 1; }
                     if matches!(kind, fast::FastKind::General) {
                         general_start.get_or_insert(at);
                         at = cur;
@@ -1091,6 +1092,18 @@ fn skipped_rects() -> &'static [[f32; 4]] {
 /// Frame-profile builds: pipeline binds and draws in `draw_quads`, reported with `RUNE_PINNED` (`report_pinned`).
 #[cfg(feature = "frame-profile")]
 pub(super) static DRAW_TALLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Renderer {
+    /// Whether `RUNE_SKIP_KIND` leaves instance `i` undrawn (frame-profile builds), wherever it would draw: the
+    /// fast pipelines and a layer's composite, as well as `draw_quads`. Other builds draw everything.
+    #[inline(always)]
+    pub(super) fn kind_skipped(&self, i: u32) -> bool {
+        #[cfg(feature = "frame-profile")]
+        { !skipped_kinds().is_empty() && self.kinds.get(i as usize).copied().flatten().is_some_and(|k| skipped_kinds().contains(&k.as_u32())) }
+        #[cfg(not(feature = "frame-profile"))]
+        { let _ = i; false }
+    }
+}
 
 /// Frame-profile builds: `RUNE_SKIP_KIND=0,7` leaves the instances of those kinds (`Kind::as_u32`) undrawn in the
 /// frame's passes, so a frame budget can say what each kind costs a GPU: the time with them less the time without.
