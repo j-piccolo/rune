@@ -970,6 +970,7 @@ impl<S: 'static> App<S> {
             #[cfg(not(any(feature = "tooling", debug_assertions)))]
             Err(crate::tooling::StartError::Window(crate::tooling::WITHOUT_TOOLING.into()))
         } else {
+            crate::overlay::set_inherited(self.runtime.font_smoothing, self.prewarm_effects);
             crate::window::run(self, args).map_err(crate::tooling::StartError::Window)
         }
     }

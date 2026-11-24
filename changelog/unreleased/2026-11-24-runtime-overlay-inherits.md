@@ -1,0 +1,1 @@
+- `wayland::open`: an overlay opened while the app runs takes the app's font smoothing (`App::font_smoothing`) and effect-pipeline warming (`App::prewarm_effects`), as an overlay declared before it runs does; it took neither.
