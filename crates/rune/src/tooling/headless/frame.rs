@@ -96,6 +96,15 @@ pub(super) struct HeadlessLoop<'a> {
     pub(super) rest_ms: Vec<f64>,
     #[cfg(feature = "frame-profile")]
     pub(super) profile: crate::frame::profile::Log,
+    /// The GPU's time and fragments for each logged frame (`tooling::FrameLog`'s queries).
+    #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+    pub(super) queries: Option<super::super::frame_log::Queries>,
+    /// `RUNE_FRAME_MARKS`: when each frame ends.
+    #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+    pub(super) marks: super::super::frame_log::Marks,
+    /// The last frame was still moving (the runtime or the compositor): this one lands it.
+    #[cfg(feature = "frame-profile")]
+    pub(super) fp_was_animating: bool,
 }
 
 /// `RUNE_DRAW_DUMP=<dir>`, when set (frame-profile).
@@ -205,6 +214,27 @@ pub(super) struct HeadlessFrame<'a, 'b, F> {
     /// This thread's CPU in each stage after the update (`frame::profile::STAGES`).
     #[cfg(feature = "frame-profile")]
     pub(super) fp_stages: [f64; crate::frame::profile::STAGES],
+    /// Whether the frame is logged: every frame, or with `RUNE_FRAME_LOG_DRAWN`, those a window would draw.
+    #[cfg(feature = "frame-profile")]
+    pub(super) fp_drawn: bool,
+    /// The GPU's clock while it drew the frame, read once it was handed over.
+    #[cfg(feature = "frame-profile")]
+    pub(super) fp_mhz: Option<u32>,
+    /// This thread's CPU the log's own reads took, left out of the frame's.
+    #[cfg(feature = "frame-profile")]
+    pub(super) fp_excluded: f64,
+}
+
+/// `RUNE_FRAME_LOG_DRAWN=1`: the frame log (and draw dump) holds only the frames a window on screen would
+/// draw after its first: one that handled input or committed, one something moved in (the runtime or the
+/// compositor), one that lands a motion, and one whose pictures changed. A window draws nothing at rest,
+/// and its first frame is its launch (the app's boot, its pipelines, its fonts), which a judge of frame
+/// rates leaves out. The turns between are left out of the next frame's counts, and `RUNE_FRAME_MARKS`
+/// marks them `skip`.
+#[cfg(feature = "frame-profile")]
+fn drawn_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUNE_FRAME_LOG_DRAWN").is_some())
 }
 
 /// Adds this thread's CPU since `since` to stage `stage` of the frame's profile, and returns now.
@@ -335,7 +365,10 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         #[cfg(feature = "frame-profile")]
         let cpu = crate::frame::profile::thread_cpu_ms();
         prepare_gpu_resources(&mut s.renderer, s.gpu, self.app.rt_mut(), (s.wp, s.hp), false);
-        let encoder = s.gpu.device.create_command_encoder(&Default::default());
+        #[allow(unused_mut)]
+        let mut encoder = s.gpu.device.create_command_encoder(&Default::default());
+        #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+        if let Some(q) = &s.queries { q.begin(&mut encoder, &mut s.renderer); }
         // `RUNE_TARGET_AGE=n`: this frame's target is the one drawn `n` frames ago, as a swap chain's is.
         #[cfg(not(target_os = "macos"))]
         let buffers = crate::window::damage::target_age();
@@ -347,6 +380,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         }
         #[cfg(feature = "frame-profile")]
         let cpu = staged(&mut self.fp_stages, 0, cpu);
+        #[cfg(feature = "frame-profile")]
+        {
+            #[cfg(not(target_os = "macos"))]
+            let pictures = images_changed;
+            #[cfg(target_os = "macos")]
+            let pictures = false;
+            self.fp_drawn = !drawn_only() || self.k > 0 && (self.fp_events > 0 || self.app.rt().stats.commits > self.fp_commits0
+                || _info.animating || s.fp_was_animating || pictures);
+        }
         // Only what changed is redrawn, as a window redraws it (`window::damage`).
         #[cfg(not(target_os = "macos"))]
         {
@@ -360,7 +402,7 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             let age = if buffers > 0 && s.turns >= buffers && s.overlay.is_none() { buffers } else { 0 };
             s.turns = s.turns.saturating_add(1);
             #[cfg(feature = "frame-profile")]
-            dump_draw_list(self.k, &plan, rt, (s.wp, s.hp), rt.clear_color(), keeps, s.alpha.is_none() && !crate::window::damage::whole_frames());
+            if self.fp_drawn { dump_draw_list(self.k, &plan, rt, (s.wp, s.hp), rt.clear_color(), keeps, s.alpha.is_none() && !crate::window::damage::whole_frames()); }
             match plan {
                 crate::window::damage::Plan::Part { draw, shift, same, .. } => {
                     s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format, shift.map(|s| (s.from, s.to)));
@@ -430,6 +472,9 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         if let Some(alpha) = &s.alpha {
             alpha.draw(&mut prepared.encoder, &s.target.view);
         }
+        // The frame's own commands end here: a window reads none of its pixels back.
+        #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+        if let Some(q) = &mut s.queries { q.end(&mut prepared.encoder, &mut s.renderer); }
         if prepared.shot.shot.snap {
             s.snap_crop.set(crop::snap_rect(self.app.rt(), s.args, s.scale, (s.wp, s.hp)));
         }
@@ -451,6 +496,13 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         s.in_flight.push(submission);
         #[cfg(feature = "frame-profile")]
         staged(&mut self.fp_stages, 3, cpu);
+        // The GPU's clock while it draws: read now, as an idle GPU's reads nothing.
+        #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+        if self.fp_drawn && s.queries.is_some() {
+            let before = crate::frame::profile::thread_cpu_ms();
+            self.fp_mhz = s.profile.exclude(super::super::frame_log::gpu_mhz);
+            self.fp_excluded += crate::frame::profile::thread_cpu_ms() - before;
+        }
         self.encoded_stamp = s.reports.stamp();
         if self.want_pixels { s.readback.submitted(); }
         crate::time::now()
@@ -476,7 +528,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
         #[cfg(feature = "frame-profile")]
         staged(&mut self.fp_stages, 4, cpu);
         #[cfg(feature = "frame-profile")]
-        {
+        { s.fp_was_animating = info.animating; }
+        #[cfg(feature = "frame-profile")]
+        if !self.fp_drawn {
+            s.profile.skip();
+            #[cfg(not(target_arch = "wasm32"))]
+            s.marks.mark("skip");
+        }
+        #[cfg(feature = "frame-profile")]
+        if self.fp_drawn {
             // Convert the frame's raw CPU mark before taking phase deltas so that once Windows'
             // cycle rate is known here, `take()` sees the cached rate for every phase too.
             let cpu_ms = frame_cpu_ms(self.fp_cpu0, crate::frame::profile::thread_cpu_since);
@@ -484,6 +544,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             // The frame's wall time until the GPU had drawn it, less `ms`: on a software rasteriser with no
             // threads of its own (lavapipe, `LP_NUM_THREADS=0`), what drawing the frame's pixels cost.
             let gpu_wait_ms = self.frame_start.elapsed().as_secs_f64() * 1000.0 - ms;
+            // The GPU's clock, time and fragments: the log's own work, read after the frame's CPU
+            // time was taken. What the log did earlier in the frame (`fp_excluded`) is left out of it.
+            #[cfg(not(target_arch = "wasm32"))]
+            let (mhz, (gpu_time_ms, frag_invocations)) = {
+                let read = s.queries.as_ref().map(|q| s.profile.exclude(|| q.read(s.gpu)));
+                (self.fp_mhz, read.map_or((None, None), |r| (r.gpu_time_ms, r.frag_invocations)))
+            };
+            #[cfg(target_arch = "wasm32")]
+            let (mhz, (gpu_time_ms, frag_invocations)): (Option<u32>, (Option<(Option<f64>, f64)>, Option<u64>)) = (None, (None, None));
             let rt = self.app.rt_mut();
             s.profile.push(crate::frame::profile::Row {
                 phases,
@@ -496,13 +565,15 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 why: rt.commit.take_commit_why(),
                 shaped: rt.stats.shaped,
                 animating: info.animating,
-                cpu_ms,
+                cpu_ms: cpu_ms.map(|c| c - self.fp_excluded),
                 gpu_wait_ms,
-                gpu_time_ms: None,
-                gpu_layers_ms: None,
-                gpu_mhz: None,
-                frag_invocations: None,
+                gpu_time_ms: gpu_time_ms.map(|(_, all)| all),
+                gpu_layers_ms: gpu_time_ms.and_then(|(layers, _)| layers),
+                gpu_mhz: mhz,
+                frag_invocations,
             });
+            #[cfg(not(target_arch = "wasm32"))]
+            s.marks.mark("frame");
         }
         s.cpu_ms.push(ms);
         if self.k > 0 {
