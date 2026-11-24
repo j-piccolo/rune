@@ -45,20 +45,22 @@ fn vs(i: In) -> Out {
         let k = u32(clamp(i32(j % 6u) - 1, 0, 3));
         corner = vec2<f32>(f32(k & 1u), f32(k >> 1u));
         let r = i.radii;
-        let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+        let reach = side_reach(r);
         let border = max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w)));
         let soft = max(i.params.z, 0.5);
-        let e = reach + soft + border + 1.0;
+        let e = reach + vec4<f32>(soft + border + 1.0);
         let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
         var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
         if (i.fade.w != 0u) {
             let c = unpack_clip_radii(i.fade.w);
-            let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-            edge = max(edge, vec4<f32>(cr + 1.0));
+            edge = max(edge, side_reach(c) + vec4<f32>(1.0));
         }
-        lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-        hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
-        if (any(hi - lo < vec2<f32>(8.0)) || i.fade.z != 0u || i.uv.z < 0.0) {
+        let hole = vec4<f32>(ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy)), floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw)));
+        let outer = split_outer(i.rect, soft + border + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), i.rect.xy, i.rect.xy + i.rect.zw, hole);
+        let piece = split_piece(j / 6u + 1u, i.rect.xy, i.rect.xy + i.rect.zw, hole, outer);
+        lo = piece.xy;
+        hi = max(piece.zw, piece.xy);
+        if (any(hole.zw - hole.xy < vec2<f32>(8.0)) || i.fade.z != 0u || i.uv.z < 0.0) {
             hi = lo;
         }
     }
@@ -151,28 +153,29 @@ fn vs(i: In) -> Out {
         if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
     }
     let r = i.radii;
-    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let reach = side_reach(r);
     let soft = max(i.params.z, 0.5);
-    let e = reach + soft + 1.0;
+    let e = reach + vec4<f32>(soft + 1.0);
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
-        let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-        edge = max(edge, vec4<f32>(cr + 1.0));
+        edge = max(edge, side_reach(c) + vec4<f32>(1.0));
     }
-    var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-    var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+    var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
     if (any(hhi - hlo < vec2<f32>(8.0)) || i.fade.z != 0u) {
         hlo = vec2<f32>(0.0);
         hhi = vec2<f32>(0.0);
     }
     hlo = max(hlo, lo);
     hhi = min(hhi, hi);
-    if (hhi.x <= hlo.x || hhi.y <= hlo.y) {
-        hhi = hlo;
+    var p = hlo;
+    if (hhi.x > hlo.x && hhi.y > hlo.y) {
+        let hole = vec4<f32>(hlo, hhi);
+        let outer = split_outer(i.rect, soft + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), lo, hi, hole);
+        p = piece_corner(split_piece(j / 6u + 1u, lo, hi, hole, outer), corner);
     }
-    let p = select(hlo, hhi, corner > vec2<f32>(0.5));
     let size_px = select(g.viewport, projection.zw, projection.z > 0.0);
     let local = p - projection.xy;
     var o: Out;
@@ -274,28 +277,29 @@ fn vs(i: In) -> Out {
         if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
     }
     let r = i.radii;
-    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let reach = side_reach(r);
     let soft = max(i.params.z, 0.5);
-    let e = reach + soft + 1.0;
+    let e = reach + vec4<f32>(soft + 1.0);
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
-        let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-        edge = max(edge, vec4<f32>(cr + 1.0));
+        edge = max(edge, side_reach(c) + vec4<f32>(1.0));
     }
-    var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-    var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+    var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
     if (any(hhi - hlo < vec2<f32>(8.0)) || i.fade.z != 0u) {
         hlo = vec2<f32>(0.0);
         hhi = vec2<f32>(0.0);
     }
     hlo = max(hlo, lo);
     hhi = min(hhi, hi);
-    if (hhi.x <= hlo.x || hhi.y <= hlo.y) {
-        hhi = hlo;
+    var p = hlo;
+    if (hhi.x > hlo.x && hhi.y > hlo.y) {
+        let hole = vec4<f32>(hlo, hhi);
+        let outer = split_outer(i.rect, soft + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), lo, hi, hole);
+        p = piece_corner(split_piece(j / 6u + 1u, lo, hi, hole, outer), corner);
     }
-    let p = select(hlo, hhi, corner > vec2<f32>(0.5));
     let center = i.rect.xy + i.rect.zw * 0.5;
     let t = 0.5 + dot(p - center, i.uv.xy);
     let u = clamp((t - t0) / max(t1 - t0, 1e-6), 0.0, 1.0);
@@ -375,30 +379,27 @@ fn vs(i: In) -> Out {
     var hi = lo + i.rect.zw + vec2<f32>(2.0 * grow);
     if (sub > 0u) {
         let r = i.radii;
-        let reach = max(max(r.x, r.y), max(r.z, r.w));
+        let reach = side_reach(r);
         let soft = max(i.params.z, 0.5);
-        let e = reach + soft + 1.0;
-        var edge = 1.5;
+        let e = reach + vec4<f32>(soft + 1.0);
+        var edge = vec4<f32>(1.5);
         if (i.fade.w != 0u) {
-            let c = unpack_clip_radii(i.fade.w);
-            edge = max(edge, max(max(c.x, c.y), max(c.z, c.w)) + 1.0);
+            edge = max(edge, side_reach(unpack_clip_radii(i.fade.w)) + vec4<f32>(1.0));
         }
-        var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + vec2<f32>(edge)));
-        var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - vec2<f32>(edge)));
+        var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+        var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
         if (any(hhi - hlo < vec2<f32>(8.0))) {
-            if (sub != 2u) { hi = lo; }
+            if (sub != 4u) { hi = lo; }
         } else {
             hlo = max(hlo, lo);
             hhi = min(hhi, hi);
             if (hhi.x > hlo.x && hhi.y > hlo.y) {
-                switch sub {
-                    case 1u: { lo = hlo; hi = hhi; }
-                    case 2u: { hi = vec2<f32>(hi.x, hlo.y); }
-                    case 3u: { lo = vec2<f32>(lo.x, hlo.y); hi = vec2<f32>(hlo.x, hhi.y); }
-                    case 4u: { lo = vec2<f32>(hhi.x, hlo.y); hi = vec2<f32>(hi.x, hhi.y); }
-                    default: { lo = vec2<f32>(lo.x, hhi.y); }
-                }
-            } else if (sub != 2u) {
+                let hole = vec4<f32>(hlo, hhi);
+                let outer = split_outer(i.rect, soft + 1.0, i.clip, vec4<f32>(1.5), lo, hi, hole);
+                let piece = split_piece(sub, lo, hi, hole, outer);
+                lo = piece.xy;
+                hi = max(piece.zw, piece.xy);
+            } else if (sub != 4u) {
                 hi = lo;
             }
         }

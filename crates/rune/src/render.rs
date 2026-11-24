@@ -1126,6 +1126,13 @@ pub(crate) fn corner_extent(radius: f32) -> f32 {
     if radius < 0.0 { -radius * CONTINUOUS_K } else { radius }
 }
 
+/// How far in from each side (left, top, right, bottom) the corners of `radii` (top-left, top-right,
+/// bottom-right, bottom-left) reach: clip.wgsl `side_reach`, which the middles of split shapes are inset by.
+pub(crate) fn side_reach(radii: [f32; 4]) -> [f32; 4] {
+    let e = radii.map(corner_extent);
+    [e[0].max(e[3]), e[0].max(e[1]), e[1].max(e[2]), e[2].max(e[3])]
+}
+
 pub(crate) const CONTINUOUS_K: f32 = instance::shader_consts::CONTINUOUS_K;
 
 /// Frame-profile builds: `RUNE_SKIP_MODE=0,6` leaves the instances drawn on those `QuadMode`s undrawn (10 more
@@ -1201,13 +1208,14 @@ pub(crate) fn report_pinned() {
 }
 
 /// The vertices a box drawn apart takes (shader.wgsl `base_vs`): its middle, where it and its clip cover every
-/// pixel whole and the fragment shader returns its fill, and four bands around it. A big panel's middle is most of
+/// pixel whole and the fragment shader returns its fill, and the bands around it: its corners, and a pixel or two
+/// along each edge between them (clip.wgsl `split_piece`). A big panel's middle is most of
 /// its pixels, and working out its rounded corners, soft edge and clip there costs a small or software GPU several
 /// times what the fill does.
-const SPLIT_VERTICES: std::ops::Range<u32> = 4..34;
-/// Its middle's quad, and the four bands around it.
-const SPLIT_MIDDLE: std::ops::Range<u32> = 4..10;
-const SPLIT_BANDS: std::ops::Range<u32> = 10..34;
+const SPLIT_VERTICES: std::ops::Range<u32> = 4..70;
+/// Its middle's three quads (clip.wgsl `split_piece`), and the eight bands around them.
+const SPLIT_MIDDLE: std::ops::Range<u32> = 4..22;
+const SPLIT_BANDS: std::ops::Range<u32> = 22..70;
 
 /// Below this many device pixels either way a shape draws whole: its middle (`split_hole`, 8 pixels at least past
 /// its corners and edges) would be small or empty, and the five quads cost more than they save.
@@ -1281,17 +1289,19 @@ pub(super) fn classify_quad(instance: &Instance) -> QuadMode {
                 let t0 = if lower_open { instance.params[0] - 2.0 } else { instance.params[0] };
                 let t1 = if upper_open { instance.params[3] - 2.0 } else { instance.params[3] };
                 if t1 > t0 + 1e-5 {
-                    // The middle (`split_hole`) lies on whole pixels inside the box less `e`: its colour can be
-                    // interpolated from its corners when `t` there stays between the stops.
-                    let reach = instance.radii.into_iter().map(corner_extent).fold(0.0f32, f32::max);
-                    let e = reach + instance.params[2].max(0.5) + 1.0;
+                    // The middle (`split_hole`, `split_piece`) lies on whole pixels inside the box less its soft
+                    // edge and a pixel, and has an area clear of the corners: its colour can be interpolated from
+                    // its corners when `t` there stays between the stops.
+                    let soft = instance.params[2].max(0.5) + 1.0;
+                    let [left, top, right, bottom] = side_reach(instance.radii).map(|r| r + soft);
                     let [x, y, w, h] = instance.rect;
-                    let (x0, x1) = ((x + e).ceil(), (x + w - e).floor());
-                    let (y0, y1) = ((y + e).ceil(), (y + h - e).floor());
+                    let has_hole = (x + w - right).floor() > (x + left).ceil() && (y + h - bottom).floor() > (y + top).ceil();
+                    let (x0, x1) = ((x + soft).ceil(), (x + w - soft).floor());
+                    let (y0, y1) = ((y + soft).ceil(), (y + h - soft).floor());
                     let [cx, cy] = [x + w * 0.5, y + h * 0.5];
                     let t = |px: f32, py: f32| 0.5 + (px - cx) * instance.uv[0] + (py - cy) * instance.uv[1];
                     let ts = [t(x0, y0), t(x1, y0), t(x0, y1), t(x1, y1)];
-                    if x1 > x0 && y1 > y0 && ts.iter().all(|&v| v >= t0 + 1e-5 && v <= t1 - 1e-5) {
+                    if has_hole && ts.iter().all(|&v| v >= t0 + 1e-5 && v <= t1 - 1e-5) {
                         return QuadMode::SplitLinear;
                     }
                 }
