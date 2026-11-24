@@ -415,6 +415,20 @@ impl CharInfo {
     }
 }
 
+/// Grapheme boundaries: worked out for ASCII text, or from the segmenter.
+struct Graphemes<A, S>(Result<A, S>);
+
+impl<A: Iterator<Item = usize>, S: Iterator<Item = usize>> Iterator for Graphemes<A, S> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match &mut self.0 {
+            Ok(ascii) => ascii.next(),
+            Err(segments) => segments.next(),
+        }
+    }
+}
+
 pub(crate) fn analyze_text(
     analyzer: &mut Analyzer,
     text: &str,
@@ -657,10 +671,17 @@ pub(crate) fn analyze_text(
 
     // Collect boundary byte positions compactly
     let mut wb_iter = analyzer.segmenters.word().segment_str(text).peekable();
-    let mut gb_iter = data_sources
-        .grapheme_segmenter()
-        .segment_str(text)
-        .peekable();
+    // In ASCII every position is a grapheme boundary but the one between CR and LF (UAX #29
+    // GB3 to GB5, GB999): no segmenter needed for the commonest text.
+    let ascii_graphemes = text.is_ascii().then(|| {
+        let bytes = text.as_bytes();
+        (0..=bytes.len()).filter(move |&at| !(at > 0 && at < bytes.len() && bytes[at - 1] == b'\r' && bytes[at] == b'\n'))
+    });
+    let mut gb_iter = Graphemes(match ascii_graphemes {
+        Some(ascii) => Ok(ascii),
+        None => Err(data_sources.grapheme_segmenter().segment_str(text)),
+    })
+    .peekable();
 
     // Merge boundaries - line takes precedence over word
     let mut lb_iter = line_boundary_positions.iter().peekable();
