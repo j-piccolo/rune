@@ -447,6 +447,10 @@ impl Scene {
     pub fn contains(&self, id: NodeId) -> bool {
         self.index.contains_key(&id.0)
     }
+    /// Whether any node is exiting: still drawn after the app removed it.
+    pub fn any_exiting(&self) -> bool {
+        !self.exiting.is_empty()
+    }
     pub fn phase(&self, id: NodeId) -> Option<Phase> {
         let i = self.slot(id)?;
         Some(self.nodes[i].presence.public(self.nodes[i].generation))
