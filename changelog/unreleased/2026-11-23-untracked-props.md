@@ -1,0 +1,1 @@
+- `AnimationStore` keeps a count of tracks, and of animating tracks, for each property, so `get`, `has`, `is_animating` and the rest answer at once for a property no node animates, without hashing the node and property. Paint asks these for every node every frame.

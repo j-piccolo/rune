@@ -10,6 +10,7 @@
 
 use super::instance::shader_consts;
 use super::*;
+use super::slim::*;
 use crate::machine::Effects;
 
 const _: () = {
@@ -54,15 +55,16 @@ fn fs(i: Out) -> DualOut {
 /// The kinds the frame pass has a pipeline of its own for (`KIND_RECT`, `KIND_SHADOW`, `KIND_GLYPH`):
 /// what most of a frame's fragments draw.
 pub(crate) const PINNED: [u32; 3] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32()];
-/// The kinds pinned where the pipelines compile from WGSL: `PINNED`'s, in its order, then the gradient kinds,
+/// The kinds pinned where the pipelines compile from WGSL: `PINNED`'s, in its order, then the gradient kinds and images,
 /// which have no shipped bytecode. `Renderer::pinned` is in this order, as long as it has pipelines for.
-pub(crate) const PINNED_FROM_WGSL: [u32; 5] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32(), Kind::Radial.as_u32(), Kind::Gradient.as_u32()];
+pub(crate) const PINNED_FROM_WGSL: [u32; 6] = [Kind::Rect.as_u32(), Kind::Shadow.as_u32(), Kind::Glyph.as_u32(), Kind::Radial.as_u32(), Kind::Gradient.as_u32(), Kind::Image.as_u32()];
 
 /// shader.wgsl's marker for the kind a fragment draws: -1, every kind.
 const PINNED_OFF: &str = shader_consts::PINNED_KIND_OFF_DECL;
 
-/// `base_vs`'s line that picks a quad's corner: the banded variant narrows the quad ahead of it.
-const CORNER: &str = "    let p = select(lo, hi, corner > vec2<f32>(0.5));";
+/// `base_vs`'s line ahead of a box's split (and of the line that picks a quad's corner): the banded variant
+/// narrows the quad there, so a segment's middle is taken within the band it draws in.
+const CORNER: &str = "    // The banded variant narrows a gradient segment's quad here (render/variant.rs `BAND`), before a split.";
 
 /// What the banded variant adds to `base_vs`. A linear gradient's stop segment (kind 11) covers its
 /// whole element, and its fragments are zero wherever another segment draws: past an open stop
@@ -133,6 +135,41 @@ pub(crate) fn pinned_wgsl(kind: u32) -> Option<String> {
         windfoil_wgsl().into()
     };
     (base.matches(PINNED_OFF).count() == 1).then(|| base.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
+}
+
+/// `pinned_wgsl` with the banded variant's vertex stage (`banded_wgsl`), for the pinned pipelines made from WGSL here:
+/// a gradient stop segment they draw rasterizes only its band, as it does with the frame's own pipeline.
+pub(crate) fn pinned_banded_wgsl(kind: u32) -> Option<String> {
+    let banded = banded_wgsl();
+    (banded.matches(PINNED_OFF).count() == 1).then(|| banded.replacen(PINNED_OFF, &format!("const PINNED_KIND: f32 = {kind}.0;"), 1))
+}
+
+/// The kinds whose middle (shader.wgsl `split_hole`) draws with a pipeline of its own (`middle_wgsl`): boxes,
+/// pictures and gradient segments, in the order `Renderer`'s middle pipelines are in.
+pub(super) const MIDDLE_KINDS: [u32; 3] = [Kind::Rect.as_u32(), Kind::Image.as_u32(), Kind::Radial.as_u32()];
+/// Slot of the slim plain-atlas-glyph pipeline in `Renderer::solid`, right after `MIDDLE_KINDS`.
+pub(super) const PLAIN_GLYPH_SLOT: usize = MIDDLE_KINDS.len();
+/// Slot of the vertex-interpolated linear-gradient middle pipeline in `Renderer::solid`.
+pub(super) const LINEAR_MIDDLE_SLOT: usize = MIDDLE_KINDS.len() + 1;
+/// Slot of the slim borderless circular-corner rect pipeline in `Renderer::solid`.
+pub(super) const SIMPLE_RECT_SLOT: usize = MIDDLE_KINDS.len() + 2;
+/// Slot of the ultra-slim upright 1:1 non-additive, non-cutout, unfaded layer composite pipeline in `Renderer::solid`.
+pub(super) const PLAIN_LAYER_SLOT: usize = MIDDLE_KINDS.len() + 3;
+/// Slot of the slim border-ring band pipeline in `Renderer::solid`.
+pub(super) const RING_SLOT: usize = MIDDLE_KINDS.len() + 4;
+/// Total per-format pipelines in `Renderer::solid`.
+pub(super) const SOLID_COUNT: usize = MIDDLE_KINDS.len() + 5;
+
+/// shader.wgsl's switch for a pipeline that draws middles only.
+const MIDDLE_OFF: &str = "const MIDDLE: bool = false;";
+
+/// The pipeline a `kind` shape's middle draws with: Windfoil pinned to that kind (`pinned_wgsl`), and every
+/// fragment in a middle, so the compiler keeps only what a middle works out (a box's fill, a picture's texel, a
+/// gradient's colour) and none of the coverage and clip around it. A small or software GPU runs that at its full
+/// rate, where the uber shader's size holds it down, and it's the same code on the same inputs: the same pixels.
+pub(super) fn middle_wgsl(kind: u32) -> Option<String> {
+    let pinned = pinned_banded_wgsl(kind)?;
+    (pinned.matches(MIDDLE_OFF).count() == 1).then(|| pinned.replacen(MIDDLE_OFF, "const MIDDLE: bool = true;", 1))
 }
 
 /// outline.wgsl's switch for subpixel outline glyphs, off but in the subpixel variant.
@@ -552,18 +589,19 @@ impl Renderer {
         }
         // Where the uber shader is compiled from WGSL as the renderer starts (Vulkan, GL), its pinned
         // pipelines can be too, on a thread: naga and the driver take milliseconds for each, where FXC
-        // takes tens of seconds. Asked for with `RUNE_PINNED_WGSL=1`, not the default: the smaller
-        // shaders shade a pixel for less (a tenth off the GPU's time on scrolling pages here), and the
-        // draw per run of a kind costs the CPU about as much in this machine's driver. Which way that
-        // goes on a small GPU with a small CPU is for a measurement there to say.
+        // takes tens of seconds. The smaller shaders shade a pixel for less (a tenth off the GPU's time
+        // on scrolling pages on an M1), and the draw per run of a kind costs the CPU about as much in
+        // that machine's driver. On a small GPU with a small CPU (Intel's 24-EU UHD on an N100, a bar's
+        // sheets and launcher) they took a fifth off the GPU's time for a few percent more CPU, and the
+        // frames inside a 240 fps budget went from 31% to 42%. `RUNE_PINNED_WGSL=0` turns them off.
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
         if matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) && self.vertex_entry == "vs"
-            && std::env::var_os("RUNE_PINNED_WGSL").is_some_and(|v| v == "1") {
+            && std::env::var_os("RUNE_PINNED_WGSL").is_none_or(|v| v != "0") {
             let (sent, done) = std::sync::mpsc::channel();
             let (device, layout, format) = (device.clone(), self.layout.clone(), self.format);
             let spawned = std::thread::Builder::new().name("rune-pinned-pipelines".into()).spawn(move || {
                 let pinned: Vec<_> = PINNED_FROM_WGSL.iter().map(|&kind| {
-                    let wgsl = pinned_wgsl(kind)?;
+                    let wgsl = pinned_banded_wgsl(kind)?;
                     compile(&device, &wgsl, |shader| Renderer::pipeline(&device, &layout, shader, format, "vs", Blend::SourceOver)).ok().map(|(_, p)| p)
                 }).collect();
                 sent.send(if pinned.iter().any(Option::is_some) { pinned } else { Vec::new() }).ok();
@@ -577,14 +615,79 @@ impl Renderer {
         self.pinned = Some(Vec::new());
     }
 
+    /// The pipelines shapes' middles draw with (`middle_wgsl`) for the renderer's format, made on a thread the first
+    /// frame that has none (where the uber shader compiles from WGSL here) and taken once they're made. Meanwhile,
+    /// and where one can't be made, a middle draws with the uber shader, which works out the same there (`i.whole`).
+    pub(super) fn solid_for_format(&mut self, device: &wgpu::Device) {
+        if self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
+        if let Some((format, done)) = &self.solid_building {
+            // Frame-profile builds wait for it, as for the pinned pipelines (`take_pinned`).
+            #[cfg(feature = "frame-profile")]
+            let got = done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected);
+            #[cfg(not(feature = "frame-profile"))]
+            let got = done.try_recv();
+            match got {
+                Ok(made) => {
+                    if *format == self.format { self.solid = Some((*format, made)); }
+                    self.solid_building = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.solid = Some((*format, Vec::new()));
+                    self.solid_building = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if self.solid_building.is_some() || self.solid.as_ref().is_some_and(|(f, _)| *f == self.format) { return; }
+        }
+        // Asked for once per format: where it can't be made, or isn't made from WGSL, the uber shader draws middles.
+        if !matches!(self.uber, Uber::Windfoil { source: Source::Compiled, .. }) || self.vertex_entry != "vs" {
+            self.solid = Some((self.format, Vec::new()));
+            return;
+        }
+        let (sent, done) = std::sync::mpsc::channel();
+        let (made_on, layout, format) = (device.clone(), self.layout.clone(), self.format);
+        let spawned = std::thread::Builder::new().name("rune-middle-pipelines".into()).spawn(move || {
+            // For the window's format, then for its layers' (`layers::FORMAT`), where a fading page draws.
+            let mut made: Vec<_> = MIDDLE_KINDS.iter().map(|&kind| {
+                let wgsl = if kind == Kind::Rect.as_u32() {
+                    solid_rect_wgsl()
+                } else if kind == Kind::Radial.as_u32() {
+                    radial_middle_wgsl()
+                } else {
+                    middle_wgsl(kind)?
+                };
+                compile(&made_on, &wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok()
+            }).collect();
+            let glyph_wgsl = plain_glyph_wgsl();
+            made.push(compile(&made_on, &glyph_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let linear_wgsl = linear_grad_middle_wgsl();
+            made.push(compile(&made_on, &linear_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let simple_wgsl = simple_rect_wgsl();
+            made.push(compile(&made_on, &simple_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let plain_layer_wgsl = plain_layer_composite_wgsl();
+            made.push(compile(&made_on, &plain_layer_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let ring_wgsl = simple_ring_wgsl();
+            made.push(compile(&made_on, &ring_wgsl, |shader| Renderer::pipeline(&made_on, &layout, shader, format, "vs", Blend::SourceOver)).ok());
+            let layer = made.iter().map(|m| m.as_ref().map(|(shader, _)| Renderer::pipeline(&made_on, &layout, shader, super::layers::FORMAT, "vs", Blend::SourceOver))).collect::<Vec<_>>();
+            let made = made.into_iter().map(|m| m.map(|(_, p)| p)).chain(layer).collect::<Vec<_>>();
+            sent.send(made).ok();
+        });
+        if spawned.is_ok() {
+            self.solid_building = Some((format, done));
+            // Frame-profile builds take it now, as they take the pinned pipelines.
+            #[cfg(feature = "frame-profile")]
+            self.solid_for_format(device);
+        }
+    }
+
     /// Takes the pinned pipelines once their thread has made them for this format (one made for a format the
     /// renderer has since left is dropped, and that format's next use starts again).
     pub(super) fn take_pinned(&mut self) {
         let Some((format, done)) = &self.pinned_building else { return };
-        // Frame-profile builds with `RUNE_PINNED=all` wait for them, so a capture's every frame draws pinned (the
-        // screen comparison forces the split on); every other build never waits.
+        // Frame-profile builds wait for them, so every frame a capture or a frame budget times draws as the last does
+        // and no compile on their thread lands in a frame's counts; every other build never waits.
         #[cfg(feature = "frame-profile")]
-        let got = if super::pinned_forced() == Some(true) { done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { done.try_recv() };
+        let got = done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected);
         #[cfg(not(feature = "frame-profile"))]
         let got = done.try_recv();
         match got {

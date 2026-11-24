@@ -37,6 +37,16 @@ fn sd_rounded(p: vec2<f32>, half: vec2<f32>, radii: vec4<f32>) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - r;
 }
 
+// Whether a rounded box covers `p` (box-local) whole, `depth` in from every edge: then `sd_rounded`
+// is at most `-depth` and every coverage taken from it at that depth is exactly 1, so a fragment
+// there can skip it. `a` is how far in from the nearest vertical and horizontal edges; outside the
+// corners' reach (`max(a)` past the largest radius, a continuous corner's `CONTINUOUS_K` times its
+// radius) the distance is exactly `-min(a)`. A sixteenth of a pixel keeps rounding on the slow side.
+fn box_inside(a: vec2<f32>, radii: vec4<f32>, depth: f32) -> bool {
+    let reach = max(max(max(radii.x, radii.y), max(radii.z, radii.w)), -CONTINUOUS_K * min(min(radii.x, radii.y), min(radii.z, radii.w)));
+    return min(a.x, a.y) >= depth + 0.0625 && max(a.x, a.y) >= reach + 0.0625;
+}
+
 // A soft edge's coverage `d` in from it: smoothstep over `fade`, linear over `-fade` when it's
 // negative (`El::clip_fade_linear`), and a hard, anti-aliased edge at zero.
 fn ramp(d: f32, fade: f32) -> f32 {
@@ -124,6 +134,13 @@ fn clip_alpha_stops(p: vec2<f32>, c: vec4<f32>, packed: vec4<u32>, stops: vec2<f
         f = vec4<f32>(unpack_f16x2(packed.x), unpack_f16x2(packed.y));
     }
     let hard = vec4<f32>(p - c.xy, c.zw - p);
+    // Deep inside a clip without stops every edge's ramp is exactly 1 (`ramp`: past its fade, or half
+    // a pixel for a hard edge), and so is a rounded clip's corner coverage (`box_inside`): most of a
+    // big panel's pixels.
+    if (packed.z == 0u && all(hard >= max(abs(f), vec4<f32>(0.5)) + vec4<f32>(0.0625))
+        && (packed.w == 0u || box_inside(min(hard.xy, hard.zw), unpack_clip_radii(packed.w), 0.5))) {
+        return 1.0;
+    }
     var alpha = 1.0;
     // `packed.z` is `@interpolate(flat)`, so these branches are uniform across every pixel of an
     // instance: instances without stop-tagged edges never unpack `stops` or run `ramp_stops`.

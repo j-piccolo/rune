@@ -171,10 +171,11 @@ impl RuntimeCore {
         let border = if bw > 0.0 { premul(resolved_border, o, srgb) } else { [0.0; 4] };
         // A gradient border draws as KIND_GRADIENT with a width: `border` top, `uv` bottom.
         // After a switch back to `border`, it stays a gradient until both stops meet.
-        let store = self.scene.store();
-        let springing = store.has(n.id, P_BORDER_BOTTOM)
-            && (store.is_animating(n.id, P_BORDER_BOTTOM) || store.is_animating(n.id, P_BORDER));
-        let border_bottom = (bw > 0.0 && focus_border.is_none() && (n.vis.border_bottom.is_some() || springing))
+        let border_bottom = (bw > 0.0 && focus_border.is_none() && (n.vis.border_bottom.is_some() || {
+            let store = self.scene.store();
+            store.has(n.id, P_BORDER_BOTTOM)
+                && (store.is_animating(n.id, P_BORDER_BOTTOM) || store.is_animating(n.id, P_BORDER))
+        }))
             .then(|| {
                 let rest_bot = self.color(n.id, P_BORDER_BOTTOM, n.vis.border_bottom.unwrap_or(n.vis.border()));
                 let (resolved_bot, _) = paint_tracks::replace_color(rest_bot, hover_border, hov_v, press_border, prs_v);
@@ -201,7 +202,7 @@ impl RuntimeCore {
         let sides = n.vis.border_sides.filter(|_| bw > 0.0).map(|ws| ws.map(|v| pixel_snap::line_width(v * s) * sc));
         let padding = sides.unwrap_or([bw; 4]);
         let (bw, border, border_kind, border_uv, border_a) =
-            if n.vis.border_dash.is_some() { (0.0, [0.0; 4], KIND_RECT, [0.0; 4], 0.0) } else { (bw, border, border_kind, border_uv, border_a) };
+            if n.vis.border_dash.is_some() || border_a <= 0.0005 { (0.0, [0.0; 4], KIND_RECT, [0.0; 4], 0.0) } else { (bw, border, border_kind, border_uv, border_a) };
         // The border's own instance, `o` in `params.w` so the shader knows how much it
         // hides the fill under it (shader.wgsl `border_over`). With inset shadows it draws
         // apart, over them, as CSS layers an inset box-shadow between background and border.
@@ -264,8 +265,8 @@ impl RuntimeCore {
                     if c0[3] <= 0.0005 && c1[3] <= 0.0005 {
                         continue;
                     }
-                    let t0_val = rg.stops[seg].0;
-                    let t1_val = rg.stops[seg + 1].0;
+                    let mut t0_val = rg.stops[seg].0;
+                    let mut t1_val = rg.stops[seg + 1].0;
                     let (seg_rect, seg_radii, uv) = match rg.geometry {
                         crate::el::GradientGeometry::Radial { center, radius } => {
                             let cx = center[0] * w;
@@ -305,7 +306,73 @@ impl RuntimeCore {
                             let (sin, cos) = angle.sin_cos();
                             let (dx, dy) = (sin, -cos);
                             let span = (dx.abs() * w + dy.abs() * h).max(1e-3);
-                            ([r[0], r[1], w, h], radii, [dx / span, dy / span, 0.0, 0.0])
+                            let (ux, uy) = (dx / span, dy / span);
+                            let below = seg > 0 || c0 == [0.0; 4];
+                            let above = seg + 1 < segs || c1 == [0.0; 4];
+                            let cmax = radii.into_iter().map(crate::render::corner_extent).fold(0.0f32, f32::max).min(w * 0.5).min(h * 0.5);
+                            if dx.abs() < 1e-6 && uy != 0.0 && (below || above) {
+                                let y0 = h * 0.5 + (t0_val - 0.5) / uy;
+                                let y1 = h * 0.5 + (t1_val - 0.5) / uy;
+                                let (mut ly0, mut ly1) = if uy > 0.0 {
+                                    (if below { (y0 - pad).floor().max(0.0) } else { 0.0 }, if above { (y1 + pad).ceil().min(h) } else { h })
+                                } else {
+                                    (if above { (y1 - pad).floor().max(0.0) } else { 0.0 }, if below { (y0 + pad).ceil().min(h) } else { h })
+                                };
+                                if cmax > 0.0 {
+                                    if ly0 < cmax { ly0 = 0.0; }
+                                    if ly1 > h - cmax { ly1 = h; }
+                                    if ly0 == 0.0 { ly1 = ly1.max((2.0 * cmax).min(h)); }
+                                    if ly1 == h { ly0 = ly0.min((h - 2.0 * cmax).max(0.0)); }
+                                }
+                                if ly1 <= ly0 { continue; }
+                                let dt = (ly0 + (ly1 - ly0) * 0.5 - h * 0.5) * uy;
+                                let (nt0, nt1) = (t0_val - dt, t1_val - dt);
+                                if nt0 > -0.45 && nt0 < 1.45 && nt1 > -0.45 && nt1 < 1.45 {
+                                    t0_val = nt0;
+                                    t1_val = nt1;
+                                    let br = [
+                                        if ly0 == 0.0 { radii[0] } else { 0.0 },
+                                        if ly0 == 0.0 { radii[1] } else { 0.0 },
+                                        if ly1 == h { radii[2] } else { 0.0 },
+                                        if ly1 == h { radii[3] } else { 0.0 },
+                                    ];
+                                    ([r[0], r[1] + ly0, w, ly1 - ly0], br, [ux, uy, 0.0, 0.0])
+                                } else {
+                                    ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                                }
+                            } else if dy.abs() < 1e-6 && ux != 0.0 && (below || above) {
+                                let x0 = w * 0.5 + (t0_val - 0.5) / ux;
+                                let x1 = w * 0.5 + (t1_val - 0.5) / ux;
+                                let (mut lx0, mut lx1) = if ux > 0.0 {
+                                    (if below { (x0 - pad).floor().max(0.0) } else { 0.0 }, if above { (x1 + pad).ceil().min(w) } else { w })
+                                } else {
+                                    (if above { (x1 - pad).floor().max(0.0) } else { 0.0 }, if below { (x0 + pad).ceil().min(w) } else { w })
+                                };
+                                if cmax > 0.0 {
+                                    if lx0 < cmax { lx0 = 0.0; }
+                                    if lx1 > w - cmax { lx1 = w; }
+                                    if lx0 == 0.0 { lx1 = lx1.max((2.0 * cmax).min(w)); }
+                                    if lx1 == w { lx0 = lx0.min((w - 2.0 * cmax).max(0.0)); }
+                                }
+                                if lx1 <= lx0 { continue; }
+                                let dt = (lx0 + (lx1 - lx0) * 0.5 - w * 0.5) * ux;
+                                let (nt0, nt1) = (t0_val - dt, t1_val - dt);
+                                if nt0 > -0.45 && nt0 < 1.45 && nt1 > -0.45 && nt1 < 1.45 {
+                                    t0_val = nt0;
+                                    t1_val = nt1;
+                                    let br = [
+                                        if lx0 == 0.0 { radii[0] } else { 0.0 },
+                                        if lx1 == w { radii[1] } else { 0.0 },
+                                        if lx1 == w { radii[2] } else { 0.0 },
+                                        if lx0 == 0.0 { radii[3] } else { 0.0 },
+                                    ];
+                                    ([r[0] + lx0, r[1], lx1 - lx0, h], br, [ux, uy, 0.0, 0.0])
+                                } else {
+                                    ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                                }
+                            } else {
+                                ([r[0], r[1], w, h], radii, [ux, uy, 0.0, 0.0])
+                            }
                         }
                     };
                     let t0 = t0_val + if seg > 0 { 2.0 } else { 0.0 };
@@ -347,7 +414,9 @@ impl RuntimeCore {
                 let under = border_paint::fill_under(Instance { fill: ov, ..ring }, false);
                 if under.rect[2] > 0.0 && under.rect[3] > 0.0 { self.instances.push(under); }
             } else if has_area && !apart && (ov[3] > 0.0005 || border_a > 0.0005) {
-                self.instances.push(Instance { fill: ov, ..ring });
+                // A clear overlay leaves nothing inside the ring: it draws as bands, as a border alone does.
+                let ring = Instance { fill: ov, ..ring };
+                if ov == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 && sides.is_none() { bands::push_ring(&mut self.instances, ring); } else { self.instances.push(ring); }
             }
         } else if apart {
             if fill[3] > 0.0005 {
@@ -417,7 +486,8 @@ impl RuntimeCore {
                 _ => radii.map(|v| if v != 0.0 { v + g.copysign(v) } else { 0.0 }),
             };
             if c.a > 0.0 && ol.width > 0.0 {
-                self.instances.push(Instance {
+                // Nothing draws inside an outline's ring: a panel's draws as bands around its middle.
+                bands::push_ring(&mut self.instances, Instance {
                     rect: [r[0] - g, r[1] - g, w + 2.0 * g, h + 2.0 * g],
                     radii: ring_radii,
                     fill: [0.0; 4],
