@@ -422,6 +422,14 @@ impl Renderer {
         !self.damage.lock().unwrap().armed.is_empty()
     }
 
+    /// The next `draw` redraws part of the kept frame: rectangles armed (`arm_damage`), not all of it
+    /// (`arm_whole`). Such a frame draws the instances that reach each rectangle by their places in the list
+    /// (`cull_armed`, its scroll and history), so the list keeps its paint order (`upload::wave_batch`).
+    pub(super) fn draws_in_part(&self) -> bool {
+        let d = self.damage.lock().unwrap();
+        !d.armed.is_empty() && !d.behind
+    }
+
     /// `draw`'s part, when armed: redraws the armed rectangles into the kept frame (all of it
     /// when it's behind) and copies it to `dst`. False when `draw` should draw whole.
     ///

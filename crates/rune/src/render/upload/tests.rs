@@ -352,3 +352,93 @@ fn only_a_changed_params_or_length_batches_again() {
     assert_eq!(prepare(&mut renderer, &frame(5.0, 0.0, 2)).0, 1, "forgotten");
     assert_eq!(prepare(&mut renderer, &[]), (1, vec![], vec![]), "emptied");
 }
+
+/// `wave_batch` keeps the order of every two instances whose pixels meet, so every pixel blends as
+/// before, and draws instances clear of each other grouped by what they draw with.
+#[test]
+fn wave_batch_keeps_the_order_of_what_overlaps_and_groups_the_rest() {
+    let viewport = (1024u32, 512u32);
+    // Rows of cards, each a plate, a title over it and a shadow under it, then a layer, then more.
+    let mut list = vec![Instance { rect: [0.0, 0.0, 1024.0, 512.0], fill: [0.1, 0.1, 0.1, 1.0], clip: NO_CLIP, params: [0.0, KIND_RECT, 0.0, 0.0], ..Zeroable::zeroed() }];
+    let mut seed = 7u32;
+    let mut rand = |n: u32| { seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345); (seed >> 8) % n };
+    for card in 0..40 {
+        let (x, y) = ((card % 10) as f32 * 96.0 + 8.0 + rand(8) as f32, (card / 10) as f32 * 120.0 + 8.0 + rand(8) as f32);
+        list.push(Instance { rect: [x - 4.0, y - 4.0, 64.0, 80.0], fill: [0.0, 0.0, 0.0, 0.4], clip: NO_CLIP, params: [0.0, KIND_SHADOW, 6.0, 0.0], ..Zeroable::zeroed() });
+        list.push(Instance { rect: [x, y, 56.0, 72.0], fill: [0.3, 0.2, 0.6, 1.0], clip: NO_CLIP, params: [0.0, KIND_RADIAL, 0.0, 1.0], uv: [0.01, 0.005, 0.0, 0.0], ..Zeroable::zeroed() });
+        for letter in 0..rand(6) + 1 {
+            list.push(Instance { rect: [x + 4.0 + letter as f32 * 7.0, y + 58.0, 6.0, 10.0], fill: [1.0; 4], clip: NO_CLIP, params: [0.0, KIND_GLYPH, 0.0, 0.0], ..Zeroable::zeroed() });
+        }
+        if card == 20 {
+            list.push(Instance::begin_layer([0.0, 0.0, 1024.0, 512.0], NO_CLIP, Default::default()));
+        }
+    }
+    let mut out = Vec::new();
+    let mut scratch = WaveScratch::default();
+    let moved = wave_batch(&list, 0, viewport, &mut scratch, &mut out);
+    assert!(moved);
+    // `order` says where each came from.
+    assert!(scratch.order.iter().enumerate().all(|(i, &was)| bytemuck::bytes_of(&out[i]) == bytemuck::bytes_of(&list[was as usize])));
+    // The same instances, each once.
+    let key = |i: &Instance| bytemuck::bytes_of(i).to_vec();
+    let mut a: Vec<_> = list.iter().map(key).collect();
+    let mut b: Vec<_> = out.iter().map(key).collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+    // Where each instance went, and no two that meet reordered, nor any across the layer.
+    let at: Vec<usize> = list.iter().map(|i| out.iter().position(|o| key(o) == key(i)).unwrap()).collect();
+    let layer = list.iter().position(|i| i.kind() == Some(Kind::Layer)).unwrap();
+    for i in 0..list.len() {
+        for j in i + 1..list.len() {
+            let (p, q) = (list[i].pixel_bounds(1024, 512), list[j].pixel_bounds(1024, 512));
+            let meet = p[0] < q[2] && q[0] < p[2] && p[1] < q[3] && q[1] < p[3];
+            if meet || i == layer || j == layer || (i < layer) != (j < layer) {
+                assert!(at[i] < at[j], "{i} and {j} reordered");
+            }
+        }
+    }
+    // Grouped: far fewer changes of kind than the cards' plate, title, shadow, plate, title ... order.
+    let changes = |l: &[Instance]| l.windows(2).filter(|w| w[0].kind() != w[1].kind()).count();
+    assert!(changes(&out) * 4 < changes(&list), "{} kind changes, from {}", changes(&out), changes(&list));
+}
+
+/// `RUNE_WAVE_DUMP=<dir>` (a `RUNE_DRAW_DUMP` of a real run): `wave_batch` on every frame of it keeps
+/// the order of every two instances whose pixels meet.
+#[test]
+fn wave_batch_keeps_overlapping_order_on_a_dumped_run() {
+    let Some(dir) = std::env::var_os("RUNE_WAVE_DUMP") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let bin = std::fs::read(dir.join("instances.bin")).unwrap();
+    let all: &[Instance] = bytemuck::cast_slice(&bin);
+    let meta = std::fs::read_to_string(dir.join("frames.jsonl")).unwrap();
+    let mut scratch = WaveScratch::default();
+    let mut bad = 0;
+    for line in meta.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let (at, n) = (v["at"].as_u64().unwrap() as usize / 128, v["n"].as_u64().unwrap() as usize);
+        let (w, h) = (v["size"][0].as_u64().unwrap() as u32, v["size"][1].as_u64().unwrap() as u32);
+        let list = &all[at..at + n];
+        let mut out = Vec::new();
+        wave_batch(list, 0, (w, h), &mut scratch, &mut out);
+        // Position of each input in the output: instances may repeat, so match them in order.
+        let mut used = vec![false; out.len()];
+        let pos: Vec<usize> = list.iter().map(|i| {
+            let p = (0..out.len()).find(|&p| !used[p] && bytemuck::bytes_of(&out[p]) == bytemuck::bytes_of(i)).unwrap();
+            used[p] = true;
+            p
+        }).collect();
+        for i in 0..n {
+            let p = list[i].pixel_bounds(w as i32, h as i32);
+            for j in i + 1..n {
+                let q = list[j].pixel_bounds(w as i32, h as i32);
+                let meet = p[0] < q[2] && q[0] < p[2] && p[1] < q[3] && q[1] < p[3];
+                if meet && pos[i] > pos[j] {
+                    if bad < 10 { eprintln!("frame {}: {i} {:?} {:?} and {j} {:?} {:?} reordered", v["k"], list[i].kind(), p, list[j].kind(), q); }
+                    bad += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(bad, 0);
+}

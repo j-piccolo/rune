@@ -13,15 +13,31 @@ use rune_staging::Staging;
 
 use super::*;
 
-/// Reusable scratch buffers for `wave_batch`, avoiding 5 heap allocations per frame.
+/// Reusable scratch for `wave_batch`, kept from frame to frame so a frame allocates nothing.
 #[derive(Default)]
-struct WaveScratch {
-    split_rects: Vec<Instance>,
-    whole_rects: Vec<Instance>,
-    whole_bbs: Vec<(u64, [f32; 4])>,
-    glyphs: Vec<Instance>,
-    glyph_bbs: Vec<(u64, [f32; 4])>,
+pub(super) struct WaveScratch {
+    /// Where each instance drawn came from: the index in the list given of the instance at each place.
+    order: Vec<u32>,
+    /// The flat run's batches, in draw order: each its draw class and its instances' indices.
+    batches: Vec<(Class, Vec<u32>)>,
+    /// Batches no longer used, their index lists kept for reuse.
+    spare: Vec<Vec<u32>>,
+    /// Each draw class's latest batch.
+    latest: Vec<(Class, u32)>,
+    /// For each grid cell, the instances drawn there so far in the run (their batch and quad), and the
+    /// latest batch among them.
+    cells: Vec<(u32, Vec<(u32, [f32; 4])>)>,
+    /// The cells written since the run began, to empty at its end.
+    touched: Vec<u32>,
 }
+
+/// What an instance draws with: its kind, its quad mode, and the atlas page or picture it binds.
+/// Instances of one class drawn one after another draw in one call (`Renderer::draw_quads`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Class(u8, u8, u32);
+
+/// The grid `wave_batch` finds overlaps in: cells this many pixels square.
+const WAVE_CELL: i32 = 64;
 
 /// Upload state: the staging, and what the instance and globals buffers hold.
 pub(super) struct Uploads {
@@ -314,7 +330,14 @@ impl Renderer {
         } else {
             instances
         };
-        let can_reorder = self.springs.is_none()
+        // A frame redrawn in part finds what to redraw by where the paint put it (`draws_in_part`); one drawn whole
+        // (every frame on Android, and the Stick's) draws grouped.
+        #[cfg(not(target_os = "macos"))]
+        let in_part = self.draws_in_part();
+        #[cfg(target_os = "macos")]
+        let in_part = false;
+        let can_reorder = !in_part
+            && self.springs.is_none()
             && self.surfaces.as_ref().is_none_or(|s| s.is_empty())
             && self.uploads.next.as_ref().is_none_or(|(_, p)| p.is_none())
             && instances.len() >= 16;
@@ -570,7 +593,12 @@ impl Renderer {
         let fused_range = self.fused_grad.as_ref().map(|(r, _)| r.start as usize..r.end as usize);
         let cleared_len = self.cleared.len as usize;
         let fast_kinds = &mut self.fast_kinds;
-        let update_fast = |fk: &mut Vec<super::fast::FastKind>, dirty: &mut bool, gained: &mut bool, span: &std::ops::Range<usize>| {
+        // What draws each instance follows its geometry as well as its `params`: a written instance's quad mode
+        // and size are worked out again, and the groups of split shapes (`together`) when one of them changed.
+        // An instance that moved, grew or took another's place (`wave_batch`) draws as it now is.
+        let (quad_mode, big) = (&mut self.quad_mode, &mut self.big);
+        let mut regroup = false;
+        let mut update_fast = |fk: &mut Vec<super::fast::FastKind>, dirty: &mut bool, gained: &mut bool, span: &std::ops::Range<usize>| {
             if fk.len() == instances.len() {
                 for i in span.clone() {
                     let k = super::fast::classify(&instances[i]);
@@ -579,6 +607,14 @@ impl Renderer {
                     if instances[i].kind() == Some(Kind::Radial) {
                         *dirty = true;
                     }
+                }
+            }
+            if quad_mode.len() == instances.len() && big.len() == instances.len() {
+                for i in span.clone() {
+                    let mode = super::classify_quad(&instances[i]);
+                    regroup |= mode.is_split() || quad_mode[i].is_split();
+                    quad_mode[i] = mode;
+                    big[i] = instances[i].rect[2] * instances[i].rect[3] >= super::BIG;
                 }
             }
             if let Some(fg) = &fused_range && span.start < fg.end && span.end > fg.start {
@@ -607,6 +643,9 @@ impl Renderer {
         if let Some(span) = open {
             rebatch |= Self::write_span(self.instances.buffer(), held, staging, instances, span.clone());
             update_fast(fast_kinds, &mut fused_dirty, &mut gained_fast, &span);
+        }
+        if regroup && !rebatch && self.quad_mode.len() == instances.len() {
+            together(instances, &self.quad_mode, &mut self.together);
         }
         self.uploads.batched &= !rebatch;
         self.uploads.fused_dirty |= fused_dirty;
@@ -705,106 +744,98 @@ impl Renderer {
 #[cfg(test)]
 mod tests;
 
-/// Paint-order-preserving 3-bucket wave batching: within each flat run of rects and unrotated page-0
-/// glyphs (between layers, effects, images, gradients, or shadows), groups split rects, then whole
-/// rects, then non-overlapping glyphs so grids and lists (e.g. 35 calendar cells + pills/dots + labels)
-/// draw in ~3 batched draws instead of alternating per-cell pipeline switches.
+/// Paint-order-preserving batching. Within each flat run (between layers, effects and the like, which
+/// keep their places), each instance joins the latest batch of its draw class (`Class`) that comes at or
+/// after the last batch holding an instance it overlaps, or starts a batch of its own after them all. Two
+/// instances whose pixels meet keep their order, so every pixel blends as it did; instances clear of
+/// each other draw grouped by class, so a page of cards (a plate, a title, a border each) draws in a few
+/// calls, not a few per card. Overlaps are found on a grid of `WAVE_CELL` cells, each listing the
+/// instances drawn there so far: an instance is tested only against those in the cells it covers.
+/// Says whether any instance moved.
 fn wave_batch(instances: &[Instance], under: usize, viewport: (u32, u32), w: &mut WaveScratch, out: &mut Vec<Instance>) -> bool {
     out.clear();
     out.reserve(instances.len());
     out.extend_from_slice(&instances[..under]);
-    let inv_w = 8.0 / (viewport.0.max(1) as f32);
-    let inv_h = 8.0 / (viewport.1.max(1) as f32);
-    let tile_mask = |bb: [f32; 4]| -> u64 {
-        if bb[2] <= bb[0] || bb[3] <= bb[1] { return 0; }
-        let cx0 = (bb[0] * inv_w).floor().clamp(0.0, 7.0) as u32;
-        let cx1 = (bb[2] * inv_w).floor().clamp(0.0, 7.0) as u32;
-        let cy0 = (bb[1] * inv_h).floor().clamp(0.0, 7.0) as u32;
-        let cy1 = (bb[3] * inv_h).floor().clamp(0.0, 7.0) as u32;
-        let row = ((1u64 << (cx1 - cx0 + 1)) - 1) << cx0;
-        let mut m = 0u64;
-        for r in cy0..=cy1 { m |= row << (r * 8); }
-        m
-    };
-    let hits_any = |m: u64, bb: [f32; 4], occ: u64, bbs: &[(u64, [f32; 4])]| -> bool {
-        (m & occ) != 0 && bbs.iter().any(|&(om, obb)| {
-            (om & m) != 0 && bb[0] < obb[2] && obb[0] < bb[2] && bb[1] < obb[3] && obb[1] < bb[3]
-        })
-    };
-    w.split_rects.clear();
-    w.whole_rects.clear();
-    w.whole_bbs.clear();
-    let mut whole_occ = 0u64;
-    w.glyphs.clear();
-    w.glyph_bbs.clear();
-    let mut glyph_occ = 0u64;
+    w.order.clear();
+    w.order.extend(0..under as u32);
+    let (vw, vh) = (viewport.0.max(1) as i32, viewport.1.max(1) as i32);
+    let (cols, rows) = ((vw + WAVE_CELL - 1) / WAVE_CELL, (vh + WAVE_CELL - 1) / WAVE_CELL);
+    let cell_count = (cols * rows) as usize;
+    if w.cells.len() != cell_count {
+        w.cells.clear();
+        w.cells.resize_with(cell_count, Default::default);
+    }
     let mut moved = false;
-    let flush = |out: &mut Vec<Instance>, w: &mut WaveScratch, whole_occ: &mut u64, glyph_occ: &mut u64| {
-        out.extend_from_slice(&w.split_rects);
-        out.extend_from_slice(&w.whole_rects);
-        out.extend_from_slice(&w.glyphs);
-        w.split_rects.clear();
-        w.whole_rects.clear();
-        w.whole_bbs.clear();
-        *whole_occ = 0;
-        w.glyphs.clear();
-        w.glyph_bbs.clear();
-        *glyph_occ = 0;
+    let flush = |out: &mut Vec<Instance>, w: &mut WaveScratch| {
+        for (_, list) in w.batches.drain(..) {
+            out.extend(list.iter().map(|&i| instances[i as usize]));
+            w.order.extend_from_slice(&list);
+            w.spare.push(list);
+        }
+        for spare in &mut w.spare { spare.clear(); }
+        w.latest.clear();
+        for &c in &w.touched { w.cells[c as usize] = (0, std::mem::take(&mut w.cells[c as usize].1)); w.cells[c as usize].1.clear(); }
+        w.touched.clear();
     };
-    for &inst in &instances[under..] {
-        match inst.kind() {
-            Some(Kind::Rect) => {
-                let is_split = super::classify_quad(&inst).is_split();
-                let g = 1.5 + inst.params[2].max(0.0) * 2.0;
-                let bb = [
-                    (inst.rect[0] - g).max(inst.clip[0] - 1.0),
-                    (inst.rect[1] - g).max(inst.clip[1] - 1.0),
-                    (inst.rect[0] + inst.rect[2] + g).min(inst.clip[2] + 1.0),
-                    (inst.rect[1] + inst.rect[3] + g).min(inst.clip[3] + 1.0),
-                ];
-                if is_split {
-                    if !w.whole_rects.is_empty() || !w.glyphs.is_empty() {
-                        let m = tile_mask(bb);
-                        if hits_any(m, bb, whole_occ, &w.whole_bbs) || hits_any(m, bb, glyph_occ, &w.glyph_bbs) {
-                            flush(out, w, &mut whole_occ, &mut glyph_occ);
-                        } else {
-                            moved = true;
-                        }
-                    }
-                    w.split_rects.push(inst);
-                } else {
-                    let m = tile_mask(bb);
-                    if !w.glyphs.is_empty() {
-                        if hits_any(m, bb, glyph_occ, &w.glyph_bbs) {
-                            flush(out, w, &mut whole_occ, &mut glyph_occ);
-                        } else {
-                            moved = true;
-                        }
-                    }
-                    whole_occ |= m;
-                    w.whole_bbs.push((m, bb));
-                    w.whole_rects.push(inst);
+    for (at, inst) in instances.iter().enumerate().skip(under) {
+        let class = match inst.kind() {
+            None | Some(Kind::Layer | Kind::LayerEnd | Kind::Effect | Kind::BackdropBlur) => None,
+            // The page a picture or a glyph binds (`Renderer::batch`), and whether it is big enough to draw split
+            // (`classify_quad`): what picks its pipeline, near enough that a batch draws in a call or two.
+            Some(kind) => {
+                let split = inst.rect[2] >= super::SPLIT_MIN && inst.rect[3] >= super::SPLIT_MIN;
+                let page = match kind { Kind::Image => inst.params[0], Kind::Glyph => inst.params[2], _ => 0.0 };
+                Some(Class(kind as u8, split as u8, page as u32))
+            }
+        };
+        let Some(class) = class else {
+            flush(out, w);
+            out.push(*inst);
+            w.order.push(at as u32);
+            continue;
+        };
+        let quad = inst.quad_extent().filter(|q| q[2] > 0.0 && q[3] > 0.0 && q[0] < vw as f32 && q[1] < vh as f32);
+        let cells = quad.map(|q| {
+            let cell = |v: f32, n: i32| ((v.max(0.0) as i32) / WAVE_CELL).min(n - 1);
+            (cell(q[0], cols), cell(q[1], rows), cell(q[2], cols), cell(q[3], rows))
+        });
+        // The latest batch of its class, unless an instance its quad meets was drawn in a batch after that one.
+        let latest = w.latest.iter().position(|&(c, _)| c == class);
+        let joins = latest.map(|l| w.latest[l].1).filter(|&batch| match (quad, cells) {
+            (Some(q), Some((c0, r0, c1, r1))) => !(r0..=r1).any(|r| (c0..=c1).any(|c| {
+                let (newest, list) = &w.cells[(r * cols + c) as usize];
+                *newest > batch && list.iter().any(|&(b, o)| b > batch && q[0] < o[2] && o[0] < q[2] && q[1] < o[3] && o[1] < q[3])
+            })),
+            _ => true,
+        });
+        let batch = match joins {
+            Some(batch) => batch,
+            None => {
+                let list = w.spare.pop().unwrap_or_default();
+                w.batches.push((class, list));
+                let batch = w.batches.len() as u32 - 1;
+                match latest {
+                    Some(l) => w.latest[l].1 = batch,
+                    None => w.latest.push((class, batch)),
                 }
+                batch
             }
-            Some(Kind::Glyph) if inst.params[0] == 0.0 && inst.params[2] == 0.0 => {
-                let bb = [
-                    inst.rect[0].max(inst.clip[0] - 1.0),
-                    inst.rect[1].max(inst.clip[1] - 1.0),
-                    (inst.rect[0] + inst.rect[2]).min(inst.clip[2] + 1.0),
-                    (inst.rect[1] + inst.rect[3]).min(inst.clip[3] + 1.0),
-                ];
-                let m = tile_mask(bb);
-                glyph_occ |= m;
-                w.glyph_bbs.push((m, bb));
-                w.glyphs.push(inst);
-            }
-            _ => {
-                flush(out, w, &mut whole_occ, &mut glyph_occ);
-                out.push(inst);
+        };
+        if batch as usize + 1 != w.batches.len() { moved = true; }
+        w.batches[batch as usize].1.push(at as u32);
+        if let (Some(q), Some((c0, r0, c1, r1))) = (quad, cells) {
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    let cell = (r * cols + c) as u32;
+                    let (newest, list) = &mut w.cells[cell as usize];
+                    if list.is_empty() { w.touched.push(cell); }
+                    *newest = (*newest).max(batch);
+                    list.push((batch, q));
+                }
             }
         }
     }
-    flush(out, w, &mut whole_occ, &mut glyph_occ);
+    flush(out, w);
     moved
 }
 
