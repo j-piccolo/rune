@@ -662,6 +662,17 @@ impl Instance {
         [x0, y0, x1, y1]
     }
 
+    /// The quad `shader.wgsl` (`base_vs`) draws for this instance, within a pixel of its clip: what
+    /// [`Self::pixel_bounds`] rounds out, a little wider and without the rounding. `None` for records that
+    /// rasterize nothing in the uber shader. For order-keeping tests, where wider only means more kept.
+    #[inline(always)]
+    pub(crate) fn quad_extent(&self) -> Option<[f32; 4]> {
+        let (x0, y0, x1, y1) = self.bounds_core::<false>(1.0)?;
+        let c = self.clip;
+        let b = [x0.max(c[0] - 1.0), y0.max(c[1] - 1.0), x1.min(c[2] + 1.0), y1.min(c[3] + 1.0)];
+        (b[2] > b[0] && b[3] > b[1]).then_some(b)
+    }
+
     /// The pixels `[x0, y0, x1, y1)` whose centres lie in the quad `shader.wgsl` (`base_vs`) draws
     /// for this instance, within the reach of its clip and a `w × h` target. Empty (`[0; 4]`) for
     /// records that rasterize nothing in the uber shader.
