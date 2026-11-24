@@ -69,31 +69,46 @@ fn split_hole(i: In) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     let r = i.radii;
-    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let reach = side_reach(r);
     let border = select(0.0, max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), kind < 0.5);
     // A picture's edge is half a pixel soft (its `params.z` says whether it's premultiplied).
     let soft = select(max(i.params.z, 0.5), 0.5, image);
-    let e = reach + soft + border + 1.0;
+    let e = reach + vec4<f32>(soft + border + 1.0);
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
-        let corner = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-        edge = max(edge, vec4<f32>(corner + 1.0));
+        edge = max(edge, side_reach(c) + vec4<f32>(1.0));
     }
-    let lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-    let hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    let lo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+    let hi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
     if (any(hi - lo < vec2<f32>(8.0))) {
         return vec4<f32>(0.0);
     }
     return vec4<f32>(lo, hi);
 }
 
+// How far in from its straight edges a box's middle starts (`split_outer`): past its soft edge and border
+// by a pixel, as `split_hole` is past its corners as well.
+fn split_margin(i: In) -> f32 {
+    let kind = i.params.y;
+    let image = kind > 6.5 && kind < 7.5;
+    let border = select(0.0, max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w))), kind < 0.5);
+    return select(max(i.params.z, 0.5), 0.5, image) + border + 1.0;
+}
+
+// The clip's straight edges' reach in (`split_outer`): its fades, or half a pixel, and a pixel more.
+fn clip_edge(fade: vec4<u32>) -> vec4<f32> {
+    let f = vec4<f32>(unpack2x16float(fade.x), unpack2x16float(fade.y));
+    return max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
+}
+
 fn base_vs(i: In) -> Out {
-    // Vertices 0..4 draw the quad. A box drawn apart (render.rs `SPLIT_VERTICES`) takes vertices 4..34
-    // instead: five quads of six vertices (a strip, each quad's first and last vertex twice, so the
-    // triangles between them have no area), its middle (`split_hole`) and the four bands around it,
-    // which meet on whole pixels; a box with no middle draws whole as the first band and nothing else.
+    // Vertices 0..4 draw the quad. A box drawn apart (render.rs `SPLIT_VERTICES`) takes vertices 4..70
+    // instead: eleven quads of six vertices (a strip, each quad's first and last vertex twice, so the
+    // triangles between them have no area), its middle's three pieces and the eight bands around them
+    // (clip.wgsl `split_piece`), which meet on whole pixels; a box with no middle draws whole as the first
+    // band and nothing else.
     var corner = vec2<f32>(f32(i.vi & 1u), f32((i.vi >> 1u) & 1u));
     var sub = 0u;
     if (i.vi >= 4u) {
@@ -129,18 +144,16 @@ fn base_vs(i: In) -> Out {
     // The banded variant narrows a gradient segment's quad here (render/variant.rs `BAND`), before a split.
     var whole = 0u;
     if (sub > 0u) {
-        // The middle within the quad as narrowed, so the five quads partition what it draws.
+        // The middle within the quad as narrowed, so the eleven quads partition what it draws.
         var hole = split_hole(i);
         hole = vec4<f32>(max(hole.xy, lo), min(hole.zw, hi));
         if (hole.z > hole.x && hole.w > hole.y) {
-            switch sub {
-                case 1u: { lo = hole.xy; hi = hole.zw; whole = 1u; }
-                case 2u: { hi = vec2<f32>(hi.x, hole.y); }
-                case 3u: { lo = vec2<f32>(lo.x, hole.y); hi = vec2<f32>(hole.x, hole.w); }
-                case 4u: { lo = vec2<f32>(hole.z, hole.y); hi = vec2<f32>(hi.x, hole.w); }
-                default: { lo = vec2<f32>(lo.x, hole.w); }
-            }
-        } else if (sub != 2u) {
+            let outer = split_outer(i.rect, split_margin(i), i.clip, clip_edge(i.fade), lo, hi, hole);
+            let piece = split_piece(sub, lo, hi, hole, outer);
+            lo = piece.xy;
+            hi = max(piece.zw, piece.xy);
+            whole = select(0u, 1u, sub <= 3u);
+        } else if (sub != 4u) {
             // No middle: the box draws whole as the first band, and its middle (which the small solid
             // pipeline draws, render.rs `SPLIT_MIDDLE`) and the other bands draw nothing.
             hi = lo;
