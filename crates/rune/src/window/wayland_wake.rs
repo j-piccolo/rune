@@ -112,8 +112,13 @@ pub(crate) fn about_to_wait(
     state: &mut State,
     hosts: &[Option<Box<dyn AnyHost>>],
 ) -> Effects<Effect> {
-    let has_live_layer = hosts.iter().flatten().any(|h| h.has_live_wayland_layer());
-    let has_pending_events = hosts.iter().flatten().any(|h| h.has_pending_platform_events());
+    // The shell's own connection (outputs, a session lock) is read the same way as a layer's.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    let (shell_live, shell_pending) = (crate::platform::wayland_shell::live(), crate::platform::wayland_shell::has_pending_events());
+    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    let (shell_live, shell_pending) = (false, false);
+    let has_live_layer = shell_live || hosts.iter().flatten().any(|h| h.has_live_wayland_layer());
+    let has_pending_events = shell_pending || hosts.iter().flatten().any(|h| h.has_pending_platform_events());
     step(state, Event::AboutToWait { has_live_layer, has_pending_events })
 }
 

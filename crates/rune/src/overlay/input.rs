@@ -573,7 +573,41 @@ impl OverlayCore {
         }
         if app.rt().live_pending() { self.dirty = true; }
         self.drag_ends_due(app);
-        let requests = std::mem::take(&mut *self.shared.requests.lock().unwrap());
+        let mut requests = std::mem::take(&mut *self.shared.requests.lock().unwrap());
+        if self.closed { return; }
+        if requests.close {
+            // For good: hidden now, its surface and window gone, and the loop drops its host.
+            self.hide(app);
+            self.release();
+            self.closed = true;
+            return;
+        }
+        if let Some(blur) = requests.blur {
+            self.blur = blur;
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+            if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
+                layer.set_blur(blur, self.at.size);
+                layer.commit();
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(shell) = requests.shell.take() {
+            let moved = shell_output(self.options.shell.as_ref()) != shell_output(Some(&shell));
+            self.options.shell = Some(shell);
+            let layer = matches!(self.surface.live().map(|l| &l.backing), Some(Backing::Layer(_)));
+            if layer && moved {
+                // A layer surface can't change output: it's made again there.
+                let shown = self.presence.shown();
+                self.hide(app);
+                if shown { self.show_fading(app, event_loop, Duration::ZERO); }
+            } else if let Some(Live { backing: Backing::Layer(layer), .. }) = self.surface.live_mut() {
+                let at = Placement { size: self.canvas_size, ..self.at };
+                layer.reshape(&self.options, at);
+                layer.commit();
+            }
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+        if let Some(shell) = requests.shell.take() { self.options.shell = Some(shell); }
         if let Some(input) = requests.input { self.pending_input = Some(input); }
         self.apply_input(app.rt());
         if let Some(exclude) = requests.exclude_from_capture { self.set_capture_exclusion(exclude); }
@@ -631,7 +665,9 @@ impl OverlayCore {
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
                     Some(Backing::Layer(layer)) => {
-                        layer.place(self.at);
+                        // A shell surface asks for its own size, 0 on a stretched axis.
+                        let at = if self.options.shell.is_some() { Placement { size: self.canvas_size, ..self.at } } else { self.at };
+                        layer.place(at);
                         layer.commit();
                     }
                     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]

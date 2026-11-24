@@ -876,7 +876,7 @@ fn clipboard_receive_marks_shown_overlay_dirty_without_advancing_and_advances_fr
         &app_spec,
     );
     let Overlay { mut core, rt, compositor, setup, on_availability, shared } = overlay;
-    let mut app = app::TypedOverlayApp { rt, compositor, setup, on_availability, shared };
+    let mut app = app::TypedOverlayApp { rt, compositor, setup, on_availability, shared, on_button: None };
     let clipboard = crate::clipboard::memory();
     app.rt.use_clipboard(&clipboard);
     app.rt.wall_start = None;

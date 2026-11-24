@@ -451,6 +451,11 @@ impl AnyHost for OverlayHost {
         false
     }
 
+    /// Closed (`OverlayHandle::close`): the loop drops it, and its surface and state with it.
+    fn finished(&self) -> bool {
+        self.core.closed
+    }
+
     fn cancel_menus(&mut self) { self.app.popup_cancel(&mut self.core.popup); }
 }
 

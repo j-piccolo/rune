@@ -1,7 +1,10 @@
-//! A Wayland layer-shell surface for overlays: `zwlr_layer_shell_v1` on winit's own display
-//! connection, in a private event queue with its own seat. The surface reserves no space;
-//! input regions and the rendered buffer share a commit. Global pointer observation and
-//! capture exclusion are unavailable. wgpu draws through the raw `wl_surface`.
+//! A Wayland layer-shell or session-lock surface for overlays: `zwlr_layer_shell_v1` (or
+//! `ext_session_lock_v1`) on winit's own display, through the connection every such surface
+//! shares (`wayland_shell`), in a private event queue with its own seat. Placed by rune's edge
+//! placement, or as its `OverlayOptions::shell` says (any layer, anchors, margins, exclusive
+//! zone and keyboard). Input regions, blur regions and the rendered buffer share a commit.
+//! Global pointer observation and capture exclusion are unavailable. wgpu draws through the
+//! raw `wl_surface`.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr::NonNull;
@@ -19,6 +22,9 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::protocol::{wl_output::{self, WlOutput}, wl_seat::{self, WlSeat}, wl_pointer::{self, WlPointer}, wl_keyboard::{self, WlKeyboard}, wl_touch::{self, WlTouch}};
 use wayland_client::{Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
+use wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::{self, ExtSessionLockSurfaceV1};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
@@ -30,6 +36,7 @@ use super::layer_shell_machine::{configure_wait, connection, exclusive_zone, fra
 use crate::el::Align;
 use crate::overlay::{Placement, ScreenEdge};
 use crate::runtime::Waker;
+use crate::wayland::{BlurRegion, LayerKeyboard, LayerShell, ShellSurface};
 use crate::{OverlayInput, OverlayOptions, OverlayPlacement};
 
 mod compose;
@@ -458,6 +465,12 @@ impl Dispatch<WpCursorShapeManagerV1, ()> for State {
 impl Dispatch<WpCursorShapeDeviceV1, ()> for State {
     fn event(_: &mut Self, _: &WpCursorShapeDeviceV1, _: <WpCursorShapeDeviceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
+    fn event(_: &mut Self, _: &ExtBackgroundEffectManagerV1, _: <ExtBackgroundEffectManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+impl Dispatch<ExtBackgroundEffectSurfaceV1, ()> for State {
+    fn event(_: &mut Self, _: &ExtBackgroundEffectSurfaceV1, _: <ExtBackgroundEffectSurfaceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
 
 /// The cursor-shape-v1 shape for `c`, as `os_cursor` maps winit's. An image is the arrow.
 fn shape(c: crate::el::Cursor) -> Shape {
@@ -514,6 +527,15 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                 }
             }
             _ => {}
+        }
+    }
+}
+impl Dispatch<ExtSessionLockSurfaceV1, ()> for State {
+    fn event(state: &mut Self, lock: &ExtSessionLockSurfaceV1, event: ext_session_lock_surface_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // A lock surface is the output's size, always: the buffer must match what it says.
+        if let ext_session_lock_surface_v1::Event::Configure { serial, width, height } = event {
+            lock.ack_configure(serial);
+            readiness::step(&mut state.readiness, readiness::Event::Configure { width, height });
         }
     }
 }
@@ -605,6 +627,12 @@ pub(crate) struct Changes {
     pub closed: bool,
 }
 
+/// The surface's role.
+enum Role {
+    Layer(ZwlrLayerSurfaceV1),
+    Lock(ExtSessionLockSurfaceV1),
+}
+
 pub(crate) struct LayerSurface {
     namespace: String,
     conn: Connection,
@@ -612,14 +640,20 @@ pub(crate) struct LayerSurface {
     seat_global: Option<(u32, u32)>,
     regions: std::cell::RefCell<Option<Vec<[i32; 4]>>>,
     compositor: WlCompositor,
-    shell: ZwlrLayerShellV1,
+    /// The layer shell a layer surface was made on; none for a lock surface.
+    shell: Option<ZwlrLayerShellV1>,
+    /// An output bound here by registry name, released with the surface.
     output: Option<WlOutput>,
     seat: Option<WlSeat>,
     options: OverlayOptions,
     queue: EventQueue<State>,
     state: State,
-    layer: ZwlrLayerSurfaceV1,
+    role: Role,
     surface: WlSurface,
+    /// `ext-background-effect-v1` on this surface, where the compositor has it, and the
+    /// region last sent (none: no blur).
+    blur: Option<ExtBackgroundEffectSurfaceV1>,
+    blur_sent: Option<Vec<[i32; 4]>>,
     display: NonNull<std::ffi::c_void>,
     /// Why the surface closed when a fatal display error ended it; `None` for compositor `closed`.
     close_reason: Option<String>,
@@ -709,17 +743,28 @@ fn drain_event_queue(queue: &mut EventQueue<State>, state: &mut State) {
 }
 
 impl LayerSurface {
-    /// None when the display isn't Wayland, the compositor lacks layer-shell, or it never
-    /// configures the surface within `configure_wait::TIMEOUT`.
+    /// None when the display isn't Wayland, the compositor lacks layer-shell (or, for a lock
+    /// surface, no lock is held or the output is unknown), or it never configures the surface
+    /// within `configure_wait::TIMEOUT`. `named` is the output a shell surface asked for by
+    /// name, on the shell's connection.
     #[allow(unsafe_code)]
-    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>) -> Option<LayerSurface> {
+    pub fn new(display: RawDisplayHandle, namespace: &str, at: Placement, interactive: bool, options: &OverlayOptions, output_id: Option<u32>, named: Option<WlOutput>) -> Option<LayerSurface> {
         let RawDisplayHandle::Wayland(display) = display else { return None };
-        let want_keys = options.keys == crate::KeyPolicy::OnDemand;
+        let lock = matches!(options.shell, Some(ShellSurface::Lock { .. }));
+        // A lock surface is made on the lock the shell holds, for the output it names.
+        let held = if lock { Some((super::wayland_shell::held_lock()?, named.clone()?)) } else { None };
+        let layer_spec = match &options.shell { Some(ShellSurface::Layer(spec)) => Some(spec.clone()), _ => None };
+        let want_keys = options.keys == crate::KeyPolicy::OnDemand || lock
+            || layer_spec.as_ref().is_some_and(|spec| spec.keyboard != LayerKeyboard::None);
         if want_keys { compose::warm(); }
-        // SAFETY: winit owns this `wl_display` for the life of the event loop, which outlives
-        // every overlay; a foreign backend never closes it.
-        let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
-        let conn = Connection::from_backend(backend);
+        // Every shell surface shares one connection, so a lock surface can be made on the lock
+        // the shell holds. Without one (the shell isn't installed), a connection of its own.
+        let conn = match super::wayland_shell::connection() {
+            Some(conn) => conn,
+            // SAFETY: winit owns this `wl_display` for the life of the event loop, which
+            // outlives every overlay; a foreign backend never closes it.
+            None => Connection::from_backend(unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) }),
+        };
         let (globals, mut queue) = match registry_queue_init::<State>(&conn) {
             Ok(pair) => pair,
             Err(_) => {
@@ -736,29 +781,46 @@ impl LayerSurface {
             queue.flush().ok();
             return None;
         };
-        let Ok(shell) = globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ()) else {
-            conn.backend().destroy_object(&compositor.id()).ok();
-            destroy_globals(&conn, globals);
-            drain_event_queue(&mut queue, &mut State::default());
-            queue.flush().ok();
-            return None;
+        let shell = if lock { None } else {
+            let Ok(shell) = globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=4, ()) else {
+                conn.backend().destroy_object(&compositor.id()).ok();
+                destroy_globals(&conn, globals);
+                drain_event_queue(&mut queue, &mut State::default());
+                queue.flush().ok();
+                return None;
+            };
+            Some(shell)
         };
-        let output = output_id.and_then(|id| {
-            globals.contents().with_list(|list| list.iter().find(|g| g.name == id && g.interface == "wl_output").map(|g| {
-                globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())
-            }))
-        });
-        let want_pointer = options.input.resolved(interactive) != OverlayInput::None;
+        let output = if named.is_some() { None } else {
+            output_id.and_then(|id| {
+                globals.contents().with_list(|list| list.iter().find(|g| g.name == id && g.interface == "wl_output").map(|g| {
+                    globals.registry().bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ())
+                }))
+            })
+        };
+        let want_pointer = options.input.resolved(interactive) != OverlayInput::None || lock;
         let seat_global = globals.contents().with_list(|list| list.iter().find(|g| g.interface == "wl_seat").map(|g| (g.name, g.version.min(8))));
         let seat = if want_pointer || want_keys { seat_global.map(|(name, version)| globals.registry().bind::<WlSeat, _, _>(name, version, &qh, ())) } else { None };
         let surface = compositor.create_surface(&qh, ());
         let region = compositor.create_region(&qh, ());
         surface.set_input_region(Some(&region));
         region.destroy();
-        // Preserve existing overlay-layer semantics. There is no layer above Overlay;
-        // relative ordering of peers is compositor policy, unlike AppKit's numeric levels.
-        let layer = shell.get_layer_surface(&surface, output.as_ref(), Layer::Overlay, namespace.to_owned(), &qh, ());
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        let role = match (&held, &shell) {
+            (Some((held, on)), _) => Role::Lock(held.get_lock_surface(&surface, on, &qh, ())),
+            (None, Some(shell)) => {
+                let on = named.as_ref().or(output.as_ref());
+                let level = layer_spec.as_ref().map_or(Layer::Overlay, |spec| layer_of(spec.layer));
+                // Preserve existing overlay-layer semantics without a shell spec. There is no
+                // layer above Overlay; relative ordering of peers is compositor policy.
+                let layer = shell.get_layer_surface(&surface, on, level, namespace.to_owned(), &qh, ());
+                let keys = layer_spec.as_ref().map_or(KeyboardInteractivity::None, |spec| interactivity(spec.keyboard, layer.version()));
+                layer.set_keyboard_interactivity(keys);
+                Role::Layer(layer)
+            }
+            (None, None) => unreachable!("a layer surface bound the layer shell above"),
+        };
+        let blur = globals.bind::<ExtBackgroundEffectManagerV1, _, _>(&qh, 1..=1, ()).ok()
+            .map(|manager| manager.get_background_effect(&surface, &qh, ()));
         let shapes = globals.bind::<WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ()).ok();
         let text_input_manager = want_keys
             .then(|| globals.bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ()).ok())
@@ -776,9 +838,11 @@ impl LayerSurface {
             text_input,
             ..State::default()
         };
-        let mut this = LayerSurface { namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, shell, output, seat, options: options.clone(), queue, state, layer, surface, display: display.display, close_reason: None };
+        let mut this = LayerSurface { namespace: namespace.to_owned(), conn, globals: Some(globals), seat_global, regions: std::cell::RefCell::new(Some(Vec::new())), compositor, shell, output, seat, options: options.clone(), queue, state, role, surface, blur, blur_sent: None, display: display.display, close_reason: None };
         this.place(at);
-        this.surface.commit();
+        // A layer surface's first commit asks for its configure. A lock surface is configured
+        // unasked, and a commit before it acks that is a protocol error that ends the client.
+        if matches!(this.role, Role::Layer(_)) { this.surface.commit(); }
         match wait_for_configure(&this.conn, &mut this.queue, &mut this.state, configure_wait::TIMEOUT) {
             configure_wait::Outcome::Done => {}
             configure_wait::Outcome::TimedOut => {
@@ -801,18 +865,23 @@ impl LayerSurface {
     }
 
     pub fn place(&mut self, at: Placement) {
-        self.layer.set_exclusive_zone(exclusive_zone(self.options.placement));
+        let Role::Layer(layer) = &self.role else { return };
+        if let Some(ShellSurface::Layer(spec)) = &self.options.shell {
+            place_shell(layer, spec, at.size);
+            return;
+        }
+        layer.set_exclusive_zone(exclusive_zone(self.options.placement));
         match self.options.placement {
             Some(OverlayPlacement::FullScreen) => {
-                self.layer.set_size(0, 0);
-                self.layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-                self.layer.set_margin(0, 0, 0, 0);
+                layer.set_size(0, 0);
+                layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+                layer.set_margin(0, 0, 0, 0);
                 return;
             }
             Some(OverlayPlacement::Rect { x, y, width, height }) => {
-                self.layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
-                self.layer.set_anchor(Anchor::Top | Anchor::Left);
-                self.layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
+                layer.set_size(width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32);
+                layer.set_anchor(Anchor::Top | Anchor::Left);
+                layer.set_margin(y.round() as i32, 0, 0, x.round() as i32);
                 return;
             }
             _ => {}
@@ -831,9 +900,30 @@ impl LayerSurface {
             Align::Center => (Anchor::empty(), 0, 0),
             Align::End => (Anchor::Right, 0, inset),
         };
-        self.layer.set_size(at.size.0.ceil() as u32, at.size.1.ceil() as u32);
-        self.layer.set_anchor(vertical | horizontal);
-        self.layer.set_margin(top, right, bottom, left);
+        layer.set_size(at.size.0.ceil() as u32, at.size.1.ceil() as u32);
+        layer.set_anchor(vertical | horizontal);
+        layer.set_margin(top, right, bottom, left);
+    }
+
+    /// Takes `options`' shell placement (`OverlayHandle::set_shell`) on the live surface: layer,
+    /// anchors, margins, zone and keyboard, sent with the next commit. The output stays.
+    pub fn reshape(&mut self, options: &OverlayOptions, at: Placement) {
+        self.options.shell = options.shell.clone();
+        let keys = match &self.options.shell { Some(ShellSurface::Layer(spec)) => spec.keyboard != LayerKeyboard::None, _ => false };
+        let keys = keys || self.options.keys == crate::KeyPolicy::OnDemand;
+        if keys != self.state.want_keys {
+            self.state.want_keys = keys;
+            if keys && self.seat.is_none() && let Some(globals) = &self.globals {
+                self.seat = self.seat_global.map(|(name, version)| globals.registry().bind(name, version, &self.queue.handle(), ()));
+            }
+            if let Some(seat) = &self.seat { self.state.update_seat(seat, &self.queue.handle()); }
+        }
+        if let (Role::Layer(layer), Some(ShellSurface::Layer(spec))) = (&self.role, &self.options.shell) {
+            if layer.version() >= 2 { layer.set_layer(layer_of(spec.layer)); }
+            layer.set_keyboard_interactivity(interactivity(spec.keyboard, layer.version()));
+            layer.set_exclusive_zone(spec.exclusive_zone);
+        }
+        self.place(at);
     }
 
     pub fn configured_size(&self) -> Option<(u32, u32)> { self.state.readiness.size() }
@@ -864,9 +954,30 @@ impl LayerSurface {
         true
     }
 
+    /// The compositor's blur behind the surface, `size` points big (for a region of the whole
+    /// surface); sent with the next commit. Nothing where the compositor has no blur.
+    pub fn set_blur(&mut self, blur: Option<BlurRegion>, size: (f32, f32)) {
+        let Some(effect) = &self.blur else { return };
+        let next = blur.map(|blur| {
+            let [x, y, w, h] = blur.rect.unwrap_or([0.0, 0.0, size.0, size.1]);
+            rounded(x, y, w, h, blur.radius)
+        });
+        if self.blur_sent == next { return; }
+        match &next {
+            Some(rects) => {
+                let region = self.compositor.create_region(&self.queue.handle(), ());
+                for &[x, y, w, h] in rects { region.add(x, y, w, h); }
+                effect.set_blur_region(Some(&region));
+                region.destroy();
+            }
+            None => effect.set_blur_region(None),
+        }
+        self.blur_sent = next;
+    }
+
     pub fn set_input(&mut self, input: OverlayInput) {
         self.options.input = input;
-        self.state.want_pointer = input != OverlayInput::None;
+        self.state.want_pointer = input != OverlayInput::None || matches!(self.role, Role::Lock(_));
         if self.seat.is_none() && self.state.want_pointer && let Some(globals) = &self.globals {
             self.seat = self.seat_global.map(|(name, version)| globals.registry().bind(name, version, &self.queue.handle(), ()));
         }
@@ -874,15 +985,20 @@ impl LayerSurface {
     }
 
     pub fn request_keys(&self) -> bool {
-        if !keyboard::can_request_keys(self.options.keys, self.layer.version()) { return false; }
-        self.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        let Role::Layer(layer) = &self.role else { return false };
+        if !keyboard::can_request_keys(self.options.keys, layer.version()) { return false; }
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         self.surface.commit();
         self.queue.flush().ok();
         true
     }
 
     pub fn supports_keys(&self) -> bool {
-        keyboard::supports_keys(self.options.keys, self.layer.version(), self.seat.is_some())
+        match &self.role {
+            Role::Lock(_) => true,
+            Role::Layer(layer) => keyboard::supports_keys(self.options.keys, layer.version(), self.seat.is_some())
+                || matches!(&self.options.shell, Some(ShellSurface::Layer(spec)) if spec.keyboard != LayerKeyboard::None),
+        }
     }
 
     pub fn has_keyboard_focus(&self) -> bool {
@@ -1046,6 +1162,11 @@ impl LayerSurface {
         }
     }
 
+    #[cfg(test)]
+    fn layer(&self) -> &ZwlrLayerSurfaceV1 {
+        match &self.role { Role::Layer(layer) => layer, Role::Lock(_) => panic!("a lock surface") }
+    }
+
     pub fn raw_handles(&self) -> (RawDisplayHandle, RawWindowHandle) {
         let surface = NonNull::new(self.surface.id().as_ptr().cast()).expect("live wl_surface");
         (
@@ -1053,6 +1174,63 @@ impl LayerSurface {
             RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
         )
     }
+}
+
+/// A layer surface placed as `spec` says, asking for `size` points (0 stretches an axis it is
+/// anchored across).
+fn place_shell(layer: &ZwlrLayerSurfaceV1, spec: &LayerShell, size: (f32, f32)) {
+    let [top, right, bottom, left] = spec.anchors;
+    let mut anchor = Anchor::empty();
+    if top { anchor |= Anchor::Top; }
+    if right { anchor |= Anchor::Right; }
+    if bottom { anchor |= Anchor::Bottom; }
+    if left { anchor |= Anchor::Left; }
+    layer.set_size(size.0.max(0.0).ceil() as u32, size.1.max(0.0).ceil() as u32);
+    layer.set_anchor(anchor);
+    let [mt, mr, mb, ml] = spec.margin;
+    layer.set_margin(mt, mr, mb, ml);
+    layer.set_exclusive_zone(spec.exclusive_zone);
+}
+
+fn layer_of(layer: crate::wayland::Layer) -> Layer {
+    match layer {
+        crate::wayland::Layer::Background => Layer::Background,
+        crate::wayland::Layer::Bottom => Layer::Bottom,
+        crate::wayland::Layer::Top => Layer::Top,
+        crate::wayland::Layer::Overlay => Layer::Overlay,
+    }
+}
+
+/// The keyboard interactivity `keys` asks for, on a layer surface of `version`: on demand needs
+/// version 4, where earlier ones only know exclusive or none.
+fn interactivity(keys: LayerKeyboard, version: u32) -> KeyboardInteractivity {
+    match keys {
+        LayerKeyboard::None => KeyboardInteractivity::None,
+        LayerKeyboard::Exclusive => KeyboardInteractivity::Exclusive,
+        LayerKeyboard::OnDemand if version >= 4 => KeyboardInteractivity::OnDemand,
+        LayerKeyboard::OnDemand => KeyboardInteractivity::None,
+    }
+}
+
+/// A rounded rect as region rects, in whole points: one per point row through each corner,
+/// inset to the curve, and one for the straight middle. A blur region is rects only, and a
+/// square one shows past a rounded panel's corners.
+fn rounded(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Vec<[i32; 4]> {
+    let rect = |x: f32, y: f32, w: f32, h: f32| [x.round() as i32, y.round() as i32, w.round() as i32, h.round() as i32];
+    let r = radius.min(width / 2.0).min(height / 2.0).max(0.0).floor();
+    if r < 1.0 { return vec![rect(x, y, width, height)]; }
+    let rows = r as usize;
+    let mut out = Vec::with_capacity(2 * rows + 1);
+    for row in 0..rows {
+        // How far in the curve is at the middle of this row.
+        let dy = r - row as f32 - 0.5;
+        let inset = (r - (r * r - dy * dy).max(0.0).sqrt()).round();
+        let span = (width - 2.0 * inset).max(0.0);
+        out.push(rect(x + inset, y + row as f32, span, 1.0));
+        out.push(rect(x + inset, y + height - row as f32 - 1.0, span, 1.0));
+    }
+    out.push(rect(x, y + r, width, height - 2.0 * r));
+    out
 }
 
 impl Drop for LayerSurface {
@@ -1085,9 +1263,15 @@ impl Drop for LayerSurface {
         if let Some(output) = self.output.take() {
             if output.version() >= 3 { output.release(); } else { backend.destroy_object(&output.id()).ok(); }
         }
-        self.layer.destroy();
+        if let Some(blur) = self.blur.take() { blur.destroy(); }
+        match &self.role {
+            Role::Layer(layer) => layer.destroy(),
+            Role::Lock(lock) => lock.destroy(),
+        }
         self.surface.destroy();
-        if self.shell.version() >= 3 { self.shell.destroy(); } else { backend.destroy_object(&self.shell.id()).ok(); }
+        if let Some(shell) = self.shell.take() {
+            if shell.version() >= 3 { shell.destroy(); } else { backend.destroy_object(&shell.id()).ok(); }
+        }
         backend.destroy_object(&self.compositor.id()).ok();
         if let Some(globals) = self.globals.take() {
             destroy_globals(&self.conn, globals);

@@ -170,6 +170,9 @@ impl SharedCore {
     fn capabilities(&self) -> crate::OverlayCapabilities { self.native.lock().unwrap().1 }
     fn set_exclude_from_capture(&self, exclude: bool) { self.request(|q| q.exclude_from_capture = Some(exclude)); }
     fn set_xwayland_input(&self, allow: bool) { self.request(|q| q.xwayland_input = Some(allow)); }
+    fn set_shell(&self, surface: crate::wayland::ShellSurface) { self.request(|q| q.shell = Some(surface)); }
+    fn set_blur(&self, blur: Option<crate::wayland::BlurRegion>) { self.request(|q| q.blur = Some(blur)); }
+    fn close(&self) { self.request(|q| q.close = true); }
     fn surface_stats(&self) -> crate::SurfaceStats { crate::frame::surface_stats::read(&self.stats) }
     fn show(&self) { self.request(|q| q.visibility = Some(Visibility::Show(Duration::ZERO))); }
     fn hide(&self) { self.request(|q| q.visibility = Some(Visibility::Hide(Duration::ZERO))); }
@@ -263,6 +266,21 @@ impl<T: 'static> OverlayHandle<T> {
     #[inline(always)]
     pub fn set_xwayland_input(&self, allow: bool) { self.shared.core.set_xwayland_input(allow); }
 
+    /// Wayland: places its shell surface anew (`OverlayOptions::shell`): layer, anchors,
+    /// margins, exclusive zone and keyboard change in place; another output remakes the surface.
+    #[inline(always)]
+    pub fn set_shell(&self, surface: crate::wayland::ShellSurface) { self.shared.core.set_shell(surface); }
+
+    /// Wayland: the compositor's blur behind it (`ext-background-effect-v1`), sent with its next
+    /// commit, or none. A region of the whole surface follows its size.
+    #[inline(always)]
+    pub fn set_blur(&self, blur: Option<crate::wayland::BlurRegion>) { self.shared.core.set_blur(blur); }
+
+    /// Takes the overlay away for good: it hides, and its host leaves the event loop with its
+    /// state. Further requests do nothing.
+    #[inline(always)]
+    pub fn close(&self) { self.shared.core.close(); }
+
     /// The overlay's frame counts: redraws, presents, failed drawable acquisitions, loop turns
     /// and pacing: current totals, and per-second rates updated once a second while it draws.
     #[inline(always)]
@@ -354,6 +372,36 @@ pub(crate) trait PendingOverlay: AnyHost {
     fn font_smoothing(&self) -> crate::FontSmoothing;
 }
 
+thread_local! {
+    /// Overlays `crate::wayland::open` made since the loop last took them.
+    static OPENED: RefCell<Vec<Box<dyn PendingOverlay>>> = const { RefCell::new(Vec::new()) };
+    /// Asks the loop for a turn, set when it starts: an overlay opened now joins on it.
+    static LOOP_WAKE: RefCell<Option<Waker>> = const { RefCell::new(None) };
+}
+
+/// The loop started: how to ask it for a turn.
+pub(crate) fn set_loop_wake(wake: Waker) {
+    LOOP_WAKE.with_borrow_mut(|held| *held = Some(wake));
+}
+
+/// An overlay opened while the app runs, on the UI thread: queued for the loop's next turn,
+/// which connects it as one an app declared before running.
+pub(crate) fn open_at_runtime<T: 'static>(configured: crate::ConfiguredOverlay<T>, state: T) -> OverlayHandle<T> {
+    // No app spec: the overlay's own fonts (`ConfiguredOverlay::fonts`), else rune's, and no
+    // inherited poll.
+    let spec = crate::tooling::AppSpec::<()>::new("", (1.0, 1.0), || (), |_, _| crate::el::el());
+    let (host, handle) = OverlayHost::new(configured, state, &spec, crate::FontSmoothing::default());
+    OPENED.with_borrow_mut(|opened| opened.push(Box::new(host)));
+    let wake = LOOP_WAKE.with_borrow(Clone::clone);
+    if let Some(wake) = wake { wake(); }
+    handle
+}
+
+/// The overlays opened since the last call, for the loop to connect.
+pub(crate) fn take_opened() -> Vec<Box<dyn PendingOverlay>> {
+    OPENED.with_borrow_mut(std::mem::take)
+}
+
 enum Backing {
     Window(Arc<Window>),
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -407,6 +455,8 @@ struct Live {
 pub(in crate::overlay) struct OverlayCore {
     on_created: Option<Box<dyn FnMut(crate::OverlayCreated)>>,
     pending_input: Option<OverlayInput>,
+    /// Where a layer surface last heard the pointer move, in surface points; None once it left.
+    layer_pointer: Option<(f32, f32)>,
     presence: Presence,
     animate_reveal: bool, // `ConfiguredOverlay::animate_reveal`
     options: OverlayOptions,
@@ -481,6 +531,10 @@ pub(in crate::overlay) struct OverlayCore {
     test_window_backing: bool,
     #[cfg(test)]
     test_window_drags: u32,
+    /// `OverlayHandle::set_blur`'s region, sent again whenever the surface is made or resized.
+    blur: Option<crate::wayland::BlurRegion>,
+    /// `OverlayHandle::close` was called: its host leaves the loop.
+    closed: bool,
 }
 
 impl OverlayCore {
@@ -512,6 +566,7 @@ impl OverlayCore {
         OverlayCore {
             on_created,
             pending_input: None,
+            layer_pointer: None,
             presence: Presence::default(),
             animate_reveal,
             options,
@@ -568,6 +623,8 @@ impl OverlayCore {
             test_window_backing: false,
             #[cfg(test)]
             test_window_drags: 0,
+            blur: None,
+            closed: false,
         }
     }
 
@@ -699,7 +756,10 @@ impl OverlayCore {
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
             Backing::Layer(layer) => {
-                layer.place(self.at);
+                // A shell surface asks for its own size, 0 on a stretched axis.
+                let at = if self.options.shell.is_some() { Placement { size: self.canvas_size, ..self.at } } else { self.at };
+                layer.place(at);
+                layer.set_blur(self.blur, self.at.size);
                 layer.commit();
             }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -723,6 +783,13 @@ impl OverlayCore {
     }
 
     fn resolve_size(&mut self, event_loop: &ActiveEventLoop) {
+        // A shell surface is as big as it asks, or as the compositor configures a stretched
+        // axis (0): no display's area clamps it.
+        if self.options.shell.is_some() && crate::window::is_wayland(event_loop) {
+            let (w, h) = self.canvas_size;
+            self.at.size = (if w > 0.0 { w } else { self.at.size.0.max(1.0) }, if h > 0.0 { h } else { self.at.size.1.max(1.0) });
+            return;
+        }
         let at = Placement { size: self.canvas_size, ..self.at };
         #[cfg(target_os = "macos")]
         if let Some(rect) = self.panel.as_ref().map_or_else(|| crate::platform::macos::overlay_rect(at, &self.options), |panel| panel.rect(at, &self.options)) {
@@ -790,6 +857,15 @@ impl OverlayCore {
             self.resized(app, event_loop);
             self.options.display = DisplayTarget::UnderPointer;
         }
+    }
+}
+
+/// The output a shell surface is on, by name.
+#[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(dead_code))]
+fn shell_output(shell: Option<&crate::wayland::ShellSurface>) -> Option<&str> {
+    match shell? {
+        crate::wayland::ShellSurface::Layer(layer) => layer.output.as_deref(),
+        crate::wayland::ShellSurface::Lock { output } => Some(output),
     }
 }
 
