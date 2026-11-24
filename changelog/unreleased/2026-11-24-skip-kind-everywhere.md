@@ -1,0 +1,1 @@
+- `RUNE_SKIP_KIND` (frame-profile) leaves a kind undrawn wherever it draws: on the fast pipelines (opaque and rounded rects, shadows, linear and radial gradients) and as a layer's composite (`8`), not only through the general path. What a kind costs a GPU, read as a frame with it less without, missed most rects and shadows and every composite.
