@@ -351,6 +351,15 @@ fn run_headless(prep: HeadlessPrep, config: HeadlessConfig, app: &mut dyn Headle
         rest_ms: Vec::new(),
         #[cfg(feature = "frame-profile")]
         profile: crate::frame::profile::Log::new(last_frame + 1),
+        // Only for a log that is written, and not `RUNE_FRAME_LOG_NO_QUERIES`: such a run pays for none.
+        #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+        queries: std::env::var_os("RUNE_FRAME_LOG")
+            .filter(|_| std::env::var_os("RUNE_FRAME_LOG_NO_QUERIES").is_none())
+            .map(|_| super::frame_log::Queries::new(&gpu)),
+        #[cfg(all(feature = "frame-profile", not(target_arch = "wasm32")))]
+        marks: super::frame_log::Marks::from_env(),
+        #[cfg(feature = "frame-profile")]
+        fp_was_animating: false,
     };
     let mut resize_from = app.rt().window_viewport();
     if script.iter().find(|e| !matches!(e.kind, Kind::Mark(_))).is_some_and(|e| e.t <= 1e-9) {
@@ -439,6 +448,12 @@ fn run_headless(prep: HeadlessPrep, config: HeadlessConfig, app: &mut dyn Headle
             fp_events: next_ev - events0,
             #[cfg(feature = "frame-profile")]
             fp_stages: [0.0; crate::frame::profile::STAGES],
+            #[cfg(feature = "frame-profile")]
+            fp_drawn: true,
+            #[cfg(feature = "frame-profile")]
+            fp_mhz: None,
+            #[cfg(feature = "frame-profile")]
+            fp_excluded: 0.0,
         };
         crate::frame::host_step::run(&mut host);
     }
