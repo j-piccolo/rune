@@ -1258,7 +1258,8 @@ impl Renderer {
                 if let Some(properties) = &self.springs { pass.set_bind_group(1, &properties.group, &[]); }
                 pass.set_bind_group(0, &t.composite, &[]);
                 pass.set_vertex_buffer(0, t.quad.slice(..));
-                pass.draw(0..4, 0..1);
+                // A layer's kind is its composite: `RUNE_SKIP_KIND=8` leaves it undrawn, the layer's contents drawn.
+                if !self.kind_skipped(l.begin) { pass.draw(0..4, 0..1); }
             } else if disposition == Disposition::Inline {
                 // An opaque group that needs no target, or any group while layers can't isolate
                 // (`breaker`).
