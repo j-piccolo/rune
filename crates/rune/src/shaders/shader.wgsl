@@ -234,8 +234,24 @@ fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
     let norm = step / (2.50662827 * sigma);
     var y = start + step * 0.5;
     var v = 0.0;
+    // A row along the box's straight sides (clear of its corners vertically) is the same erf pair whichever
+    // it is: `shadow_x`'s `delta` is 0 there. It is worked out once, for the first such row, and taken again.
+    let straight = half.y - corner;
+    var flat = 0.0;
+    var have_flat = false;
     for (var i = 0; i < 4; i = i + 1) {
-        v = v + shadow_x(p.x, p.y - y, inv_sigma_sqrt2, corner, half) * exp(-(y * y) * inv_two_sigma2);
+        let row = p.y - y;
+        var across: f32;
+        if (abs(row) <= straight) {
+            if (!have_flat) {
+                flat = shadow_x(p.x, row, inv_sigma_sqrt2, corner, half);
+                have_flat = true;
+            }
+            across = flat;
+        } else {
+            across = shadow_x(p.x, row, inv_sigma_sqrt2, corner, half);
+        }
+        v = v + across * exp(-(y * y) * inv_two_sigma2);
         y = y + step;
     }
     return v * norm;
