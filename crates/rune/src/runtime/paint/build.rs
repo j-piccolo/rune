@@ -14,6 +14,9 @@ impl RuntimeCore {
         self.prepare_viewports();
         let flying = !self.motion.flying.is_empty();
         let tree_order = self.paint.needs_tree_order(&self.tree, &self.scene, flying);
+        // A draw dump's marks say which element drew each instance (`tooling::dump_draw_list`).
+        #[cfg(feature = "frame-profile")]
+        if crate::tooling::dump_marks() { self.track_marks = true; }
         self.keep_swap(tree_order);
         self.instances.clear();
         self.paint.quads_frame += 1;
@@ -206,6 +209,9 @@ impl RuntimeCore {
             }
             let n = &self.tree.nodes[i];
             let mark = if n.vis.mark != 0 { n.vis.mark } else { pinh.mark };
+            // A draw dump names each instance's element by its mark instead (`tooling::element_mark`).
+            #[cfg(feature = "frame-profile")]
+            let mark = if self.track_marks && crate::tooling::dump_marks() { crate::tooling::element_mark(&n.path) } else { mark };
             let mut own = p.opacity;
             let mut hit_own = own * group_factor(&self.scene, self.kbd.focus.keyboard(), self.kbd.focus.path(), n, 1.0);
             own *= group_factor(&self.scene, self.kbd.focus.keyboard(), self.kbd.focus.path(), n, pinh.group);

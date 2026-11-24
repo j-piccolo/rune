@@ -87,30 +87,67 @@ pub(super) struct HeadlessLoop<'a> {
     pub(super) profile: crate::frame::profile::Log,
 }
 
-/// `RUNE_DRAW_DUMP=<dir>` (frame-profile): every frame's instance list (`instances.bin`, 128 bytes each)
-/// and what the redraw planner made of it (`frames.jsonl`, with each list's offset), for tools that
-/// count what a frame asks of a GPU from the draw list itself, on any machine.
+/// `RUNE_DRAW_DUMP=<dir>`, when set (frame-profile).
 #[cfg(all(feature = "frame-profile", not(target_os = "macos")))]
-pub(crate) fn dump_draw_list(k: usize, plan: &crate::window::damage::Plan, instances: &[crate::render::Instance], size: (u32, u32), clear: [f32; 4], keeps: bool, into_kept: bool) {
-    use std::sync::{Mutex, OnceLock};
-    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    static OUT: Mutex<Option<(std::fs::File, std::fs::File, u64)>> = Mutex::new(None);
-    let Some(dir) = DIR.get_or_init(|| std::env::var_os("RUNE_DRAW_DUMP").map(Into::into)) else { return };
+fn dump_dir() -> Option<&'static std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("RUNE_DRAW_DUMP").map(Into::into)).as_ref()
+}
+
+/// Frame-profile builds dumping their draw lists (`RUNE_DRAW_DUMP`): each element's instances carry its
+/// mark ([`element_mark`]) in place of an app's, so the dump can say which element drew what.
+#[cfg(feature = "frame-profile")]
+pub(crate) fn dump_marks() -> bool {
+    #[cfg(not(target_os = "macos"))]
+    { dump_dir().is_some() }
+    #[cfg(target_os = "macos")]
+    { false }
+}
+
+/// An element's mark in a dump: its path hashed (FNV-1a), never 0 (no mark). A path is the same from
+/// frame to frame, so instances a kept subtree carries from an earlier frame still name their element.
+#[cfg(feature = "frame-profile")]
+pub(crate) fn element_mark(path: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in path.bytes() { h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193); }
+    h | 1
+}
+
+/// `RUNE_DRAW_DUMP=<dir>` (frame-profile): every frame's instance list (`instances.bin`, 128 bytes each),
+/// each instance's element (`marks.bin`, a `u32` each: [`element_mark`]), and what the redraw planner made
+/// of the list (`frames.jsonl`, with each list's offset and the paths of the elements its marks name), for
+/// tools that count what a frame asks of a GPU from the draw list itself, on any machine.
+#[cfg(all(feature = "frame-profile", not(target_os = "macos")))]
+pub(crate) fn dump_draw_list(k: usize, plan: &crate::window::damage::Plan, core: &RuntimeCore, size: (u32, u32), clear: [f32; 4], keeps: bool, into_kept: bool) {
+    use std::sync::Mutex;
+    static OUT: Mutex<Option<(std::fs::File, std::fs::File, std::fs::File, u64)>> = Mutex::new(None);
+    let Some(dir) = dump_dir() else { return };
     let mut out = OUT.lock().unwrap();
     if out.is_none() {
         std::fs::create_dir_all(dir).ok();
-        let (Ok(meta), Ok(bin)) = (std::fs::File::create(dir.join("frames.jsonl")), std::fs::File::create(dir.join("instances.bin"))) else { return };
-        *out = Some((meta, bin, 0));
+        let (Ok(meta), Ok(bin), Ok(marks)) = (std::fs::File::create(dir.join("frames.jsonl")), std::fs::File::create(dir.join("instances.bin")), std::fs::File::create(dir.join("marks.bin"))) else { return };
+        *out = Some((meta, bin, marks, 0));
     }
-    let Some((meta, bin, at)) = out.as_mut() else { return };
+    let Some((meta, bin, marks_out, at)) = out.as_mut() else { return };
+    let instances = &core.instances;
     let bytes: &[u8] = bytemuck::cast_slice(instances);
     bin.write_all(bytes).ok();
+    // Marks run parallel to the instances (`Runtime::marks`); a list painted before marks were on has none.
+    let marks: Vec<u32> = (0..instances.len()).map(|i| core.marks.get(i).copied().unwrap_or(0)).collect();
+    marks_out.write_all(bytemuck::cast_slice(&marks)).ok();
+    let named: std::collections::HashSet<u32> = marks.iter().copied().filter(|&m| m != 0).collect();
+    let mut elements = serde_json::Map::new();
+    for n in &core.tree.nodes {
+        let m = element_mark(&n.path);
+        if named.contains(&m) { elements.insert(m.to_string(), n.path.clone().into()); }
+    }
     let (kind, why, draw, shift, same) = match plan {
         crate::window::damage::Plan::All(why) => ("all", *why, Vec::new(), None, false),
         crate::window::damage::Plan::Part { draw, shift, same, .. } => ("part", "", draw.clone(), shift.map(|s| (s.from, s.to)), *same),
     };
     writeln!(meta, "{}", json!({ "k": k, "at": *at, "n": instances.len(), "size": [size.0, size.1], "clear": clear, "plan": kind, "why": why,
-        "draw": draw, "shift": shift, "same": same, "keeps": keeps, "into_kept": into_kept, "age": crate::window::damage::target_age() })).ok();
+        "draw": draw, "shift": shift, "same": same, "keeps": keeps, "into_kept": into_kept, "age": crate::window::damage::target_age(),
+        "elements": elements })).ok();
     *at += bytes.len() as u64;
 }
 
@@ -307,7 +344,7 @@ impl<F: FnMut(Shot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
             let age = if buffers > 0 && s.turns >= buffers && s.overlay.is_none() { buffers } else { 0 };
             s.turns = s.turns.saturating_add(1);
             #[cfg(feature = "frame-profile")]
-            dump_draw_list(self.k, &plan, &rt.instances, (s.wp, s.hp), rt.clear_color(), keeps, s.alpha.is_none() && !crate::window::damage::whole_frames());
+            dump_draw_list(self.k, &plan, rt, (s.wp, s.hp), rt.clear_color(), keeps, s.alpha.is_none() && !crate::window::damage::whole_frames());
             match plan {
                 crate::window::damage::Plan::Part { draw, shift, same, .. } => {
                     s.renderer.arm_damage(&s.gpu.device, &s.gpu.queue, &draw, rt.clear_color(), (s.wp, s.hp), s.target_format, shift.map(|s| (s.from, s.to)));

@@ -148,7 +148,7 @@ impl FrameLog {
         let core = rt.core_mut();
         // `RUNE_DRAW_DUMP`: the draw list, for counting what the frame asks of a GPU. Drawn whole.
         #[cfg(not(target_os = "macos"))]
-        super::headless::dump_draw_list(self.k, &crate::window::damage::Plan::All("overlay"), &core.instances, size, [0.0; 4], false, false);
+        super::headless::dump_draw_list(self.k, &crate::window::damage::Plan::All("overlay"), core, size, [0.0; 4], false, false);
         renderer.attach_text(&mut core.text.atlas);
         crate::frame::host_step::prepare_gpu_resources(renderer, gpu, core, size, false);
         stage(0, &mut since);

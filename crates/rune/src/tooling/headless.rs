@@ -17,6 +17,8 @@ use app::{HeadlessApp, TypedHeadlessApp};
 pub(in crate::tooling) use frame::{step_window_frame, take_window_frame};
 #[cfg(all(feature = "frame-profile", not(target_os = "macos")))]
 pub(in crate::tooling) use frame::dump_draw_list;
+#[cfg(feature = "frame-profile")]
+pub(crate) use frame::{dump_marks, element_mark};
 use frame::{HeadlessFrame, HeadlessLoop};
 
 #[cfg(test)]

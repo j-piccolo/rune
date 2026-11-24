@@ -1,0 +1,1 @@
+- A draw dump (`RUNE_DRAW_DUMP`) says which element drew each instance: `marks.bin` holds a mark per instance (the element's path hashed), and each frame's line in `frames.jsonl` maps the marks it uses to their paths (`elements`). While dumping, an element's mark replaces an app's (`El::mark`).
