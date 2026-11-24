@@ -74,7 +74,7 @@ fn split_hole(i: In) -> vec4<f32> {
     // A picture's edge is half a pixel soft (its `params.z` says whether it's premultiplied).
     let soft = select(max(i.params.z, 0.5), 0.5, image);
     let e = reach + vec4<f32>(soft + border + 1.0);
-    let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
+    let f = vec4<f32>(unpack_f16x2(i.fade.x), unpack_f16x2(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
@@ -99,7 +99,7 @@ fn split_margin(i: In) -> f32 {
 
 // The clip's straight edges' reach in (`split_outer`): its fades, or half a pixel, and a pixel more.
 fn clip_edge(fade: vec4<u32>) -> vec4<f32> {
-    let f = vec4<f32>(unpack2x16float(fade.x), unpack2x16float(fade.y));
+    let f = vec4<f32>(unpack_f16x2(fade.x), unpack_f16x2(fade.y));
     return max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
 }
 
