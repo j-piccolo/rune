@@ -4,7 +4,8 @@
 //! headless run writes its frames (`RUNE_FRAME_LOG`), with everything the thread did since the
 //! last frame: the input it handled, the updates and the frames that settled them. Where the
 //! device has timestamps inside encoders, the GPU's own time for the frame and its clock as it
-//! drew come with it (`gpu_time_ms`, `gpu_mhz`). A picture a compositor would show under the
+//! drew come with it (`gpu_time_ms`, `gpu_mhz`); where it has pipeline statistics, the fragment
+//! shader invocations its passes ran (`frag_invocations`). A picture a compositor would show under the
 //! window (`El::underlay`) it leaves out, as a window on a surface that can hold one does.
 
 use crate::render::{Gpu, Offscreen, Renderer};
@@ -14,11 +15,67 @@ pub struct FrameLog {
     log: crate::frame::profile::Log,
     target: Offscreen,
     timer: Option<Timer>,
+    frags: Option<Frags>,
     events: usize,
     cpu0: Option<f64>,
     commits0: u64,
     /// Frames logged so far.
     k: usize,
+}
+
+/// The queries a frame's passes count their fragment shader invocations into, and where they're read
+/// back (`render::frag_stats`).
+struct Frags {
+    queries: wgpu::QuerySet,
+    resolved: wgpu::Buffer,
+    read: wgpu::Buffer,
+    /// Queries a frame used, and whether it had more passes than the set holds.
+    used: (u32, bool),
+}
+
+impl Frags {
+    /// Passes a frame can count: a frame splits into a pass per isolated group and per backdrop.
+    const COUNT: u32 = 256;
+
+    fn new(gpu: &Gpu) -> Option<Self> {
+        if !gpu.device.features().contains(wgpu::Features::PIPELINE_STATISTICS_QUERY) { return None; }
+        let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("frame-log fragments"),
+            ty: wgpu::QueryType::PipelineStatistics(wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS),
+            count: Self::COUNT,
+        });
+        let size = u64::from(Self::COUNT) * 8;
+        let buffer = |usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame-log fragments"), size, usage, mapped_at_creation: false });
+        let resolved = buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
+        let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        Some(Self { queries, resolved, read, used: (0, false) })
+    }
+
+    /// Resolves the queries the frame used, once its passes are recorded.
+    fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.used = crate::render::frag_stats::finish();
+        let n = self.used.0;
+        if n > 0 {
+            encoder.resolve_query_set(&self.queries, 0..n, &self.resolved, 0);
+            encoder.copy_buffer_to_buffer(&self.resolved, 0, &self.read, 0, u64::from(n) * 8);
+        }
+    }
+
+    /// The frame's invocations, once its work is done: none when it had more passes than the set counts.
+    fn read(&self, gpu: &Gpu) -> Option<u64> {
+        let (n, over) = self.used;
+        if over { return None; }
+        if n == 0 { return Some(0); }
+        let slice = self.read.slice(..u64::from(n) * 8);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok()?;
+        let sum = {
+            let bytes = slice.get_mapped_range().ok()?;
+            bytes.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).sum()
+        };
+        self.read.unmap();
+        Some(sum)
+    }
 }
 
 /// Two timestamps around a frame's commands, and where they're read back.
@@ -72,7 +129,7 @@ impl FrameLog {
     /// Frames `size` device pixels big, each a JSON line appended to `out`.
     pub fn new<S: 'static>(gpu: &Gpu, renderer: &Renderer, rt: &mut crate::Runtime<S>, size: (u32, u32), out: std::fs::File) -> Self {
         let target = Offscreen::with_format(&gpu.device, size.0.max(1), size.1.max(1), renderer.format());
-        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, timer: Timer::new(gpu), events: 0, cpu0: None, commits0: 0, k: 0 };
+        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, timer: Timer::new(gpu), frags: Frags::new(gpu), events: 0, cpu0: None, commits0: 0, k: 0 };
         log.skip(rt);
         log
     }
@@ -102,7 +159,9 @@ impl FrameLog {
         }
         // A picture the compositor would show under the window (`El::underlay`) isn't the window's to draw.
         renderer.set_underlay_start(core.underlay(size).map_or(0, |(from, _)| from));
+        if let Some(f) = &self.frags { crate::render::frag_stats::start(f.queries.clone(), Frags::COUNT); }
         crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &self.target.view, core, size, [0.0; 4]);
+        if let Some(f) = &mut self.frags { f.resolve(&mut encoder); }
         renderer.set_underlay_start(0);
         renderer.pass_mark = None;
         if let Some(t) = &self.timer {
@@ -126,6 +185,7 @@ impl FrameLog {
         let gpu_wait_ms = start.elapsed().as_secs_f64() * 1000.0 - ms;
         let before = cpu_ms().unwrap_or(0.0);
         let gpu_time_ms = match &self.timer { Some(t) => self.log.exclude(|| t.read(gpu)), None => None };
+        let frag_invocations = match &self.frags { Some(f) => self.log.exclude(|| f.read(gpu)), None => None };
         excluded += cpu_ms().unwrap_or(before) - before;
         self.log.push(crate::frame::profile::Row {
             phases: crate::frame::profile::take(),
@@ -143,6 +203,7 @@ impl FrameLog {
             gpu_time_ms: gpu_time_ms.map(|(_, all)| all),
             gpu_layers_ms: gpu_time_ms.map(|(layers, _)| layers),
             gpu_mhz: mhz,
+            frag_invocations,
         });
         self.events = 0;
         self.cpu0 = cpu_ms();
