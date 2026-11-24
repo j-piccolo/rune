@@ -1,0 +1,1 @@
+- A band of a border ring with no fill, circular corners and no fade (a glass panel's rim) draws on a slim pipeline of its own: the ring's coverage, its clip and a discard where it's empty, without the uber shader's box path. No pixel changes.

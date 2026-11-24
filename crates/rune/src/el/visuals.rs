@@ -228,6 +228,16 @@ impl El {
         cold.pixels_fit = None;
         self
     }
+    /// Lets the compositor show this element's picture ([`pixels`](Self::pixels)), an opaque one
+    /// covering the window, under the window instead of the window drawing it: while it rests whole
+    /// (fully opaque, unclipped, one texel a device pixel) in a window whose surface can hold one,
+    /// the window draws neither it nor anything under it, and the compositor shows the picture where
+    /// the window leaves it clear. Fading, moving or not covering the window, it draws as any picture
+    /// does. For a backdrop: every texel of the picture must be opaque.
+    pub fn underlay(mut self) -> Self {
+        self.vis.cold_mut().underlay = true;
+        self
+    }
     /// Shows `pixels` at its own aspect ratio, centred: `Fit` letterboxes the whole image inside
     /// the rect (the corner radius rounds the image), `Fill` covers the rect and crops the overflow.
     pub fn pixels_fit(mut self, pixels: &crate::pixels::Pixels, fit: crate::SurfaceFit) -> Self {

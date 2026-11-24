@@ -93,6 +93,8 @@ struct Meta {
     token: u64,
     logical_at: f64,
     node_next: u32,
+    /// A settle threshold this track's owner chose (`animate_changed_eps`), in place of its class's; 0 for none.
+    eps: f32,
 }
 
 /// A fast, unkeyed hasher for small fixed-size keys (ids, glyph keys) that no input chooses.
@@ -194,6 +196,10 @@ pub struct AnimationStore {
 
     index: FxMap<(u64, u16), u32>,
     node_head: FxMap<u64, u32>,
+    /// Live track count and currently-animating track count per `PropId` (`0..128`), so queries
+    /// for properties with zero tracks or zero active animations skip the `index` hash lookup.
+    prop_tracks: [u32; 128],
+    prop_active: [u32; 128],
 
     events: Carry<MotionEvent>,
     retarget_audit: Option<RetargetAudit>,
@@ -242,6 +248,8 @@ impl AnimationStore {
             pending_free: NONE,
             index: FxMap::default(),
             node_head: FxMap::default(),
+            prop_tracks: [0; 128],
+            prop_active: [0; 128],
             events: Carry::new(),
             retarget_audit: None,
         }
@@ -311,6 +319,12 @@ impl AnimationStore {
     /// Device pixels per point; sets settle thresholds below the 1/64 px snap quantum.
     pub fn set_pixel_scale(&mut self, scale: f32) {
         self.pixel_scale = scale.max(1.0);
+    }
+
+    /// Track `t`'s settle thresholds: its class's, or what its owner chose (`animate_changed_eps`).
+    pub(crate) fn track_eps(&self, t: usize) -> crate::layer::Eps {
+        let m = &self.t_meta[t];
+        if m.eps > 0.0 { crate::layer::Eps { pos: m.eps, vel: m.eps * 10.0 } } else { m.class.eps(self.pixel_scale) }
     }
 
     pub fn pixel_scale(&self) -> f32 {
@@ -516,6 +530,7 @@ impl AnimationStore {
             }
         };
         self.index.insert((node.0, prop.0), t);
+        if (prop.0 as usize) < 128 { self.prop_tracks[prop.0 as usize] += 1; }
         self.node_head.insert(node.0, t);
         t
     }
@@ -577,7 +592,7 @@ impl AnimationStore {
         if self.reduced_motion {
             anim.curve = class.reduce(anim.curve);
         }
-        let eps = class.eps(self.pixel_scale);
+        let eps = self.track_eps(t);
         let blend = anim.resolved_blend();
         let l0 = self.t_lane0[t] as usize;
         let mut changed = false;
@@ -679,6 +694,6 @@ impl AnimationStore {
 
 impl Meta {
     fn new(node: NodeId, prop: PropId, class: PropClass, generation: u32, node_next: u32) -> Meta {
-        Meta { node, prop, class, generation, alive: true, epoch: 0, token: 0, logical_at: f64::NEG_INFINITY, node_next }
+        Meta { node, prop, class, generation, alive: true, epoch: 0, token: 0, logical_at: f64::NEG_INFINITY, node_next, eps: 0.0 }
     }
 }

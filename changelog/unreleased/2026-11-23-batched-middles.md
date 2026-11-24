@@ -1,0 +1,2 @@
+- Boxes, pictures and gradient segments of one kind that draw their middles apart and lie clear of each other (a month grid's day cells, a list's rows) draw all their middles in one draw and all their bands in another, not two draws and two pipeline switches each. No pixel changes.
+- In a layer, a kind with no pinned pipeline draws with the layer's pipeline, not the window's (a format the layer's pass refuses).

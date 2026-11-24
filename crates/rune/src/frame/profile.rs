@@ -99,6 +99,12 @@ pub(crate) struct Row {
     pub cpu_ms: Option<f64>,
     /// Wall time from the frame's submit until the GPU had drawn it (0 with no compositor: nothing waits).
     pub gpu_wait_ms: f64,
+    /// The GPU's own time for the frame, from timestamps around its commands, and its clock (MHz) as
+    /// it drew, where the run could read them (`tooling::FrameLog`).
+    pub gpu_time_ms: Option<f64>,
+    /// Of that, the frame's layer passes, before its own.
+    pub gpu_layers_ms: Option<f64>,
+    pub gpu_mhz: Option<u32>,
 }
 
 /// A headless run's frames. With `RUNE_FRAME_LOG=FILE`, each frame is also written to FILE as a
@@ -208,11 +214,16 @@ mod counters {
 #[cfg(feature = "frame-profile")]
 impl Log {
     pub(crate) fn new(frames: usize) -> Self {
-        install_text_hook();
         let out = std::env::var_os("RUNE_FRAME_LOG").map(|path| {
-            let file = std::fs::File::create(&path).unwrap_or_else(|e| panic!("RUNE_FRAME_LOG {}: {e}", path.to_string_lossy()));
-            std::io::BufWriter::new(file)
+            std::fs::File::create(&path).unwrap_or_else(|e| panic!("RUNE_FRAME_LOG {}: {e}", path.to_string_lossy()))
         });
+        Self::to(out, frames)
+    }
+
+    /// A log written to `out`, if any.
+    pub(crate) fn to(out: Option<std::fs::File>, frames: usize) -> Self {
+        install_text_hook();
+        let out = out.map(std::io::BufWriter::new);
         // Counted only for a log that is written: the counters are a few dozen files to read a frame.
         #[cfg(target_os = "linux")]
         let counted = out.as_ref().and_then(|_| counters::Counters::new()).map(|c| { let now = c.read(); (c, now) });
@@ -230,6 +241,9 @@ impl Log {
                 "commits": row.commits, "shaped": row.shaped, "animating": row.animating, "gpu_wait_ms": row.gpu_wait_ms,
             });
             if row.commits > 0 { line["why"] = crate::runtime::CommitWhy::names(row.why).into(); }
+            if let Some(ms) = row.gpu_time_ms { line["gpu_time_ms"] = ms.into(); }
+            if let Some(ms) = row.gpu_layers_ms { line["gpu_layers_ms"] = ms.into(); }
+            if let Some(mhz) = row.gpu_mhz { line["gpu_mhz"] = mhz.into(); }
             for (name, ms) in STAGE_NAMES.iter().zip(row.stages) { line[*name] = ms.into(); }
             // Since the last frame ended, in user space: the drawing thread's cycles and instructions,
             // then every thread's (a software rasteriser's among them).
@@ -242,6 +256,25 @@ impl Log {
             writeln!(out, "{line}").expect("RUNE_FRAME_LOG write");
         }
         self.rows.push(row);
+    }
+
+    /// Runs `f`, leaving what it costs this thread out of the next frame's counts: the log's own work.
+    pub(crate) fn exclude<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        #[cfg(target_os = "linux")]
+        let before = self.counted.as_ref().map(|(c, _)| c.read());
+        let out = f();
+        #[cfg(target_os = "linux")]
+        if let (Some(before), Some((counters, last))) = (before, self.counted.as_mut()) {
+            let after = counters.read();
+            for at in 0..4 { last[at] = last[at].wrapping_add(after[at].wrapping_sub(before[at])); }
+        }
+        out
+    }
+
+    /// Leaves what this thread did since the last frame out of the next one's counts.
+    pub(crate) fn skip(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((counters, last)) = self.counted.as_mut() { *last = counters.read(); }
     }
 
     /// Means over the logged frames (first frame left out when more than one ran). CPU means

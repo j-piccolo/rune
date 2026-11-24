@@ -286,6 +286,8 @@ pub(crate) mod word {
 pub(crate) const STOP_FADE_BIAS: f32 = 131_072.0;
 
 pub fn pack_fade(width: [f32; 4], origin: [f32; 4], clip: [f32; 4]) -> [u32; 4] {
+    // No fade on any edge packs to zeros, as the loop below would: most primitives have none.
+    if width == [0.0; 4] { return [0; 4]; }
     // A negative width is a linear ramp (`El::clip_fade_linear`); `width > STOP_FADE_BIAS` tags
     // an edge using explicit piecewise-linear stops (`ScrollFade::stops`, bit 7 of its offset byte).
     let mut halves = [0u32; 4];
