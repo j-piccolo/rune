@@ -1218,7 +1218,7 @@ const SPLIT_MIDDLE: std::ops::Range<u32> = 4..22;
 const SPLIT_BANDS: std::ops::Range<u32> = 22..70;
 
 /// Below this many device pixels either way a shape draws whole: its middle (`split_hole`, 8 pixels at least past
-/// its corners and edges) would be small or empty, and the five quads cost more than they save.
+/// its corners and edges) would be small or empty, and the eleven quads cost more than they save.
 const SPLIT_MIN: f32 = 32.0;
 
 /// The pipeline pinned to `kind`, among the renderer's (`variant::PINNED_FROM_WGSL` order), if there is one.
