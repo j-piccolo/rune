@@ -3,7 +3,7 @@
 //! `classify_quad` (render.rs) gives it, with only the work those instances need.
 
 /// Ultra-slim shader for `Kind::Rect` middles (`QuadMode::MiddleOnly` on `0..4`, and `QuadMode::Split`
-/// middle on `4..10`): 1 flat varying (`fill`, byte-rounded once per vertex) and a 1-instruction fragment shader.
+/// middle pieces on `4..22`): 1 flat varying (`fill`, byte-rounded once per vertex) and a 1-instruction fragment shader.
 pub(super) fn solid_rect_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
 struct Globals {
@@ -84,7 +84,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 "#)
 }
 
-/// Slim shader for `Kind::Radial` (radial and angled linear gradient) middles (`4..10`):
+/// Slim shader for `Kind::Radial` (radial and angled linear gradient) middles (`4..22`):
 /// 5 flat varyings instead of 10, no `sd_rounded` or `clip_alpha_stops` in the fragment stage.
 pub(super) fn radial_middle_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
@@ -126,13 +126,13 @@ fn vs(i: In) -> Out {
     let grow = 1.0 + i.params.z * 2.0;
     var lo = i.rect.xy - vec2<f32>(grow);
     var hi = lo + i.rect.zw + vec2<f32>(2.0 * grow);
+    let lower_open = i.params.x >= 1.5;
+    let upper_open = i.params.w >= 1.5;
+    let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
+    let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
+    let below = lower_open || all(i.fill == vec4<f32>(0.0));
+    let above = upper_open || all(i.border == vec4<f32>(0.0));
     if (i.uv.z == 0.0 && any(i.uv.xy != vec2<f32>(0.0))) {
-        let lower_open = i.params.x >= 1.5;
-        let upper_open = i.params.w >= 1.5;
-        let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
-        let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
-        let below = lower_open || all(i.fill == vec4<f32>(0.0));
-        let above = upper_open || all(i.border == vec4<f32>(0.0));
         let down = abs(i.uv.y) >= abs(i.uv.x);
         let slope = select(i.uv.x, i.uv.y, down);
         let across = select(i.uv.y, i.uv.x, down);
@@ -151,6 +151,12 @@ fn vs(i: In) -> Out {
         }
         far = max(far, near);
         if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
+    } else if (i.uv.z > 0.0 && above) {
+        // As the band shader narrows it (variant.rs `BAND`), so the middle and bands cut the same quad.
+        let c = i.rect.xy + i.uv.xy;
+        let r_bound = abs(i.uv.zw) * max(t1, 0.0) + vec2<f32>(1.0);
+        lo = max(lo, c - r_bound);
+        hi = max(min(hi, c + r_bound), lo);
     }
     let r = i.radii;
     let reach = side_reach(r);
@@ -211,7 +217,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 "#)
 }
 
-/// Vertex-interpolated shader for linear `Kind::Radial` middles (`4..10`) whose `split_hole` lies
+/// Vertex-interpolated shader for linear `Kind::Radial` middles (`4..22`) whose `split_hole` lies
 /// strictly within `[t0, t1]`: evaluates `mix(fill, border, u)` at the 4 vertices and lets the
 /// hardware rasterizer interpolate `col`, making the fragment shader a single `return i.col;`.
 pub(super) fn linear_grad_middle_wgsl() -> String {
@@ -319,7 +325,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 
 /// Slim shader for borderless, circular-corner, unfaded `Kind::Rect`s (whole `0..4` or `SPLIT_BANDS`
-/// `10..34`): no `border_over`, no per-side borders, no `sd_continuous` (`atan2`), no `ramp_stops`,
+/// `22..70`): no `border_over`, no per-side borders, no `sd_continuous` (`atan2`), no `ramp_stops`,
 /// and discards zero-coverage apron pixels before blending.
 pub(super) fn simple_rect_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
