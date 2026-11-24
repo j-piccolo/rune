@@ -14,6 +14,7 @@ mod effect_warm;
 mod fast;
 mod fill;
 mod first_use;
+pub(crate) mod frag_stats;
 mod gpu_loss;
 mod instance;
 mod layers;
@@ -1103,7 +1104,9 @@ impl Renderer {
             multiview_mask: None,
         });
         if !blurs {
+            let counted = frag_stats::begin(&mut pass);
             self.draw_range(&mut pass, self.format, start..self.count);
+            frag_stats::end(&mut pass, counted);
             self.skip_instance.set(None);
             return;
         }

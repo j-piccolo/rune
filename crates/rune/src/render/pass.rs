@@ -29,7 +29,8 @@ pub(super) enum ActivePass<'a, 'p> {
 
 /// An owned pass, with everything a re-opened pass restores.
 pub(super) struct OpenPass<'a, 'p> {
-    pass: wgpu::RenderPass<'p>,
+    /// Frame-profile builds count its fragments (`frag_stats`), to its end.
+    pass: super::frag_stats::Counted<'p>,
     encoder: &'a mut wgpu::CommandEncoder,
     view: &'a wgpu::TextureView,
     /// The scissor a scope set (`None`: the whole target), restored when the pass re-opens.
@@ -62,7 +63,7 @@ impl<'a, 'p> ActivePass<'a, 'p> {
         view: &'a wgpu::TextureView,
         timestamps: Option<wgpu::RenderPassTimestampWrites<'a>>,
     ) -> Self {
-        ActivePass::Owned(OpenPass { pass, encoder, view, scissor: None, timestamps })
+        ActivePass::Owned(OpenPass { pass: super::frag_stats::Counted::new(pass), encoder, view, scissor: None, timestamps })
     }
 
     /// Sets the scissor to `rect` (`[x, y, width, height]`), or to the whole `size` target.
@@ -237,7 +238,7 @@ impl<'a, 'p> ActivePass<'a, 'p> {
         }).forget_lifetime();
         next.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
         if let Some([x, y, w, h]) = scissor { next.set_scissor_rect(x, y, w, h); }
-        *self = ActivePass::Owned(OpenPass { pass: next, encoder, view, scissor, timestamps });
+        *self = ActivePass::Owned(OpenPass { pass: super::frag_stats::Counted::new(next), encoder, view, scissor, timestamps });
         Some(bd)
     }
 }

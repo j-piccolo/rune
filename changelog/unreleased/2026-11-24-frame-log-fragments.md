@@ -1,0 +1,1 @@
+- Frame-profile builds ask the device for pipeline statistics where it has them, and `tooling::FrameLog` logs each frame's `frag_invocations`: the fragment shader invocations its passes ran (the frame's, its isolated groups', and each half of a pass a backdrop split), as the GPU counted them.
