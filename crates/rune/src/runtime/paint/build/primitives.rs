@@ -3,6 +3,8 @@
 use super::*;
 
 impl RuntimeCore {
+    /// The instances it pushes take their fade after it returns (`build`: every instance a node pushed
+    /// gets the node's packed fade), so they're made with none here.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn paint_node_box(
@@ -164,7 +166,7 @@ impl RuntimeCore {
             params: [bw, KIND_DASHED, blur * s, 1.0],
             uv: [dash * k_px, gap * k_px, n.vis.border_dash_phase * k_px, 0.0],
             clip,
-            fade: crate::render::pack_fade(fade, clip, clip),
+            fade: [0; 4],
         });
         // Per-side widths (`El::border_sides`), each snapped as `bw` is; the widest is `bw`.
         let sides = n.vis.border_sides.filter(|_| bw > 0.0).map(|ws| ws.map(|v| pixel_snap::line_width(v * s) * sc));
@@ -182,7 +184,7 @@ impl RuntimeCore {
             params: [bw, border_kind, blur * s, o],
             uv: if border_kind == KIND_RECT { sides.unwrap_or([0.0; 4]) } else { border_uv },
             clip,
-            fade: crate::render::pack_fade(fade, clip, clip),
+            fade: [0; 4],
         };
         let apart = bw > 0.0 && border_a > 0.0005 && n.vis.shadows.iter().chain(stuck_shadows.1).any(|sh| sh.inset);
         // Dimmed, an opaque fill and its gradient draw as one opaque gradient, so they fade
@@ -199,7 +201,7 @@ impl RuntimeCore {
                     params: [0.0, KIND_RECT, blur * s, 1.0],
                     uv: [0.0; 4],
                     clip,
-                    fade: crate::render::pack_fade(fade, clip, clip),
+                    fade: [0; 4],
                 });
             }
             let g = n.vis.gradient.as_deref().copied().unwrap_or_default();
@@ -215,7 +217,7 @@ impl RuntimeCore {
                     params: [0.0, KIND_GRADIENT, 0.0, 1.0],
                     uv: bottom,
                     clip,
-                    fade: crate::render::pack_fade(fade, clip, clip),
+                    fade: [0; 4],
                 });
             }
             if let Some(rg) = &n.vis.radial {
@@ -352,7 +354,7 @@ impl RuntimeCore {
                         params: [t0, KIND_RADIAL, blur * s, t1],
                         uv,
                         clip,
-                        fade: crate::render::pack_fade(fade, clip, clip),
+                        fade: [0; 4],
                     });
                 }
             }
@@ -448,7 +450,7 @@ impl RuntimeCore {
                     params: [ow, KIND_RECT, 0.0, 1.0],
                     uv: [0.0; 4],
                     clip,
-                    fade: crate::render::pack_fade(fade, clip, clip),
+                    fade: [0; 4],
                 });
             }
         }
