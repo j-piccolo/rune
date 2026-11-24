@@ -605,6 +605,7 @@ impl RuntimeCore {
             if let Some((_, radii)) = rounded {
                 for instance in &mut self.instances[primitive_start..] {
                     if glyphs_clear && instance.params[1] == KIND_GLYPH { continue; }
+                    if clear_of_round_corners(instance, radii) { continue; }
                     instance.round_clip_corners(radii);
                 }
                 let packed = crate::render::pack_clip_radii(clip, radii);
