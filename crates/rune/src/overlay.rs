@@ -377,6 +377,15 @@ thread_local! {
     static OPENED: RefCell<Vec<Box<dyn PendingOverlay>>> = const { RefCell::new(Vec::new()) };
     /// Asks the loop for a turn, set when it starts: an overlay opened now joins on it.
     static LOOP_WAKE: RefCell<Option<Waker>> = const { RefCell::new(None) };
+    /// The running app's font smoothing and effect warming (`App::font_smoothing`,
+    /// `App::prewarm_effects`), which an overlay opened now takes as a declared one does.
+    static INHERITED: std::cell::Cell<Option<(crate::FontSmoothing, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The app about to run: what an overlay opened while it runs takes from it.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn set_inherited(font_smoothing: crate::FontSmoothing, prewarm_effects: bool) {
+    INHERITED.set(Some((font_smoothing, prewarm_effects)));
 }
 
 /// The loop started: how to ask it for a turn.
@@ -390,7 +399,9 @@ pub(crate) fn open_at_runtime<T: 'static>(configured: crate::ConfiguredOverlay<T
     // No app spec: the overlay's own fonts (`ConfiguredOverlay::fonts`), else rune's, and no
     // inherited poll.
     let spec = crate::tooling::AppSpec::<()>::new("", (1.0, 1.0), || (), |_, _| crate::el::el());
-    let (host, handle) = OverlayHost::new(configured, state, &spec, crate::FontSmoothing::default());
+    let (font_smoothing, prewarm_effects) = INHERITED.get().unwrap_or_default();
+    let (mut host, handle) = OverlayHost::new(configured, state, &spec, font_smoothing);
+    host.set_prewarm_effects(prewarm_effects);
     OPENED.with_borrow_mut(|opened| opened.push(Box::new(host)));
     let wake = LOOP_WAKE.with_borrow(Clone::clone);
     if let Some(wake) = wake { wake(); }
