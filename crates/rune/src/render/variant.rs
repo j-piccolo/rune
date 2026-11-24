@@ -721,6 +721,17 @@ impl Renderer {
             let format = self.extra[index].0;
             self.extra[index].1 = Self::pipeline(device, &self.layout, &self.shader, format, self.vertex_entry, Blend::SourceOver);
         }
+        // The fast pipelines share the uber shader's bind group layout: made again on the new one,
+        // and warmed again with their first draw.
+        if let Some(res) = &self.fused_res {
+            for (format, fast) in &mut self.fast {
+                *fast = super::fast::FastPipelines::new(device, &self.layout, &self.bind_layout, &res.layout, *format);
+            }
+            self.uploads.fast_warmed = false;
+        }
+        // So are the layers' composites (`add_layer_format`).
+        let formats: Vec<_> = self.layers.pipelines.drain(..).map(|(format, _)| format).collect();
+        for format in formats { self.add_layer_format(device, format); }
         self.shader_changed(device);
         // Built on the old bind layout; made again at the next backdrop blur and subpixel frame.
         self.backdrop_blur = None;
