@@ -205,8 +205,9 @@ impl RuntimeCore {
     /// subtree counts as more.
     pub(super) fn paints_once(&self, i: usize) -> bool {
         let mut painted = false;
+        let mut end = self.tree.nodes.len();
         for j in i..self.tree.nodes.len() {
-            if j > i && !self.tree.is_descendant(j, i) { break; }
+            if j > i && !self.tree.is_descendant(j, i) { end = j; break; }
             if j - i >= 32 { return false; }
             let n = &self.tree.nodes[j];
             let v = &n.vis;
@@ -223,7 +224,9 @@ impl RuntimeCore {
                 _ => return false,
             }
         }
-        true
+        // Exiting descendants sit at the end of the nodes, past the subtree walked above, and paint the
+        // group's opacity only through its layer.
+        !self.scene.any_exiting() || !(end..self.tree.nodes.len()).any(|j| self.tree.is_descendant(j, i))
     }
 
 

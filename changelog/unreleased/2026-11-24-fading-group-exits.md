@@ -1,0 +1,1 @@
+- A fading group with a child on its way out draws into a layer again: the child that is leaving sits at the end of the nodes, where the check for a group that paints a single thing didn't look, and painted outside the group's opacity.
