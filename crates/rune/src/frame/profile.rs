@@ -210,6 +210,15 @@ impl Log {
     }
 
     pub(crate) fn push(&mut self, row: Row) {
+        // The frame's counts end here, before the row is built and written: that is the log's
+        // work, left out of this frame and (`skip` once it is written) the next.
+        #[cfg(target_os = "linux")]
+        let counted = self.counted.as_mut().map(|(counters, last)| {
+            let now = counters.read();
+            let delta: [u64; 4] = std::array::from_fn(|at| now[at].wrapping_sub(last[at]));
+            *last = now;
+            delta
+        });
         if let Some(out) = self.out.as_mut() {
             use std::io::Write;
             let p = &row.phases;
@@ -227,14 +236,13 @@ impl Log {
             // Since the last frame ended, in user space: the drawing thread's cycles and instructions,
             // then every thread's (a software rasteriser's among them).
             #[cfg(target_os = "linux")]
-            if let Some((counters, last)) = self.counted.as_mut() {
-                let now = counters.read();
-                for (at, name) in ["cyc", "ins", "cyc_all", "ins_all"].into_iter().enumerate() { line[name] = now[at].wrapping_sub(last[at]).into(); }
-                *last = now;
+            if let Some(delta) = counted {
+                for (at, name) in ["cyc", "ins", "cyc_all", "ins_all"].into_iter().enumerate() { line[name] = delta[at].into(); }
             }
             writeln!(out, "{line}").expect("RUNE_FRAME_LOG write");
         }
         self.rows.push(row);
+        self.skip();
     }
 
     /// Runs `f`, leaving what it costs this thread out of the next frame's counts: the log's own work.
