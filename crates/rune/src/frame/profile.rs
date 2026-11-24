@@ -105,6 +105,9 @@ pub(crate) struct Row {
     /// Of that, the frame's layer passes, before its own.
     pub gpu_layers_ms: Option<f64>,
     pub gpu_mhz: Option<u32>,
+    /// The fragment shader invocations the GPU counted in the frame's passes (`render::frag_stats`),
+    /// where the device has pipeline statistics (`tooling::FrameLog`).
+    pub frag_invocations: Option<u64>,
 }
 
 /// A headless run's frames. With `RUNE_FRAME_LOG=FILE`, each frame is also written to FILE as a
@@ -253,6 +256,7 @@ impl Log {
             if let Some(ms) = row.gpu_time_ms { line["gpu_time_ms"] = ms.into(); }
             if let Some(ms) = row.gpu_layers_ms { line["gpu_layers_ms"] = ms.into(); }
             if let Some(mhz) = row.gpu_mhz { line["gpu_mhz"] = mhz.into(); }
+            if let Some(n) = row.frag_invocations { line["frag_invocations"] = n.into(); }
             for (name, ms) in STAGE_NAMES.iter().zip(row.stages) { line[*name] = ms.into(); }
             // Since the last frame ended, in user space: the drawing thread's cycles and instructions,
             // then every thread's (a software rasteriser's among them).

@@ -226,6 +226,9 @@ impl Gpu {
         // Dual-source blending is for subpixel text (`FontSmoothing::WindfoilRgb`, `ClearType`).
         // Timestamps inside encoders time a whole frame, layer passes and all (`tooling::FrameLog`).
         let optional_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS | wgpu::Features::DUAL_SOURCE_BLENDING | wanted | crate::gpu::backend::free_features(adapter);
+        // Frame-profile builds: the GPU's count of the fragments it shaded (`render::frag_stats`).
+        #[cfg(feature = "frame-profile")]
+        let optional_features = optional_features | wgpu::Features::PIPELINE_STATISTICS_QUERY;
         // Precompiled uber shaders: a metallib on macOS, DXBC on Windows.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let optional_features = optional_features | wgpu::Features::PASSTHROUGH_SHADERS;

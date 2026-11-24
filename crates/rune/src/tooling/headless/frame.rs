@@ -464,6 +464,7 @@ impl<F: FnMut(FrameShot, Vec<u8>)> FrameHost for HeadlessFrame<'_, '_, F> {
                 gpu_time_ms: None,
                 gpu_layers_ms: None,
                 gpu_mhz: None,
+                frag_invocations: None,
             });
         }
         s.cpu_ms.push(ms);
