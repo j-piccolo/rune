@@ -195,10 +195,13 @@ fn matched_in_place_keeps_ancestor_opacity_layer_and_rounded_clip_open() {
     rt_clip.frame(0.0);
     rt_clip.update(|s, _| s.active = 1);
     rt_clip.frame(0.0);
-    rt_clip.frame(0.10);
+    // Early in the flight, while the pill still reaches the clip's left corners: a shape clear of
+    // them draws without them, as it looks the same.
+    rt_clip.frame(0.02);
     assert!(!rt_clip.motion.flying.is_empty());
     let pill_inst = rt_clip.instances.iter().find(|q| q.params[1] == KIND_RECT && approx_color(q, PILL_COLOR))
         .expect("flying pill rect emitted");
+    assert!(pill_inst.rect[0] < 12.0, "the pill reaches the clip's corners: {:?}", pill_inst.rect);
     // Rounded clip corners are packed into fade[3] (round_clip_corners).
     assert_ne!(pill_inst.fade[3], 0, "in-place flight must retain ancestor clip_rounded mask");
 }
