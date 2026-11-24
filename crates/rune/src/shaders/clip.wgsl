@@ -8,6 +8,51 @@
 // the quarter turn (0 on the diagonal; within 0.32% of r). Each quadrant takes its own
 // corner's whole curve, as Core Animation does when K·r passes half the shorter side.
 const CONTINUOUS_K: f32 = 1.52866483;
+// How far in from each side (left, top, right, bottom) the corners of `radii` (top-left, top-right,
+// bottom-right, bottom-left; negative is continuous) reach: a side is clear of the corners it doesn't
+// touch, so a box rounded on top only has a square bottom edge, and its middle (`split_hole`) runs to it.
+fn side_reach(radii: vec4<f32>) -> vec4<f32> {
+    let e = select(radii, -CONTINUOUS_K * radii, radii < vec4<f32>(0.0));
+    return vec4<f32>(max(e.x, e.w), max(e.x, e.y), max(e.y, e.z), max(e.z, e.w));
+}
+// The box less its straight edges, on whole pixels: `rect` in by `m` (its soft edge, border and a pixel
+// more), the clip `clip` in by `edge` (its fades and a pixel more), within `lo`..`hi` and around `hole`
+// (`split_hole`, which is in from the corners as well). Between two corners the box and its clip cover
+// every pixel of it whole, as they do the hole.
+fn split_outer(rect: vec4<f32>, m: f32, clip: vec4<f32>, edge: vec4<f32>, lo: vec2<f32>, hi: vec2<f32>, hole: vec4<f32>) -> vec4<f32> {
+    let olo = max(ceil(max(rect.xy + vec2<f32>(m), clip.xy + edge.xy)), lo);
+    let ohi = min(floor(min(rect.xy + rect.zw - vec2<f32>(m), clip.zw - edge.zw)), hi);
+    return vec4<f32>(min(olo, hole.xy), max(ohi, hole.zw));
+}
+
+// A box drawn apart (render.rs `SPLIT_VERTICES`) is eleven quads, which partition its quad `lo`..`hi`: its
+// middle in three (`sub` 1 to 3: a column from its top edge to its bottom between the corners, and a strip
+// either side of it from corner to corner), covered whole, and eight bands (4 to 11: the top and bottom edges,
+// and on each side its two corners and the edge between them). Only the corners and a pixel or two along each
+// edge take the band shader. `hole` and `outer` as `split_hole` and `split_outer` give them.
+fn split_piece(sub: u32, lo: vec2<f32>, hi: vec2<f32>, hole: vec4<f32>, outer: vec4<f32>) -> vec4<f32> {
+    let h = hole;
+    let o = outer;
+    switch sub {
+        case 1u: { return vec4<f32>(h.x, o.y, h.z, o.w); }
+        case 2u: { return vec4<f32>(o.x, h.y, h.x, h.w); }
+        case 3u: { return vec4<f32>(h.z, h.y, o.z, h.w); }
+        case 4u: { return vec4<f32>(lo.x, lo.y, hi.x, o.y); }
+        case 5u: { return vec4<f32>(lo.x, o.w, hi.x, hi.y); }
+        case 6u: { return vec4<f32>(lo.x, o.y, h.x, h.y); }
+        case 7u: { return vec4<f32>(lo.x, h.w, h.x, o.w); }
+        case 8u: { return vec4<f32>(lo.x, h.y, o.x, h.w); }
+        case 9u: { return vec4<f32>(h.z, o.y, hi.x, h.y); }
+        case 10u: { return vec4<f32>(h.z, h.w, hi.x, o.w); }
+        default: { return vec4<f32>(o.z, h.y, hi.x, h.w); }
+    }
+}
+
+// A box's quad corner `corner` (0 or 1 each way) of split piece `piece`, empty when it has no area.
+fn piece_corner(piece: vec4<f32>, corner: vec2<f32>) -> vec2<f32> {
+    return select(piece.xy, max(piece.zw, piece.xy), corner > vec2<f32>(0.5));
+}
+
 fn sd_continuous(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
     let e = CONTINUOUS_K * r;
     let q = half - abs(p);
