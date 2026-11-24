@@ -1,0 +1,1 @@
+- A frame log's (`RUNE_FRAME_LOG`, `tooling::FrameLog`) cycle and instruction counts end where the frame does: the row the log built and wrote for the frame was counted in it (building it) and in the next (writing it).
