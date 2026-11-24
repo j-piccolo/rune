@@ -818,14 +818,15 @@ fn together(instances: &[Instance], quad_mode: &[super::QuadMode], out: &mut Vec
         let g = 2.0 + 2.0 * i.params[2].max(0.0);
         [i.rect[0] - g, i.rect[1] - g, i.rect[0] + i.rect[2] + g, i.rect[1] + i.rect[3] + g]
     };
-    let mut group: Vec<[f32; 4]> = Vec::new();
+    let (mut group, mut len) = ([[0.0f32; 4]; GROUP], 0);
     for (at, instance) in instances.iter().enumerate() {
-        if !quad_mode[at].is_split() { group.clear(); continue; }
+        if !quad_mode[at].is_split() { len = 0; continue; }
         let r = reach(instance);
-        let joins = at > 0 && quad_mode[at - 1] == quad_mode[at] && instances[at - 1].kind() == instance.kind() && group.len() < GROUP
-            && group.iter().all(|g| r[2] <= g[0] || g[2] <= r[0] || r[3] <= g[1] || g[3] <= r[1]);
-        if !joins { group.clear(); }
+        let joins = at > 0 && quad_mode[at - 1] == quad_mode[at] && instances[at - 1].kind() == instance.kind() && len < GROUP
+            && group[..len].iter().all(|g| r[2] <= g[0] || g[2] <= r[0] || r[3] <= g[1] || g[3] <= r[1]);
+        if !joins { len = 0; }
         out[at] = joins;
-        group.push(r);
+        group[len] = r;
+        len += 1;
     }
 }

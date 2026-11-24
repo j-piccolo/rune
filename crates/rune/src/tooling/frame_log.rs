@@ -129,7 +129,11 @@ impl FrameLog {
     /// Frames `size` device pixels big, each a JSON line appended to `out`.
     pub fn new<S: 'static>(gpu: &Gpu, renderer: &Renderer, rt: &mut crate::Runtime<S>, size: (u32, u32), out: std::fs::File) -> Self {
         let target = Offscreen::with_format(&gpu.device, size.0.max(1), size.1.max(1), renderer.format());
-        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, timer: Timer::new(gpu), frags: Frags::new(gpu), events: 0, cpu0: None, commits0: 0, k: 0 };
+        // `RUNE_FRAME_LOG_NO_QUERIES`: no timestamps and no fragment counts. They are commands the driver records
+        // and submits with every frame, which a window on screen never pays: a judge takes the CPU's cost from a
+        // run without them (its frames are the same, the clock being virtual) and the GPU's from one with.
+        let quiet = std::env::var_os("RUNE_FRAME_LOG_NO_QUERIES").is_some();
+        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, timer: if quiet { None } else { Timer::new(gpu) }, frags: if quiet { None } else { Frags::new(gpu) }, events: 0, cpu0: None, commits0: 0, k: 0 };
         log.skip(rt);
         log
     }

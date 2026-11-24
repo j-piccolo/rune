@@ -3,7 +3,7 @@
 //! `classify_quad` (render.rs) gives it, with only the work those instances need.
 
 /// Ultra-slim shader for `Kind::Rect` middles (`QuadMode::MiddleOnly` on `0..4`, and `QuadMode::Split`
-/// middle on `4..10`): 1 flat varying (`fill`, byte-rounded once per vertex) and a 1-instruction fragment shader.
+/// middle pieces on `4..22`): 1 flat varying (`fill`, byte-rounded once per vertex) and a 1-instruction fragment shader.
 pub(super) fn solid_rect_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
 struct Globals {
@@ -45,20 +45,22 @@ fn vs(i: In) -> Out {
         let k = u32(clamp(i32(j % 6u) - 1, 0, 3));
         corner = vec2<f32>(f32(k & 1u), f32(k >> 1u));
         let r = i.radii;
-        let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+        let reach = side_reach(r);
         let border = max(i.params.x, max(max(i.uv.x, i.uv.y), max(i.uv.z, i.uv.w)));
         let soft = max(i.params.z, 0.5);
-        let e = reach + soft + border + 1.0;
+        let e = reach + vec4<f32>(soft + border + 1.0);
         let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
         var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
         if (i.fade.w != 0u) {
             let c = unpack_clip_radii(i.fade.w);
-            let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-            edge = max(edge, vec4<f32>(cr + 1.0));
+            edge = max(edge, side_reach(c) + vec4<f32>(1.0));
         }
-        lo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-        hi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
-        if (any(hi - lo < vec2<f32>(8.0)) || i.fade.z != 0u || i.uv.z < 0.0) {
+        let hole = vec4<f32>(ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy)), floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw)));
+        let outer = split_outer(i.rect, soft + border + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), i.rect.xy, i.rect.xy + i.rect.zw, hole);
+        let piece = split_piece(j / 6u + 1u, i.rect.xy, i.rect.xy + i.rect.zw, hole, outer);
+        lo = piece.xy;
+        hi = max(piece.zw, piece.xy);
+        if (any(hole.zw - hole.xy < vec2<f32>(8.0)) || i.fade.z != 0u || i.uv.z < 0.0) {
             hi = lo;
         }
     }
@@ -82,7 +84,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 "#)
 }
 
-/// Slim shader for `Kind::Radial` (radial and angled linear gradient) middles (`4..10`):
+/// Slim shader for `Kind::Radial` (radial and angled linear gradient) middles (`4..22`):
 /// 5 flat varyings instead of 10, no `sd_rounded` or `clip_alpha_stops` in the fragment stage.
 pub(super) fn radial_middle_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
@@ -124,13 +126,13 @@ fn vs(i: In) -> Out {
     let grow = 1.0 + i.params.z * 2.0;
     var lo = i.rect.xy - vec2<f32>(grow);
     var hi = lo + i.rect.zw + vec2<f32>(2.0 * grow);
+    let lower_open = i.params.x >= 1.5;
+    let upper_open = i.params.w >= 1.5;
+    let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
+    let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
+    let below = lower_open || all(i.fill == vec4<f32>(0.0));
+    let above = upper_open || all(i.border == vec4<f32>(0.0));
     if (i.uv.z == 0.0 && any(i.uv.xy != vec2<f32>(0.0))) {
-        let lower_open = i.params.x >= 1.5;
-        let upper_open = i.params.w >= 1.5;
-        let t0 = select(i.params.x, i.params.x - 2.0, lower_open);
-        let t1 = select(i.params.w, i.params.w - 2.0, upper_open);
-        let below = lower_open || all(i.fill == vec4<f32>(0.0));
-        let above = upper_open || all(i.border == vec4<f32>(0.0));
         let down = abs(i.uv.y) >= abs(i.uv.x);
         let slope = select(i.uv.x, i.uv.y, down);
         let across = select(i.uv.y, i.uv.x, down);
@@ -149,30 +151,37 @@ fn vs(i: In) -> Out {
         }
         far = max(far, near);
         if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
+    } else if (i.uv.z > 0.0 && above) {
+        // As the band shader narrows it (variant.rs `BAND`), so the middle and bands cut the same quad.
+        let c = i.rect.xy + i.uv.xy;
+        let r_bound = abs(i.uv.zw) * max(t1, 0.0) + vec2<f32>(1.0);
+        lo = max(lo, c - r_bound);
+        hi = max(min(hi, c + r_bound), lo);
     }
     let r = i.radii;
-    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let reach = side_reach(r);
     let soft = max(i.params.z, 0.5);
-    let e = reach + soft + 1.0;
+    let e = reach + vec4<f32>(soft + 1.0);
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
-        let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-        edge = max(edge, vec4<f32>(cr + 1.0));
+        edge = max(edge, side_reach(c) + vec4<f32>(1.0));
     }
-    var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-    var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+    var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
     if (any(hhi - hlo < vec2<f32>(8.0)) || i.fade.z != 0u) {
         hlo = vec2<f32>(0.0);
         hhi = vec2<f32>(0.0);
     }
     hlo = max(hlo, lo);
     hhi = min(hhi, hi);
-    if (hhi.x <= hlo.x || hhi.y <= hlo.y) {
-        hhi = hlo;
+    var p = hlo;
+    if (hhi.x > hlo.x && hhi.y > hlo.y) {
+        let hole = vec4<f32>(hlo, hhi);
+        let outer = split_outer(i.rect, soft + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), lo, hi, hole);
+        p = piece_corner(split_piece(j / 6u + 1u, lo, hi, hole, outer), corner);
     }
-    let p = select(hlo, hhi, corner > vec2<f32>(0.5));
     let size_px = select(g.viewport, projection.zw, projection.z > 0.0);
     let local = p - projection.xy;
     var o: Out;
@@ -208,7 +217,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 "#)
 }
 
-/// Vertex-interpolated shader for linear `Kind::Radial` middles (`4..10`) whose `split_hole` lies
+/// Vertex-interpolated shader for linear `Kind::Radial` middles (`4..22`) whose `split_hole` lies
 /// strictly within `[t0, t1]`: evaluates `mix(fill, border, u)` at the 4 vertices and lets the
 /// hardware rasterizer interpolate `col`, making the fragment shader a single `return i.col;`.
 pub(super) fn linear_grad_middle_wgsl() -> String {
@@ -274,28 +283,29 @@ fn vs(i: In) -> Out {
         if (down) { lo.y = near; hi.y = far; } else { lo.x = near; hi.x = far; }
     }
     let r = i.radii;
-    let reach = max(max(max(r.x, r.y), max(r.z, r.w)), -CONTINUOUS_K * min(min(r.x, r.y), min(r.z, r.w)));
+    let reach = side_reach(r);
     let soft = max(i.params.z, 0.5);
-    let e = reach + soft + 1.0;
+    let e = reach + vec4<f32>(soft + 1.0);
     let f = vec4<f32>(unpack2x16float(i.fade.x), unpack2x16float(i.fade.y));
     var edge = max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0);
     if (i.fade.w != 0u) {
         let c = unpack_clip_radii(i.fade.w);
-        let cr = max(max(max(c.x, c.y), max(c.z, c.w)), -CONTINUOUS_K * min(min(c.x, c.y), min(c.z, c.w)));
-        edge = max(edge, vec4<f32>(cr + 1.0));
+        edge = max(edge, side_reach(c) + vec4<f32>(1.0));
     }
-    var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + edge.xy));
-    var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - edge.zw));
+    var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+    var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
     if (any(hhi - hlo < vec2<f32>(8.0)) || i.fade.z != 0u) {
         hlo = vec2<f32>(0.0);
         hhi = vec2<f32>(0.0);
     }
     hlo = max(hlo, lo);
     hhi = min(hhi, hi);
-    if (hhi.x <= hlo.x || hhi.y <= hlo.y) {
-        hhi = hlo;
+    var p = hlo;
+    if (hhi.x > hlo.x && hhi.y > hlo.y) {
+        let hole = vec4<f32>(hlo, hhi);
+        let outer = split_outer(i.rect, soft + 1.0, i.clip, max(abs(f), vec4<f32>(0.5)) + vec4<f32>(1.0), lo, hi, hole);
+        p = piece_corner(split_piece(j / 6u + 1u, lo, hi, hole, outer), corner);
     }
-    let p = select(hlo, hhi, corner > vec2<f32>(0.5));
     let center = i.rect.xy + i.rect.zw * 0.5;
     let t = 0.5 + dot(p - center, i.uv.xy);
     let u = clamp((t - t0) / max(t1 - t0, 1e-6), 0.0, 1.0);
@@ -315,7 +325,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 }
 
 /// Slim shader for borderless, circular-corner, unfaded `Kind::Rect`s (whole `0..4` or `SPLIT_BANDS`
-/// `10..34`): no `border_over`, no per-side borders, no `sd_continuous` (`atan2`), no `ramp_stops`,
+/// `22..70`): no `border_over`, no per-side borders, no `sd_continuous` (`atan2`), no `ramp_stops`,
 /// and discards zero-coverage apron pixels before blending.
 pub(super) fn simple_rect_wgsl() -> String {
     format!("{}\n{}", super::CLIP_WGSL, r#"
@@ -375,30 +385,27 @@ fn vs(i: In) -> Out {
     var hi = lo + i.rect.zw + vec2<f32>(2.0 * grow);
     if (sub > 0u) {
         let r = i.radii;
-        let reach = max(max(r.x, r.y), max(r.z, r.w));
+        let reach = side_reach(r);
         let soft = max(i.params.z, 0.5);
-        let e = reach + soft + 1.0;
-        var edge = 1.5;
+        let e = reach + vec4<f32>(soft + 1.0);
+        var edge = vec4<f32>(1.5);
         if (i.fade.w != 0u) {
-            let c = unpack_clip_radii(i.fade.w);
-            edge = max(edge, max(max(c.x, c.y), max(c.z, c.w)) + 1.0);
+            edge = max(edge, side_reach(unpack_clip_radii(i.fade.w)) + vec4<f32>(1.0));
         }
-        var hlo = ceil(max(i.rect.xy + vec2<f32>(e), i.clip.xy + vec2<f32>(edge)));
-        var hhi = floor(min(i.rect.xy + i.rect.zw - vec2<f32>(e), i.clip.zw - vec2<f32>(edge)));
+        var hlo = ceil(max(i.rect.xy + e.xy, i.clip.xy + edge.xy));
+        var hhi = floor(min(i.rect.xy + i.rect.zw - e.zw, i.clip.zw - edge.zw));
         if (any(hhi - hlo < vec2<f32>(8.0))) {
-            if (sub != 2u) { hi = lo; }
+            if (sub != 4u) { hi = lo; }
         } else {
             hlo = max(hlo, lo);
             hhi = min(hhi, hi);
             if (hhi.x > hlo.x && hhi.y > hlo.y) {
-                switch sub {
-                    case 1u: { lo = hlo; hi = hhi; }
-                    case 2u: { hi = vec2<f32>(hi.x, hlo.y); }
-                    case 3u: { lo = vec2<f32>(lo.x, hlo.y); hi = vec2<f32>(hlo.x, hhi.y); }
-                    case 4u: { lo = vec2<f32>(hhi.x, hlo.y); hi = vec2<f32>(hi.x, hhi.y); }
-                    default: { lo = vec2<f32>(lo.x, hhi.y); }
-                }
-            } else if (sub != 2u) {
+                let hole = vec4<f32>(hlo, hhi);
+                let outer = split_outer(i.rect, soft + 1.0, i.clip, vec4<f32>(1.5), lo, hi, hole);
+                let piece = split_piece(sub, lo, hi, hole, outer);
+                lo = piece.xy;
+                hi = max(piece.zw, piece.xy);
+            } else if (sub != 4u) {
                 hi = lo;
             }
         }

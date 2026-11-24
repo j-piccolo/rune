@@ -247,6 +247,28 @@ pub(in crate::runtime) fn own_paints(n: &Node) -> usize {
     ].into_iter().filter(|&b| b).count()
 }
 
+/// Whether rounding `instance`'s clip by `radii` changes none of its pixels: its quad, inside the clip, lies
+/// in one of the clip's central strips, clear of the corner squares. There the rounded mask's coverage
+/// repeats the nearest hard edge's, which is 0 or 1 at every pixel centre when the clip's edges are on whole
+/// pixels and unfaded. A segment of a panel's gradient clear of the panel's corners then draws its middle up
+/// to the clip's edge, instead of a corner's reach in from all four.
+/// `reach` is `crate::render::side_reach(radii)`, the same for every instance of a node.
+pub(in crate::runtime) fn clear_of_round_corners(instance: &Instance, [left, top, right, bottom]: [f32; 4]) -> bool {
+    if instance.fade[..3] != [0; 3] || ![KIND_RECT, KIND_RADIAL, KIND_GLYPH, KIND_IMAGE].contains(&instance.params[1]) {
+        return false;
+    }
+    let c = instance.clip;
+    // Whole pixels, by a round trip through an integer (a clip past `i32`'s range counts as not whole).
+    if c.iter().any(|&v| (v as i32) as f32 != v) {
+        return false;
+    }
+    let Some(q) = instance.quad_bounds() else { return false };
+    let q = [q[0].max(c[0]), q[1].max(c[1]), q[2].min(c[2]), q[3].min(c[3])];
+    q[2] <= q[0] || q[3] <= q[1]
+        || (q[0] >= c[0] + left && q[2] <= c[2] - right)
+        || (q[1] >= c[1] + top && q[3] <= c[3] - bottom)
+}
+
 /// Whether `rect` (edges) lies a pixel or more inside the rounded rectangle `mask` (edges) with
 /// corner `radii` `[tl, tr, br, bl]`, so that rounding the mask's corners can't touch it. The
 /// mask is convex, so it's enough that `rect`'s corners are inside; a continuous corner counts

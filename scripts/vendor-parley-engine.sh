@@ -6,7 +6,8 @@
 # of work shaping redid from the same inputs: `Analyzer` keeps the line and word segmenters it made
 # (`analysis.rs` `Segmenters`; making one loads the ICU dictionaries), `Shaper` keeps each run's
 # font metrics per font instance and size (`run_metrics_cache`), and `FontMetrics::from_font_instance`
-# keeps a style's per thread (64 entries). Two hooks for a host without ICU's dictionaries or the
+# keeps a style's per thread (64 entries); and ASCII text's grapheme boundaries worked out without ICU's
+# segmenter (every position but CR LF's, UAX #29). Two hooks for a host without ICU's dictionaries or the
 # fonts a script needs (Rune's web build): `dictionary::set_dictionary_segmenter` (the words, and
 # Thai, Lao, Khmer and Burmese line breaks, of runs that need a dictionary; with the
 # `line-dictionaries` feature, the words alone, the line segmenter keeping its Thai, Lao, Khmer and

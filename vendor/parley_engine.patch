@@ -11,7 +11,7 @@ index 68a28c1..c09da2b 100644
  libm = [
      "fontique/libm",
 diff --git a/src/analysis.rs b/src/analysis.rs
-index 7d871af..31cf0dc 100644
+index 7d871af..fe9dff4 100644
 --- a/src/analysis.rs
 +++ b/src/analysis.rs
 @@ -150,13 +150,43 @@ impl AnalysisDataSources {
@@ -60,7 +60,28 @@ index 7d871af..31cf0dc 100644
  #[inline(always)]
  fn line_segmenter_impl(opt: LineBreakOptions<'_>) -> LineSegmenterBorrowed<'static> {
      LineSegmenter::new_for_non_complex_scripts(opt)
-@@ -558,8 +588,9 @@ pub(crate) fn analyze_text(
+@@ -385,6 +415,20 @@ impl CharInfo {
+     }
+ }
+ 
++/// Grapheme boundaries: worked out for ASCII text, or from the segmenter.
++struct Graphemes<A, S>(Result<A, S>);
++
++impl<A: Iterator<Item = usize>, S: Iterator<Item = usize>> Iterator for Graphemes<A, S> {
++    type Item = usize;
++
++    fn next(&mut self) -> Option<usize> {
++        match &mut self.0 {
++            Ok(ascii) => ascii.next(),
++            Err(segments) => segments.next(),
++        }
++    }
++}
++
+ pub(crate) fn analyze_text(
+     analyzer: &mut Analyzer,
+     text: &str,
+@@ -558,8 +602,9 @@ pub(crate) fn analyze_text(
      for (substring_index, (substring, segmenter_key, last)) in contiguous_substrings.enumerate() {
          // Fast path for text with a single segmenter configuration.
          if substring_index == 0 && last {
@@ -72,7 +93,7 @@ index 7d871af..31cf0dc 100644
                  .segment_str(substring);
  
              let _first = lb_iter.next();
-@@ -580,8 +611,9 @@ pub(crate) fn analyze_text(
+@@ -580,8 +625,9 @@ pub(crate) fn analyze_text(
              break;
          }
  
@@ -84,7 +105,7 @@ index 7d871af..31cf0dc 100644
              .segment_str(substring);
  
          let mut substring_chars = substring.chars();
-@@ -613,8 +645,18 @@ pub(crate) fn analyze_text(
+@@ -613,12 +659,29 @@ pub(crate) fn analyze_text(
          }
      }
  
@@ -100,11 +121,26 @@ index 7d871af..31cf0dc 100644
 +
      // Collect boundary byte positions compactly
 -    let mut wb_iter = data_sources.word_segmenter().segment_str(text).peekable();
+-    let mut gb_iter = data_sources
+-        .grapheme_segmenter()
+-        .segment_str(text)
+-        .peekable();
 +    let mut wb_iter = analyzer.segmenters.word().segment_str(text).peekable();
-     let mut gb_iter = data_sources
-         .grapheme_segmenter()
-         .segment_str(text)
-@@ -679,8 +721,11 @@ pub(crate) fn analyze_text(
++    // In ASCII every position is a grapheme boundary but the one between CR and LF (UAX #29
++    // GB3 to GB5, GB999): no segmenter needed for the commonest text.
++    let ascii_graphemes = text.is_ascii().then(|| {
++        let bytes = text.as_bytes();
++        (0..=bytes.len()).filter(move |&at| !(at > 0 && at < bytes.len() && bytes[at - 1] == b'\r' && bytes[at] == b'\n'))
++    });
++    let mut gb_iter = Graphemes(match ascii_graphemes {
++        Some(ascii) => Ok(ascii),
++        None => Err(data_sources.grapheme_segmenter().segment_str(text)),
++    })
++    .peekable();
+ 
+     // Merge boundaries - line takes precedence over word
+     let mut lb_iter = line_boundary_positions.iter().peekable();
+@@ -679,8 +742,11 @@ pub(crate) fn analyze_text(
          let properties = data_sources.properties(ch);
  
          // For characters requiring a dictionary for deciding word boundaries, apply
