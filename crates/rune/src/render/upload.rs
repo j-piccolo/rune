@@ -69,7 +69,7 @@ pub(super) struct Uploads {
     /// The last `prepare` wrote only a loop-only frame's slots.
     patched: bool,
     /// Whether `fast::warm_draw` has run once to pre-compile fast-path fragment shaders.
-    fast_warmed: bool,
+    pub(super) fast_warmed: bool,
     /// Whether an in-place instance write touched `fused_grad` or a `Kind::Radial`, requiring
     /// `fused_grad` and its uniform buffer to be refreshed without a full rebatch.
     fused_dirty: bool,
