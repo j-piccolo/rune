@@ -14,13 +14,82 @@ use crate::render::{Gpu, Offscreen, Renderer};
 pub struct FrameLog {
     log: crate::frame::profile::Log,
     target: Offscreen,
-    timer: Option<Timer>,
-    frags: Option<Frags>,
+    queries: Queries,
     events: usize,
     cpu0: Option<f64>,
     commits0: u64,
     /// Frames logged so far.
     k: usize,
+}
+
+/// The GPU queries a logged frame's commands run: its time ([`Timer`]) and its fragments ([`Frags`]), each
+/// where the device has them. `RUNE_FRAME_LOG_NO_QUERIES`: neither. They are commands the driver records
+/// and submits with every frame, which a window on screen never pays: a judge takes the CPU's cost from a
+/// run without them (its frames are the same, the clock being virtual) and the GPU's from one with.
+pub(crate) struct Queries {
+    timer: Option<Timer>,
+    frags: Option<Frags>,
+}
+
+/// What a frame's queries read: milliseconds to the end of its layer passes and to its end, and the
+/// fragment shader invocations its passes ran.
+pub(crate) struct Read {
+    pub(crate) gpu_time_ms: Option<(Option<f64>, f64)>,
+    pub(crate) frag_invocations: Option<u64>,
+}
+
+impl Queries {
+    pub(crate) fn new(gpu: &Gpu) -> Self {
+        let quiet = std::env::var_os("RUNE_FRAME_LOG_NO_QUERIES").is_some();
+        Self { timer: if quiet { None } else { Timer::new(gpu) }, frags: if quiet { None } else { Frags::new(gpu) } }
+    }
+
+    /// Before the frame's first command.
+    pub(crate) fn begin(&self, encoder: &mut wgpu::CommandEncoder, renderer: &mut Renderer) {
+        if let Some(t) = &self.timer {
+            encoder.write_timestamp(&t.queries, 0);
+            renderer.pass_mark = Some((t.queries.clone(), 1));
+        }
+        if let Some(f) = &self.frags { crate::render::frag_stats::start(f.queries.clone(), Frags::COUNT); }
+    }
+
+    /// After the frame's last command.
+    pub(crate) fn end(&mut self, encoder: &mut wgpu::CommandEncoder, renderer: &mut Renderer) {
+        if let Some(f) = &mut self.frags { f.resolve(encoder); }
+        renderer.pass_mark = None;
+        if let Some(t) = &self.timer {
+            encoder.write_timestamp(&t.queries, 2);
+            encoder.resolve_query_set(&t.queries, 0..3, &t.resolved, 0);
+            encoder.copy_buffer_to_buffer(&t.resolved, 0, &t.read, 0, 24);
+        }
+    }
+
+    /// The frame's counts, once its work is done.
+    pub(crate) fn read(&self, gpu: &Gpu) -> Read {
+        Read { gpu_time_ms: self.timer.as_ref().and_then(|t| t.read(gpu)), frag_invocations: self.frags.as_ref().and_then(|f| f.read(gpu)) }
+    }
+}
+
+/// `RUNE_FRAME_MARKS=1` beside `RUNE_FRAME_LOG=FILE`: when each logged frame ends, on the host's monotonic
+/// clock (`CLOCK_MONOTONIC` on Linux; one line `frame NS` a frame, and `skip NS` a turn left out, in FILE.marks), so a profiler's samples (`perf record -k CLOCK_MONOTONIC`) can
+/// be told to the frame they were in.
+pub(crate) struct Marks(Option<std::io::BufWriter<std::fs::File>>);
+
+impl Marks {
+    pub(crate) fn from_env() -> Self {
+        let path = std::env::var_os("RUNE_FRAME_MARKS").and(std::env::var_os("RUNE_FRAME_LOG"));
+        Self(path.and_then(|path| {
+            let mut path = std::path::PathBuf::from(path).into_os_string();
+            path.push(".marks");
+            std::fs::File::create(path).ok().map(std::io::BufWriter::new)
+        }))
+    }
+
+    pub(crate) fn mark(&mut self, what: &str) {
+        use std::io::Write;
+        let Some(out) = &mut self.0 else { return };
+        let _ = writeln!(out, "{what} {}", crate::frame::host_clock::now_ns());
+    }
 }
 
 /// The queries a frame's passes count their fragment shader invocations into, and where they're read
@@ -98,24 +167,28 @@ impl Timer {
         Some(Self { queries, resolved, read, period: f64::from(gpu.queue.get_timestamp_period()) })
     }
 
-    /// The milliseconds from the frame's start to the end of its layer passes and to its end, once its work is done.
-    fn read(&self, gpu: &Gpu) -> Option<(f64, f64)> {
+    /// The milliseconds from the frame's start to the end of its layer passes (`None`: a frame that drew
+    /// none of the passes that mark it, such as one that only copied) and to its end, once its work is done.
+    fn read(&self, gpu: &Gpu) -> Option<(Option<f64>, f64)> {
         let slice = self.read.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         rune_gpu::health::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).ok()?;
-        let ticks = {
+        let (start, layers, end) = {
             let bytes = slice.get_mapped_range().ok()?;
             let at = |i: usize| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-            (at(1).wrapping_sub(at(0)), at(2).wrapping_sub(at(0)))
+            (at(0), at(1), at(2))
         };
         self.read.unmap();
-        Some((ticks.0 as f64 * self.period / 1e6, ticks.1 as f64 * self.period / 1e6))
+        let ms = |ticks: u64| ticks as f64 * self.period / 1e6;
+        // An unwritten mark holds an earlier frame's (or nothing): it isn't between this frame's two.
+        let layers = (start <= layers && layers <= end).then(|| ms(layers - start));
+        Some((layers, ms(end.wrapping_sub(start))))
     }
 }
 
 /// The GPU's clock now (MHz), where the kernel says it: Intel's `gt_act_freq_mhz` on Linux. A file read
 /// each frame, which only an offscreen judge's frames take: a window's loop never runs this.
-fn gpu_mhz() -> Option<u32> {
+pub(crate) fn gpu_mhz() -> Option<u32> {
     #[cfg(target_os = "linux")]
     for entry in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
         if let Some(mhz) = std::fs::read_to_string(entry.path().join("gt_act_freq_mhz")).ok().and_then(|s| s.trim().parse().ok()) {
@@ -129,11 +202,7 @@ impl FrameLog {
     /// Frames `size` device pixels big, each a JSON line appended to `out`.
     pub fn new<S: 'static>(gpu: &Gpu, renderer: &Renderer, rt: &mut crate::Runtime<S>, size: (u32, u32), out: std::fs::File) -> Self {
         let target = Offscreen::with_format(&gpu.device, size.0.max(1), size.1.max(1), renderer.format());
-        // `RUNE_FRAME_LOG_NO_QUERIES`: no timestamps and no fragment counts. They are commands the driver records
-        // and submits with every frame, which a window on screen never pays: a judge takes the CPU's cost from a
-        // run without them (its frames are the same, the clock being virtual) and the GPU's from one with.
-        let quiet = std::env::var_os("RUNE_FRAME_LOG_NO_QUERIES").is_some();
-        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, timer: if quiet { None } else { Timer::new(gpu) }, frags: if quiet { None } else { Frags::new(gpu) }, events: 0, cpu0: None, commits0: 0, k: 0 };
+        let mut log = Self { log: crate::frame::profile::Log::to(Some(out), 1024), target, queries: Queries::new(gpu), events: 0, cpu0: None, commits0: 0, k: 0 };
         log.skip(rt);
         log
     }
@@ -157,22 +226,12 @@ impl FrameLog {
         crate::frame::host_step::prepare_gpu_resources(renderer, gpu, core, size, false);
         stage(0, &mut since);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        if let Some(t) = &self.timer {
-            encoder.write_timestamp(&t.queries, 0);
-            renderer.pass_mark = Some((t.queries.clone(), 1));
-        }
+        self.queries.begin(&mut encoder, renderer);
         // A picture the compositor would show under the window (`El::underlay`) isn't the window's to draw.
         renderer.set_underlay_start(core.underlay(size).map_or(0, |(from, _)| from));
-        if let Some(f) = &self.frags { crate::render::frag_stats::start(f.queries.clone(), Frags::COUNT); }
         crate::frame::host_step::draw_ui(renderer, gpu, &mut encoder, &self.target.view, core, size, [0.0; 4]);
-        if let Some(f) = &mut self.frags { f.resolve(&mut encoder); }
         renderer.set_underlay_start(0);
-        renderer.pass_mark = None;
-        if let Some(t) = &self.timer {
-            encoder.write_timestamp(&t.queries, 2);
-            encoder.resolve_query_set(&t.queries, 0..3, &t.resolved, 0);
-            encoder.copy_buffer_to_buffer(&t.resolved, 0, &t.read, 0, 24);
-        }
+        self.queries.end(&mut encoder, renderer);
         stage(2, &mut since);
         renderer.submit(&gpu.queue, encoder);
         stage(3, &mut since);
@@ -188,8 +247,7 @@ impl FrameLog {
         // drawing the frame's pixels cost.
         let gpu_wait_ms = start.elapsed().as_secs_f64() * 1000.0 - ms;
         let before = cpu_ms().unwrap_or(0.0);
-        let gpu_time_ms = match &self.timer { Some(t) => self.log.exclude(|| t.read(gpu)), None => None };
-        let frag_invocations = match &self.frags { Some(f) => self.log.exclude(|| f.read(gpu)), None => None };
+        let Read { gpu_time_ms, frag_invocations } = self.log.exclude(|| self.queries.read(gpu));
         excluded += cpu_ms().unwrap_or(before) - before;
         self.log.push(crate::frame::profile::Row {
             phases: crate::frame::profile::take(),
@@ -205,7 +263,7 @@ impl FrameLog {
             cpu_ms: self.cpu0.map(|start| cpu_ms().unwrap_or(start) - start - excluded),
             gpu_wait_ms,
             gpu_time_ms: gpu_time_ms.map(|(_, all)| all),
-            gpu_layers_ms: gpu_time_ms.map(|(layers, _)| layers),
+            gpu_layers_ms: gpu_time_ms.and_then(|(layers, _)| layers),
             gpu_mhz: mhz,
             frag_invocations,
         });

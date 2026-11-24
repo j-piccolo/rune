@@ -471,6 +471,9 @@ impl Renderer {
         // much as the rest of a loop-only frame.
         let uploads = |encoder: &mut wgpu::CommandEncoder| {
             if runs.is_empty() || layers_reached || listed { self.encode_layers_timed(encoder, None, &mut |_, _| {}); } else { self.flush_uploads(encoder); }
+            // Frame-profile builds: the layer passes end here (`tooling::FrameLog`'s timer).
+            #[cfg(feature = "frame-profile")]
+            if let Some((queries, at)) = &self.pass_mark { encoder.write_timestamp(queries, *at); }
             self.submit_uploads();
         };
         let copy = |encoder: &mut wgpu::CommandEncoder, from: &wgpu::Texture, at: [u32; 2], to: &wgpu::Texture, to_at: [u32; 2], size: [u32; 2]| {
@@ -636,6 +639,8 @@ impl Renderer {
         // An opaque clear is the pass's own clear over the rectangle: one colour, nothing blended, and
         // the rects at the head of the list that paint only that colour change nothing after it
         // (`cleared_start`, as in a frame drawn whole).
+        // Frame-profile builds count the fragments it shades (`frag_stats`).
+        let counted = super::frag_stats::begin(&mut pass);
         let opaque = clear[3] == 1.0;
         let start = if opaque { self.cleared_start(wgpu::LoadOp::Clear(wgpu::Color { r: clear[0] as f64, g: clear[1] as f64, b: clear[2] as f64, a: clear[3] as f64 })) } else { 0 };
         for (n, &rect) in rects.iter().enumerate().filter(|_| !spoil) {
@@ -666,6 +671,7 @@ impl Renderer {
                 None => self.draw_layer_range(&mut active, self.format, start..self.count, None, &mut |_, _| {}),
             }
         }
+        super::frag_stats::end(&mut pass, counted);
     }
 }
 
