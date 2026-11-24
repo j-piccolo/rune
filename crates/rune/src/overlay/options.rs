@@ -146,6 +146,10 @@ pub struct OverlayOptions {
     /// can't use it. Read when the surface is made, at each show on Wayland;
     /// `OverlayHandle::set_xwayland_input` changes it.
     pub xwayland_input: bool,
+    /// Wayland: the shell surface it is instead of rune's own placement (a layer-shell surface
+    /// placed as it says, or a session-lock surface); see [`crate::wayland`].
+    /// `OverlayHandle::set_shell` changes it.
+    pub shell: Option<crate::wayland::ShellSurface>,
 }
 
 /// Keeps existing exhaustive `OverlaySpec` literals source compatible.
@@ -163,6 +167,9 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) macos_level: Option<isize>,
     pub(crate) animate_reveal: bool,
     pub(crate) release_after: Option<std::time::Duration>,
+    /// `ConfiguredOverlay::fonts`: its own faces, in place of the app's.
+    pub(crate) fonts: Option<(&'static [&'static [u8]], (&'static str, &'static str))>,
+    pub(crate) on_button: Option<fn(&mut T, bool)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +284,18 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// `OverlayOptions::level`; `OverlayHandle::set_macos_level` changes it later. At any
     /// level a macOS overlay goes exactly where it's placed, over the menu bar too.
     pub fn macos_level(mut self, level: isize) -> Self { self.macos_level = Some(level); self }
+    /// Wayland: what shell surface it is (`OverlayOptions::shell`).
+    pub fn shell(mut self, surface: crate::wayland::ShellSurface) -> Self { self.options.shell = Some(surface); self }
+    /// The faces its text uses and the families its sans and mono slots name, as
+    /// `AppSpec::fonts` and `AppSpec::families` give a window's: an overlay opened while the app
+    /// runs ([`crate::wayland::open`]) has no app spec to take them from.
+    pub fn fonts(mut self, fonts: &'static [&'static [u8]], families: (&'static str, &'static str)) -> Self {
+        self.fonts = Some((fonts, families));
+        self
+    }
+    /// Called with every primary press (true) and release (false) on the overlay, before
+    /// anything in its view hears it: a shell's click-away watches where presses land.
+    pub fn on_button(mut self, f: fn(&mut T, bool)) -> Self { self.on_button = Some(f); self }
 }
 
 impl<T: 'static> OverlaySpec<T> {
@@ -288,7 +307,7 @@ impl<T: 'static> OverlaySpec<T> {
         ConfiguredOverlay {
             spec: self, options, on_key: None, on_created: None, on_availability: None, poll: None, compositor: None,
             setup: None, runtime: crate::app::RuntimeConfig::default(), font_smoothing: None, macos_level: None,
-            animate_reveal: false, release_after: None,
+            animate_reveal: false, release_after: None, fonts: None, on_button: None,
         }
     }
 }

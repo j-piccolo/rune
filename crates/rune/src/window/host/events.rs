@@ -196,7 +196,7 @@ impl Host {
             WakeEvent::GpuReady(_) => self.gpu_ready(),
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             WakeEvent::GpuReady(_) => {}
-            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) | WakeEvent::FileDrop | WakeEvent::LayerPending | WakeEvent::AppColorScheme => {}
+            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) | WakeEvent::FileDrop | WakeEvent::LayerPending | WakeEvent::AppColorScheme | WakeEvent::Services => {}
         }
     }
 

@@ -84,7 +84,9 @@ impl OverlayCore {
         if !surface && !parks { return; }
         self.resolve_size(event_loop);
         let made = if wayland {
-            self.layer(app, event_loop).or_else(|| self.xwayland(app))
+            // A shell surface is a layer or lock surface or nothing: no XWayland stand-in.
+            let shell = self.options.shell.is_some();
+            self.layer(app, event_loop).or_else(|| if shell { None } else { self.xwayland(app) })
         } else if self.surface.parked().is_some() || self.window(app, event_loop).is_some() {
             // macOS made the surface with its panel; elsewhere the window waits parked.
             match self.surface.take_live() {
@@ -359,20 +361,29 @@ impl OverlayCore {
         use winit::raw_window_handle::HasDisplayHandle;
         use winit::platform::wayland::MonitorHandleExtWayland;
         let display = event_loop.display_handle().ok()?.as_raw();
+        // A shell surface on an output named: the shared connection's, at its scale.
+        let named = shell_output(self.options.shell.as_ref()).and_then(crate::platform::wayland_shell::output_named);
         let monitor = monitor(event_loop, &self.options.display);
-        let scale = monitor.as_ref().map_or(1.0, |m| m.scale_factor()).ceil() as i32;
+        let scale = match &named {
+            Some((_, _, scale)) => *scale,
+            None => monitor.as_ref().map_or(1.0, |m| m.scale_factor()).ceil() as i32,
+        };
         // With no target, the compositor chooses an output; global pointer querying is forbidden.
         let output = match &self.options.display {
             DisplayTarget::Id(id) if event_loop.available_monitors().any(|m| m == id.0) => Some(id.0.native_id()),
             DisplayTarget::Native(crate::NativeDisplayId::Wayland(id)) if event_loop.available_monitors().any(|m| m.native_id() == *id) => Some(*id),
             _ => None,
         };
-        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, self.at, self.interactive, &self.options, output)?;
+        // A shell surface asks for its own size, 0 on an axis it stretches along.
+        let at = if self.options.shell.is_some() { Placement { size: self.canvas_size, ..self.at } } else { self.at };
+        let named = named.map(|(_, proxy, _)| proxy);
+        let mut layer = crate::platform::layer_shell::LayerSurface::new(display, self.name, at, self.interactive, &self.options, output, named)?;
         layer.set_buffer_scale(scale);
         if let Some((w, h)) = layer.configured_size() {
             if w > 0 { self.at.size.0 = w as f32; }
             if h > 0 { self.at.size.1 = h as f32; }
         }
+        layer.set_blur(self.blur, self.at.size);
         self.shared.native.lock().unwrap().1 = crate::OverlayCapabilities {
             capture_exclusion: OverlaySupport::Unsupported, global_pointer: OverlaySupport::Unsupported,
             nonactivating_keys: if layer.supports_keys() { OverlaySupport::Supported } else { OverlaySupport::Unsupported },

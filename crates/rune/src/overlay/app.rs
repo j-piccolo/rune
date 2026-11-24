@@ -43,6 +43,9 @@ pub(super) trait OverlayApp {
     fn compositor_animating(&self) -> bool;
     fn render_compositor(&mut self, args: OverlayRenderArgs<'_>) -> bool;
     fn release_compositor_gpu(&mut self);
+    /// A primary press (true) or release on the surface, before the runtime hears it
+    /// (`ConfiguredOverlay::on_button`).
+    fn button_hook(&mut self, down: bool);
 }
 
 impl dyn OverlayApp + '_ {
@@ -158,6 +161,7 @@ pub(super) struct TypedOverlayApp<T: 'static> {
     pub(super) setup: Option<fn(&mut T, Waker)>,
     pub(super) on_availability: Option<fn(&mut T, super::Availability, &mut Tx)>,
     pub(super) shared: Arc<Shared<T>>,
+    pub(super) on_button: Option<fn(&mut T, bool)>,
 }
 
 impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
@@ -232,6 +236,10 @@ impl<T: 'static> OverlayApp for TypedOverlayApp<T> {
             c.release_gpu();
         }
     }
+
+    fn button_hook(&mut self, down: bool) {
+        if let Some(hook) = self.on_button { hook(&mut self.rt.state, down); }
+    }
 }
 
 /// Non-generic overlay host stored in `App::overlays` and `Windows::hosts`.
@@ -249,13 +257,14 @@ fn build_parts<S, T: 'static>(
 ) -> (OverlayCore, TypedOverlayApp<T>, OverlayHandle<T>, bool) {
     let ConfiguredOverlay {
         spec, options, on_key, on_created, on_availability, poll, compositor, setup, mut runtime, font_smoothing,
-        macos_level, animate_reveal, release_after,
+        macos_level, animate_reveal, release_after, fonts, on_button,
     } = configured;
     let inherits_font_smoothing = font_smoothing.is_none();
     runtime.font_smoothing = font_smoothing.unwrap_or(app_font_smoothing);
     let shared_core = Arc::new(SharedCore::default());
     let shared = Arc::new(Shared { core: shared_core.clone(), updates: Default::default() });
-    let text = TextSystem::for_window(app.fonts, app.families);
+    let (fonts, families) = fonts.unwrap_or((app.fonts, app.families));
+    let text = TextSystem::for_window(fonts, families);
     let mut rt = Runtime::with_text(state, spec.view, spec.size, Env::default(), text);
     rt.configure(runtime);
     rt.track_marks = compositor.is_some();
@@ -279,7 +288,7 @@ fn build_parts<S, T: 'static>(
         animate_reveal,
         release_after,
     );
-    let typed = TypedOverlayApp { rt, compositor, setup, on_availability, shared: shared.clone() };
+    let typed = TypedOverlayApp { rt, compositor, setup, on_availability, shared: shared.clone(), on_button };
     (core, typed, OverlayHandle { shared }, inherits_font_smoothing)
 }
 
@@ -396,6 +405,7 @@ impl<T: 'static> OverlayApp for BorrowOverlayApp<'_, T> {
             c.release_gpu();
         }
     }
+    fn button_hook(&mut self, _down: bool) {}
 }
 
 #[cfg(test)]
@@ -418,7 +428,7 @@ macro_rules! with_app {
 impl<T: 'static> Overlay<T> {
     pub(super) fn new<S>(configured: impl Into<ConfiguredOverlay<T>>, state: T, app: &AppSpec<S>) -> (Self, OverlayHandle<T>) {
         let (core, typed, handle, _) = build_parts(configured.into(), state, app, crate::FontSmoothing::default());
-        let TypedOverlayApp { rt, compositor, setup, on_availability, shared } = typed;
+        let TypedOverlayApp { rt, compositor, setup, on_availability, shared, .. } = typed;
         (Overlay { core, rt, compositor, setup, on_availability, shared }, handle)
     }
 
