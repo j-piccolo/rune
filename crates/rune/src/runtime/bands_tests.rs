@@ -59,13 +59,19 @@ fn a_big_border_ring_draws_as_bands_and_a_filled_box_never_asks() {
     let mut out = Vec::new();
     let ring = Instance { rect: [10.0, 10.0, 800.0, 500.0], radii: [-16.0; 4], fill: [0.0; 4], border: [1.0; 4], params: [1.0, KIND_RECT, 0.0, 1.0], uv: [0.0; 4], clip: NO_CLIP, fade: [0; 4] };
     push_ring(&mut out, ring);
-    assert_eq!(out.len(), 4);
+    // Its four corners and four edges as thin as the ring.
+    assert_eq!(out.len(), 8);
     let bands = windows(&out, 1.0);
-    // Continuous corners reach K times their radius along each edge.
-    let e = 16.0 * crate::render::CONTINUOUS_K + 1.0 + 0.5 + 1.0;
-    let hole = [10.0 + e, 10.0 + e, 810.0 - e, 510.0 - e];
+    for (a, b) in bands.iter().enumerate().flat_map(|(k, a)| bands[k + 1..].iter().map(move |b| (a, b))) {
+        assert_eq!(area([a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]), 0.0, "pieces never overlap");
+    }
+    // Continuous corners reach K times their radius along each edge; the edges are the border, its soft
+    // edge and a pixel thick.
+    let t = 1.0 + 0.5 + 1.0;
+    let e = 16.0 * crate::render::CONTINUOUS_K + t;
+    let inside = area([10.0 + t, 10.0 + t, 810.0 - t, 510.0 - t]) - 4.0 * (e - t) * (e - t);
     let total: f32 = bands.iter().map(|&b| area(b)).sum();
-    assert!((total - (area([9.0, 9.0, 811.0, 511.0]) - area(hole))).abs() < 1.0);
+    assert!((total - (area([9.0, 9.0, 811.0, 511.0]) - inside)).abs() < 1.0, "the pieces tile the ring's reach");
 }
 
 /// The outer shadows a view paints, at scale 1.
