@@ -672,9 +672,10 @@ impl RuntimeCore {
             }
             let n = &self.tree.nodes[i];
             if let Some((_, radii)) = rounded {
+                let reach = crate::render::side_reach(radii);
                 for instance in &mut self.instances[primitive_start..] {
                     if glyphs_clear && instance.params[1] == KIND_GLYPH { continue; }
-                    if clear_of_round_corners(instance, radii) { continue; }
+                    if clear_of_round_corners(instance, reach) { continue; }
                     instance.round_clip_corners(radii);
                 }
                 let packed = crate::render::pack_clip_radii(clip, radii);
