@@ -304,7 +304,9 @@ impl TextSystem {
         // `exact` overrides the predicted spacing with each run's own, by byte range.
         // Code never takes ligatures (`->` stays two characters); later features override earlier.
         let off = [b"liga", b"clig", b"calt", b"dlig"].map(|tag| parley::FontFeature::new(parley::setting::Tag::new(tag), 0));
-        let unligated: Vec<parley::FontFeature> = features.iter().chain(&off).copied().collect();
+        // Only mono text or a mono span draws with them.
+        let any_mono = mono_style || has_mono_span;
+        let unligated: Vec<parley::FontFeature> = if any_mono { features.iter().chain(&off).copied().collect() } else { Vec::new() };
         type Spacings = [(std::ops::Range<usize>, f32)];
         let build = |lcx: &mut LayoutContext<Ink>, fcx: &mut FontContext, exact: &Spacings, widen: &Spacings, weights: &Spacings, fits: &Spacings, bold: &[(std::ops::Range<usize>, u32)]| {
             let mut b = lcx.ranged_builder(fcx, text, scale, true);
@@ -490,25 +492,36 @@ impl TextSystem {
         }
         // The spacing each run got, against the spacing its own font needs.
         let given = |at: usize| given_map.get(at).unwrap_or(base_spacing);
-        let mut exact: Vec<(std::ops::Range<usize>, f32)> = Vec::new();
+        // Each run's needed spacing, by byte range, made only when a run's differs from what it got.
+        let mut needed_of = |run: &parley::Run<'_, Ink>| {
+            let font = run.font();
+            let trak = font_trak(&mut self.traks, &font.data, font.index);
+            (spacing(trak, run.font_size() / scale), run.text_range())
+        };
         let mut mismatch = false;
-        for line in layout.lines() {
+        'runs: for line in layout.lines() {
             for run in line.runs() {
-                let font = run.font();
-                let trak = font_trak(&mut self.traks, &font.data, font.index);
-                let needed = spacing(trak, run.font_size() / scale);
-                let range = run.text_range();
-                if range.is_empty() {
-                    continue;
-                }
-                mismatch |= (needed - given(range.start)).abs() > 1e-4;
-                match exact.last_mut() {
-                    Some((last, v)) if last.end == range.start && *v == needed => last.end = range.end,
-                    _ => exact.push((range, needed)),
+                let (needed, range) = needed_of(&run);
+                if !range.is_empty() && (needed - given(range.start)).abs() > 1e-4 {
+                    mismatch = true;
+                    break 'runs;
                 }
             }
         }
         if mismatch {
+            let mut exact: Vec<(std::ops::Range<usize>, f32)> = Vec::new();
+            for line in layout.lines() {
+                for run in line.runs() {
+                    let (needed, range) = needed_of(&run);
+                    if range.is_empty() {
+                        continue;
+                    }
+                    match exact.last_mut() {
+                        Some((last, v)) if last.end == range.start && *v == needed => last.end = range.end,
+                        _ => exact.push((range, needed)),
+                    }
+                }
+            }
             layout = build(&mut self.layout_cx, &mut self.font_cx, &exact, &widen, &weights, &fits, &bold);
         }
         layout.align(align, AlignmentOptions::default());
